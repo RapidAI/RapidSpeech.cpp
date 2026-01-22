@@ -1,16 +1,6 @@
-
 <div align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/RapidAI/RapidOCR/releases/download/v1.1.0/Logov2_black.png"  width="60%" height="60%">
-    <source media="(prefers-color-scheme: light)" srcset="https://github.com/RapidAI/RapidOCR/releases/download/v1.1.0/Logov2_white.png"  width="60%" height="60%">
-    <img alt="Shows an illustrated sun in light mode and a moon with stars in dark mode." src="https://github.com/RapidAI/RapidOCR/releases/download/v1.1.0/Logov2_white.png">
-  </picture>
-
-<div>&nbsp;</div>
-<div align="center">
-    <b><font size="4"><i>Open source OCR for the security of the digital world</i></font></b>
+<img src="assets/rapid-speech.png" alt="rapid-speech Logo"  />
 </div>
-<div>&nbsp;</div>
 
 简体中文 | [English](./README.md)
 # RapidSpeech.cpp 🎙️
