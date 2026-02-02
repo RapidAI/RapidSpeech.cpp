@@ -2,7 +2,7 @@
 <img src="assets/rapid-speech.png" alt="RapidSpeech Logo" />
 </div>
 
-English | [简体中文](./README_zh.md)
+English | [简体中文](./README-CN.md)
 
 <a href="https://huggingface.co/lovemefan/RapidSpeech" target="_blank"><img src="https://img.shields.io/badge/🤗-Hugging Face-blue"></a>
 <a href="https://www.modelscope.cn/models/lovemefan/RapidSpeech" target="_blank"><img src="https://img.shields.io/badge/ModelScope-blue"></a>
@@ -46,13 +46,13 @@ While the open-source ecosystem already offers powerful cloud-side frameworks su
 ## 📦 Model Support
 
 **Automatic Speech Recognition (ASR)**
-- SenseVoice-small
-- FunASR-nano
-- Qwen3-ASR
+- [x] SenseVoice-small
+- [ ] FunASR-nano
+- [ ] Qwen3-ASR
 
 **Text-to-Speech (TTS)**
-- CosyVoice3
-- Qwen3-TTS
+- [ ] CosyVoice3
+- [ ] Qwen3-TTS
 
 ------
 

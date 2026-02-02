@@ -45,13 +45,13 @@
 ## 📦 模型支持
 
 **语音识别（ASR）**
-- SenseVoice-small
-- FunASR-nano
-- Qwen3-ASR
+- [x] SenseVoice-small
+- [ ] FunASR-nano
+- [ ] Qwen3-ASR
 
-**语音合成（TTS）**
-- CosyVoice3
-- Qwen3-TTS
+**Text-to-Speech (TTS)**
+- [ ] CosyVoice3
+- [ ] Qwen3-TTS
 
 ------
 
