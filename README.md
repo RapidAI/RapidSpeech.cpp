@@ -1,62 +1,105 @@
 <div align="center">
-<img src="assets/rapid-speech.png" alt="rapid-speech Logo"  />
+<img src="assets/rapid-speech.png" alt="RapidSpeech Logo" />
 </div>
 
-[简体中文](./README-CN.md) | English
+English | [简体中文](./README_zh.md)
+
+<a href="https://huggingface.co/lovemefan/RapidSpeech" target="_blank"><img src="https://img.shields.io/badge/🤗-Hugging Face-blue"></a>
+<a href="https://www.modelscope.cn/models/lovemefan/RapidSpeech" target="_blank"><img src="https://img.shields.io/badge/ModelScope-blue"></a>
+<a href="https://github.com/RapidAI/RapidSpeech.cpp/stargazers"><img src="https://img.shields.io/github/stars/RapidAI/RapidSpeech.cpp?color=ccf"></a>
 
 # RapidSpeech.cpp 🎙️
 
-**RapidSpeech.cpp** is a high-performance, edge-native speech intelligence framework powered by **ggml**. It is designed to provide a pure C++, zero-dependency on-device inference solution for large-scale ASR (Automatic Speech Recognition) and TTS (Text-to-Speech) models.
+**RapidSpeech.cpp** is a high-performance, **edge-native speech intelligence framework** built on top of **ggml**.  
+It aims to provide **pure C++**, **zero-dependency**, and **on-device inference** for large-scale ASR (Automatic Speech Recognition) and TTS (Text-to-Speech) models.
 
 ------
 
-## 🌟 Core Strategic Advantages
+## 🌟 Key Differentiators
 
-In the current open-source landscape, while we have excellent cloud-based frameworks like **vLLM-omni** and mature edge tools like **sherpa-onnx**, **RapidSpeech.cpp** achieves a generational breakthrough in the following dimensions:
+While the open-source ecosystem already offers powerful cloud-side frameworks such as **vLLM-omni**, as well as mature on-device solutions like **sherpa-onnx**, **RapidSpeech.cpp** introduces a new generation of design choices focused on edge deployment.
 
-### 1. Distinction from vLLM: Edge vs. Cloud Throughput
+### 1. vs. vLLM: Edge-first, not cloud-throughput-first
 
-- **Deployment Environment:** vLLM is engineered for data centers, relying on Python environments and tight CUDA coupling to maximize GPU throughput via PagedAttention.
-- **RapidSpeech.cpp** focuses on **Edge Computing**. It prioritizes low latency and minimal footprint, capable of running on embedded devices, mobile phones, laptops, or NPU platforms without any GPU or Python runtime requirements.
+- **vLLM**
+    - Designed for data centers and cloud environments
+    - Strongly coupled with Python and CUDA
+    - Maximizes GPU throughput via techniques such as PageAttention
 
-### 2. Distinction from sherpa-onnx: Deeper Low-Level Control
+- **RapidSpeech.cpp**
+    - Designed specifically for **edge and on-device inference**
+    - Optimized for **low latency, low memory footprint, and lightweight deployment**
+    - Runs on embedded devices, mobile platforms, laptops, and even NPU-only systems
+    - **No Python runtime required**
 
-| Dimension             | sherpa-onnx (ONNX Runtime)                                   | **RapidSpeech.cpp (GGML)**                                   |
-| --------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
-| **Memory Management** | Relies on internal ORT allocation; memory overhead is relatively "black-box." | **Zero runtime memory allocation**. Memory is locked during the graph-building phase, completely eliminating on-device OOM (Out of Memory) issues. |
-| **Quantization**      | Primarily supports INT8; limited support for ultra-low bits (INT4/INT5). | **Cutting-edge Quantization**. Native support for the K-Quants series (Q4_K, Q5_K, Q6_K, etc.), significantly reducing bandwidth pressure while maintaining accuracy. |
-| **GPU Performance**   | Depends on ONNX EP mapping, incurring operator conversion overhead. | **Native GPU Optimization**. Directly invokes `ggml-cuda` or `ggml-metal`, offering inference efficiency significantly superior to the generic `onnxruntime-gpu`. |
-| **Deployment**        | Depends on dynamic libraries and often requires external config files (.yaml/.txt). | **Single Binary**. The GGUF format encapsulates all configurations and weights—deploy and run instantly. |
+### 2. vs. sherpa-onnx: Deeper control over the inference stack
 
-
-------
-
-## 🏗️ Architecture Design
-
-RapidSpeech.cpp is more than just an inference engine; it is a comprehensive speech business framework:
-
-- **Core Engine:** A `ggml`-based computational backend supporting mixed-precision inference from INT4 to FP32.
-- **Architecture Layer:** A plugin-based model builder with planned support for **Funasr-nano**, **CosyVoice**, **Qwen3-TTS**, and more.
-- **Business Logic:** Built-in circular buffers, VAD (Voice Activity Detection), text frontend (Phonemization), and multi-session management.
+| Aspect | sherpa-onnx (ONNX Runtime) | **RapidSpeech.cpp (ggml)** |
+| --- | --- | --- |
+| **Memory Management** | Managed internally by ORT, relatively opaque | **Zero runtime allocation** — memory is fully planned during graph construction to avoid edge-side OOM |
+| **Quantization** | Primarily INT8, limited support for ultra-low bit-width | **Full K-Quants family** (Q4_K / Q5_K / Q6_K), significantly reducing bandwidth and memory usage while preserving accuracy |
+| **GPU Performance** | Relies on execution providers with operator mapping overhead | **Native backends** (`ggml-cuda`, `ggml-metal`) with speech-specific optimizations, outperforming generic `onnxruntime-gpu` |
+| **Deployment** | Requires shared libraries and external config files | **Single binary deployment** — model weights and configs are fully encapsulated in **GGUF** |
 
 ------
 
-## 🚀 Key Features
+## 📦 Model Support
 
-- [ ] **Extreme Quantization:** Native support for 4-bit, 5-bit, 6-bit, and other quantization schemes to adapt to hardware with varying memory bandwidths.
-- [ ] **Zero Dependencies:** Pure C/C++ implementation, compiling into a single lightweight binary.
-- [ ] **GPU Acceleration:** Tailor-made optimizations for CUDA and Metal backends specifically for large speech model characteristics.
-- [ ] **Unified Format:** Both ASR and TTS models utilize a unified, extended **GGUF** format.
+**Automatic Speech Recognition (ASR)**
+- SenseVoice-small
+- FunASR-nano
+- Qwen3-ASR
+
+**Text-to-Speech (TTS)**
+- CosyVoice3
+- Qwen3-TTS
 
 ------
 
-## 🛠️ Quick Start (Under Development)
+## 🏗️ Architecture Overview
 
-Bash
+RapidSpeech.cpp is not just an inference wrapper — it is a full-featured speech application framework:
 
-```
+- **Core Engine**  
+  A `ggml`-based computation backend supporting mixed-precision inference from INT4 to FP32.
+
+- **Architecture Layer**  
+  A plugin-style model construction and loading system, with planned support for FunASR-nano, CosyVoice, Qwen3-TTS, and more.
+
+- **Business Logic Layer**  
+  Built-in ring buffers, VAD (voice activity detection), text frontend processing (e.g., phonemization), and multi-session management.
+
+------
+
+## 🚀 Core Features
+
+- [ ] **Extreme Quantization**: Native support for 4-bit, 5-bit, and 6-bit quantization schemes to match diverse hardware constraints.
+- [ ] **Zero Dependencies**: Implemented entirely in C/C++, producing a single lightweight binary.
+- [ ] **GPU / NPU Acceleration**: Customized CUDA and Metal backends optimized for speech models.
+- [ ] **Unified Model Format**: Both ASR and TTS models use an extended **GGUF** format.
+
+------
+
+## 🛠️ Quick Start (WIP)
+
+### Download Models
+
+Models are available on:
+
+- 🤗 Hugging Face: https://huggingface.co/lovemefan/RapidSpeech
+- ModelScope: https://www.modelscope.cn/models/lovemefan/RapidSpeech
+
+### Build & Run
+
+```bash
 git clone https://github.com/RapidAI/RapidSpeech.cpp
 cd RapidSpeech.cpp
+cmake -B build
+cmake --build build --config Release
+
+./build/rs-asr-offline \
+  -m /path/to/SenseVoice/sense-voice-small-fp32.gguf \
+  -w /path/to/test_sample_rate_16k.wav
 ```
 
 ------
