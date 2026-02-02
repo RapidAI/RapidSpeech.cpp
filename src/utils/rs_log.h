@@ -1,6 +1,6 @@
 #pragma once
 
-#include <string>
+#include <vector>
 
 /**
  * Log levels for the RapidSpeech framework.

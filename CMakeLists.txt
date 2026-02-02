@@ -120,8 +120,8 @@ if (RS_OPENCL)
 endif()
 
 # --- Example Executables ---
-add_executable(rs-cli examples/main.cpp)
-target_link_libraries(rs-cli PRIVATE rapidspeech)
+add_executable(rs-asr-offline examples/rs-asr-offline.cpp)
+target_link_libraries(rs-asr-offline PRIVATE rapidspeech)
 
 # --- Tests ---
 if (RS_BUILD_TESTS)

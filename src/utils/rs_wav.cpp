@@ -6,44 +6,76 @@
 #include <iostream>
 
 bool load_wav_file(const char* filename, std::vector<float>& data, int* sample_rate) {
-  std::ifstream file(filename, std::ios::binary);
-  if (!file.is_open()) {
-    return false;
-  }
-
-  WaveHeader header;
-  file.read(reinterpret_cast<char*>(&header), sizeof(WaveHeader));
-
-  // 基础校验
-  if (std::strncmp(header.chunkId, "RIFF", 4) != 0 || std::strncmp(header.format, "WAVE", 4) != 0) {
-    std::cerr << "[rs_wav] 错误：非法的 RIFF/WAVE 文件。" << std::endl;
-    return false;
-  }
-
-  if (header.bitsPerSample != 16) {
-    std::cerr << "[rs_wav] 错误：仅支持 16位 PCM WAV 文件。" << std::endl;
-    return false;
-  }
-
-  *sample_rate = static_cast<int>(header.sampleRate);
-    
-  // 计算采样点数量
-  int num_samples = header.subchunk2Size / (header.numChannels * (header.bitsPerSample / 8));
-  data.resize(num_samples);
-
-  // 读取 16位数据并归一化到 float [-1.0, 1.0]
-  for (int i = 0; i < num_samples; ++i) {
-    int16_t sample = 0;
-    file.read(reinterpret_cast<char*>(&sample), sizeof(int16_t));
-    data[i] = static_cast<float>(sample) / 32768.0f;
-        
-    // 如果是双声道，为了简单起见跳过第二个声道
-    if (header.numChannels > 1) {
-      file.seekg(sizeof(int16_t), std::ios::cur);
+    std::ifstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        return false;
     }
-  }
 
-  return true;
+    // Read initial 12 bytes to verify RIFF/WAVE
+    char riff_header[12];
+    file.read(riff_header, 12);
+    if (std::strncmp(riff_header, "RIFF", 4) != 0 || std::strncmp(riff_header + 8, "WAVE", 4) != 0) {
+        std::cerr << "[rs_wav] Error: Invalid RIFF/WAVE file." << std::endl;
+        return false;
+    }
+
+    uint16_t num_channels = 0;
+    uint32_t samples_per_sec = 0;
+    uint16_t bits_per_sample = 0;
+    uint32_t data_size = 0;
+
+    // Robustly search for 'fmt ' and 'data' chunks
+    char chunk_id[4];
+    uint32_t chunk_size;
+    while (file.read(chunk_id, 4) && file.read(reinterpret_cast<char*>(&chunk_size), 4)) {
+        if (std::strncmp(chunk_id, "fmt ", 4) == 0) {
+            uint16_t audio_format;
+            file.read(reinterpret_cast<char*>(&audio_format), 2);
+            file.read(reinterpret_cast<char*>(&num_channels), 2);
+            file.read(reinterpret_cast<char*>(&samples_per_sec), 4);
+            file.seekg(6, std::ios::cur); // Skip byteRate and blockAlign
+            file.read(reinterpret_cast<char*>(&bits_per_sample), 2);
+
+            if (audio_format != 1 || bits_per_sample != 16) {
+                std::cerr << "[rs_wav] Error: Only 16-bit PCM is supported." << std::endl;
+                return false;
+            }
+            // Skip remaining fmt chunk if any (e.g. for non-PCM)
+            if (chunk_size > 16) file.seekg(chunk_size - 16, std::ios::cur);
+        } else if (std::strncmp(chunk_id, "data", 4) == 0) {
+            data_size = chunk_size;
+            break; // Found the data chunk
+        } else {
+            // Skip unknown chunks
+            file.seekg(chunk_size, std::ios::cur);
+        }
+    }
+
+    if (num_channels == 0 || data_size == 0) {
+        std::cerr << "[rs_wav] Error: Could not find audio data." << std::endl;
+        return false;
+    }
+
+    *sample_rate = static_cast<int>(samples_per_sec);
+
+    // num_samples here is the number of audio frames (time steps)
+    int bytes_per_sample = bits_per_sample / 8;
+    int num_samples = data_size / (num_channels * bytes_per_sample);
+    data.resize(num_samples);
+
+    // Read samples
+    for (int i = 0; i < num_samples; ++i) {
+        int16_t sample = 0;
+        file.read(reinterpret_cast<char*>(&sample), sizeof(int16_t));
+        data[i] = static_cast<float>(sample);
+
+        // Correctly skip the remaining channels for multi-channel files
+        if (num_channels > 1) {
+            file.seekg(bytes_per_sample * (num_channels - 1), std::ios::cur);
+        }
+    }
+
+    return true;
 }
 
 static float DEFAULT_CMVN_MEANS[560];
@@ -81,7 +113,7 @@ void load_cmvn_params(struct gguf_context * ctx_gguf, std::vector<float>& means,
 
   // 2. Fallback to hardcoded defaults if GGUF doesn't have them
   if (!loaded) {
-    RS_LOG_INFO("Using hardcoded default CMVN parameters.");
+    RS_LOG_ERR("Can not found CMVN metadata from gguf file.");
     means.assign(DEFAULT_CMVN_MEANS, DEFAULT_CMVN_MEANS + 560);
     vars.assign(DEFAULT_CMVN_VARS, DEFAULT_CMVN_VARS + 560);
   }

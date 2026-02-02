@@ -40,6 +40,8 @@ public:
   // 4. Decode/Generate: e.g., Hidden States -> Text Tokens
   virtual bool Decode(RSState& state, ggml_backend_sched_t sched) = 0;
 
+  virtual std::string GetTranscription(RSState& state) = 0;
+
   // Get metadata
   virtual const RSModelMeta& GetMeta() const = 0;
 };

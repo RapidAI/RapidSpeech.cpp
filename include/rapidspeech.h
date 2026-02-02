@@ -27,9 +27,9 @@ typedef struct rs_context_t rs_context_t;
 // Task Types
 typedef enum {
   RS_TASK_ASR_OFFLINE = 0,
-  RS_TASK_ASR_STREAMING,
+  RS_TASK_ASR_ONLINE,
   RS_TASK_TTS_OFFLINE,
-  RS_TASK_TTS_STREAMING,
+  RS_TASK_TTS_ONLINE,
   RS_TASK_E2E_SPEECH_LLM // End-to-End Speech LLM
 } rs_task_type_t;
 

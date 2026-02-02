@@ -16,6 +16,11 @@ extern "C" {
 void rdft(int n, int isgn, double *a, int *ip, double *w);
 }
 
+// Helper function to calculate Mel scale
+static inline double mel_scale(double hz) {
+  return 1127.0 * std::log(1.0 + hz / 700.0);
+}
+
 AudioProcessor::AudioProcessor(const STFTConfig& config) : config_(config) {
   // Ensure n_fft is power of two
   config_.n_fft = RoundToPowerOfTwo(config_.frame_size);
@@ -46,33 +51,42 @@ void AudioProcessor::InitTables() {
   fft_ip_[0] = 0;
 }
 
+/**
+ * Replicated Mel Filter Bank calculation logic from Python.
+ * Logic: Interpolation is performed in the MEL domain.
+ */
 void AudioProcessor::InitMelFilters() {
-  int n_fft = config_.n_fft;
-  int n_mels = config_.n_mels;
-  int sample_rate = config_.sample_rate;
-  int num_bins = n_fft / 2 + 1;
+  const int n_mel = config_.n_mels;        // 80
+  const int fft_bins = config_.n_fft / 2; // 256 (for n_fft=512)
+  const int num_bins = fft_bins;          // Your Python script used 256 cols
 
-  mel_filters_.assign(n_mels * num_bins, 0.0f);
+  mel_filters_.assign(n_mel * num_bins, 0.0f);
 
-  auto hz_to_mel = [](float hz) { return 1127.0f * logf(1.0f + hz / 700.0f); };
-  auto mel_to_hz = [](float mel) { return 700.0f * (expf(mel / 1127.0f) - 1.0f); };
+  // Hardcoded constants from your Python script
+  const double mel_low_freq = 31.748642;   // mel_scale(20.0)
+  const double mel_freq_delta = 34.6702385;
+  const double fft_bin_width = (double)config_.sample_rate / config_.n_fft; // 16000 / 512 = 31.25
 
-  float min_mel = hz_to_mel(config_.f_min);
-  float max_mel = hz_to_mel(config_.f_max);
-  float mel_step = (max_mel - min_mel) / (n_mels + 1);
-
-  for (int i = 0; i < n_mels; i++) {
-    float f0 = mel_to_hz(min_mel + i * mel_step);
-    float f1 = mel_to_hz(min_mel + (i + 1) * mel_step);
-    float f2 = mel_to_hz(min_mel + (i + 2) * mel_step);
+  for (int i = 0; i < n_mel; i++) {
+    // Calculate Mel boundaries for the current triangular filter
+    double left_mel   = mel_low_freq + i * mel_freq_delta;
+    double center_mel = mel_low_freq + (i + 1.0) * mel_freq_delta;
+    double right_mel  = mel_low_freq + (i + 2.0) * mel_freq_delta;
 
     for (int j = 0; j < num_bins; j++) {
-      float freq = (float)j * sample_rate / n_fft;
-      if (freq >= f0 && freq <= f1) {
-        mel_filters_[i * num_bins + j] = (freq - f0) / (f1 - f0);
-      } else if (freq > f1 && freq <= f2) {
-        mel_filters_[i * num_bins + j] = (f2 - freq) / (f2 - f1);
-      }
+      // Frequency of the current FFT bin in Hz
+      double freq_hz = fft_bin_width * j;
+      // Convert current bin frequency to Mel
+      double mel_num = mel_scale(freq_hz);
+
+      // Calculate slopes in the MEL domain (Python logic)
+      double up_slope   = (mel_num - left_mel) / (center_mel - left_mel);
+      double down_slope = (right_mel - mel_num) / (right_mel - center_mel);
+
+      // Triangle filter: max(0, min(up, down))
+      double filter_val = std::max(0.0, std::min(up_slope, down_slope));
+
+      mel_filters_[i * num_bins + j] = static_cast<float>(filter_val);
     }
   }
 }
@@ -123,17 +137,17 @@ void AudioProcessor::ComputeFbank(const std::vector<float>& samples, std::vector
     // 6. Power Spectrum
     // rdft output: [Re0, Re(n/2), Re1, Im1, Re2, Im2 ... Re(n/2-1), Im(n/2-1)]
     std::vector<double> power_spec(config_.n_fft / 2 + 1);
-    power_spec[0] = window[0] * window[0]; // DC
-    power_spec[config_.n_fft / 2] = window[1] * window[1]; // Nyquist
-    for (int j = 1; j < config_.n_fft / 2; j++) {
+    // power_spec[0] = window[0] * window[0]; // DC
+    // power_spec[config_.n_fft / 2] = window[1] * window[1]; // Nyquist
+    for (int j = 0; j < config_.n_fft / 2; j++) {
       power_spec[j] = window[2 * j] * window[2 * j] + window[2 * j + 1] * window[2 * j + 1];
     }
 
     // 7. Mel Filtering
-    int num_bins = config_.n_fft / 2 + 1;
+    int num_bins = config_.n_fft / 2 ;
     for (int j = 0; j < config_.n_mels; j++) {
       double mel_energy = 0.0;
-      for (int k = 0; k < num_bins; k++) {
+      for (int k = 0; k <= num_bins; k++) {
         mel_energy += power_spec[k] * mel_filters_[j * num_bins + k];
       }
       // Log & Clamp

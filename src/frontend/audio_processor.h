@@ -11,7 +11,7 @@ struct STFTConfig {
   int frame_step = 160; // 10ms @ 16k
   int n_fft = 512;      // Power of 2 padding
   int n_mels = 80;
-  float f_min = 0.0f;
+  float f_min = 31.748642f;
   float f_max = 8000.0f;
 
   // --- SenseVoice Specific (LFR & CMVN) ---

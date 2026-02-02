@@ -1,27 +1,25 @@
 #include "core/rs_processor.h"
 #include "utils/rs_log.h"
+#include "ggml-backend.h"
 #include <iostream>
 #include <algorithm>
 
 RSProcessor::RSProcessor(std::shared_ptr<ISpeechModel> model, ggml_backend_sched_t sched)
     : model_(model), sched_(sched) {
 
-  // 1. Configure the Audio Processor based on model metadata
   STFTConfig config;
   if (model_) {
     const auto& meta = model_->GetMeta();
     config.sample_rate = meta.audio_sample_rate;
     config.n_mels = meta.n_mels;
 
-    // SenseVoice specific frontend defaults
+    // SenseVoice specific frontend config
     config.use_lfr = true;
     config.lfr_m = 7;
     config.lfr_n = 6;
   }
 
   audio_proc_ = std::make_unique<AudioProcessor>(config);
-
-  // 2. Initialize the model-specific state (context for inference)
   if (model_) {
     state_ = model_->CreateState();
   }
@@ -39,59 +37,47 @@ void RSProcessor::SetCMVN(const std::vector<float>& means, const std::vector<flo
 
 int RSProcessor::Process() {
   if (!model_ || !state_ || !sched_) {
-    RS_LOG_ERR("Processor not fully initialized.");
+    RS_LOG_ERR("Processor error: Missing model, state, or scheduler.");
     return -1;
   }
 
-  // Wait until we have enough data for a meaningful inference
   if (audio_buffer_.Size() < static_cast<size_t>(chunk_size_samples_)) {
     return 0;
   }
 
-  // 1. Fetch chunk from circular buffer
-  std::vector<float> pcm_chunk = audio_buffer_.Pop(chunk_size_samples_);
-
-  // 2. Feature Extraction (PCM -> Fbank -> LFR -> CMVN)
+  std::vector<float> pcm_chunk = audio_buffer_.Pop(audio_buffer_.Size());
+  float pcm_duration = pcm_chunk.size() / model_->GetMeta().audio_sample_rate;
+  std::chrono::steady_clock::time_point start = std::chrono::high_resolution_clock::now();
   std::vector<float> features;
   audio_proc_->Compute(pcm_chunk, features);
 
-  if (features.empty()) {
-    return 0;
-  }
+  if (features.empty()) return 0;
 
-  // 3. Model Encoding (Audio Features -> Hidden States)
+  // --- CRITICAL FIX FOR Encode Graph ---
+  // Reset the scheduler to clear memory assignments before building/allocating the Encode graph.
+  ggml_backend_sched_reset(sched_);
+
+  // 3. Model Encoding
   if (!model_->Encode(features, *state_, sched_)) {
     RS_LOG_ERR("Model encoding failed.");
     return -1;
   }
 
-  // 4. Model Decoding (Hidden States -> Token IDs)
+  // --- CRITICAL FIX FOR Decode Graph ---
+  // Since Decode builds a NEW ggml_cgraph with its own context, we MUST reset the scheduler
+  // again to prevent "GGML_ASSERT(!sched->is_alloc)" failure.
+  // The previous graph (Encode) has already finished execution, so it's safe to clear.
+  ggml_backend_sched_reset(sched_);
+
+  // 4. Model Decoding
   if (!model_->Decode(*state_, sched_)) {
     RS_LOG_ERR("Model decoding failed.");
     return -1;
   }
+  std::chrono::steady_clock::time_point end = std::chrono::high_resolution_clock::now();
 
-  // 5. Post-process Token IDs to Text
-  // We need to access the derived state to get the results
-  // For SenseVoice, results are in state->ids
-  // Note: In a production version, we would use a more generic state access
-  // but for now, we assume SenseVoice-like ID container.
-
-  // This is a simplified token-to-text conversion with CTC deduplication
-  // In a real project, this logic would likely live in a 'Tokenizer' class.
-
-  // Since ISpeechModel doesn't expose vocab directly via the interface
-  // (except in metadata), we cast for now or ideally add it to the interface.
-  // Assuming SenseVoiceModel's vocab is accessible or using a placeholder:
-
-  // For now, let's represent the logic:
-  // for (int id : sv_state->ids) {
-  //    if (id != 0 && id != last_token_id_) {
-  //        text_accumulator_ += model_vocab[id];
-  //    }
-  //    last_token_id_ = id;
-  // }
-
+  text_accumulator_ = model_->GetTranscription(*state_);
+  RS_LOG_INFO("RTF is: %f", std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1e6 / pcm_duration);
   return 1;
 }
 
@@ -99,8 +85,7 @@ std::string RSProcessor::GetTextResult() {
   return text_accumulator_;
 }
 
-// --- CircularBuffer Implementation ---
-
+// CircularBuffer implementation...
 void CircularBuffer::Push(const float* data, size_t size) {
   if (data && size > 0) {
     buffer_.insert(buffer_.end(), data, data + size);
@@ -109,16 +94,12 @@ void CircularBuffer::Push(const float* data, size_t size) {
 
 std::vector<float> CircularBuffer::Pop(size_t size) {
   if (buffer_.size() < size) return {};
-
-  std::vector<float> result;
-  result.reserve(size);
+  std::vector<float> result(size);
   for (size_t i = 0; i < size; ++i) {
-    result.push_back(buffer_.front());
+    result[i] = buffer_.front();
     buffer_.pop_front();
   }
   return result;
 }
 
-size_t CircularBuffer::Size() const {
-  return buffer_.size();
-}
+size_t CircularBuffer::Size() const { return buffer_.size(); }

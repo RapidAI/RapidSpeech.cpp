@@ -20,6 +20,7 @@ struct WaveHeader {
   uint16_t bitsPerSample;
   char subchunk2Id[4];
   uint32_t subchunk2Size;
+
 };
 
 /**

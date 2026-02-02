@@ -1,46 +1,38 @@
 #include "sensevoice.h"
+#include "ctc_decoder.h"
 #include "core/rs_context.h"
 #include "utils/rs_log.h"
 #include "ggml.h"
+#include "ggml-cpu.h"
 #include "ggml-backend.h"
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include "utils/debug_utils.h"
 
-#define SENSE_VOICE_ENCODER_MAX_NODES 8192
-#define SENSE_VOICE_DECODER_MAX_NODES 16
+// Increased node limit to handle deep SenseVoice graphs (50+ layers)
+#define SENSE_VOICE_ENCODER_MAX_NODES 6144
+#define SENSE_VOICE_DECODER_MAX_NODES 128
 
-/**
- * SenseVoice internal request state.
- * Manages persistent tensors and backend buffers that need to survive
- * between the Encode and Decode phases.
- */
 struct SenseVoiceState : public RSState {
-  // Persistent context for tensor metadata (lives as long as the state)
   struct ggml_context * ctx_persistent = nullptr;
-  // Persistent buffer for actual tensor data on the backend (e.g., GPU memory)
   ggml_backend_buffer_t buffer_persistent = nullptr;
-
-  // Pointer to the encoder output tensor (metadata in ctx_persistent, data in buffer_persistent)
   struct ggml_tensor * encoder_out = nullptr;
 
   std::vector<int32_t> ids;
-  int language_id = 1; // Default: English (1)
-  bool use_itn = false;
+  std::vector<std::string> tokens;
+  int language_id = 0;
+  bool use_itn = true;
 
   SenseVoiceState() {
-    // Initialize a small persistent context for model results metadata
-    struct ggml_init_params params = { 128 * ggml_tensor_overhead(), nullptr, true };
+    // Increase persistent context to ensure enough room for tensor metadata
+    struct ggml_init_params params = { 512 * ggml_tensor_overhead(), nullptr, true };
     ctx_persistent = ggml_init(params);
   }
 
   ~SenseVoiceState() {
-    if (buffer_persistent) {
-      ggml_backend_buffer_free(buffer_persistent);
-    }
-    if (ctx_persistent) {
-      ggml_free(ctx_persistent);
-    }
+    if (buffer_persistent) ggml_backend_buffer_free(buffer_persistent);
+    if (ctx_persistent) ggml_free(ctx_persistent);
   }
 };
 
@@ -64,6 +56,7 @@ static struct ggml_tensor * ggml_mul_mat_pad(struct ggml_context * ctx, struct g
   return ggml_add(ctx, ggml_mul_mat(ctx, x_0, y_0), ggml_mul_mat(ctx, x_1, y_1));
 }
 
+
 /**
  * Forward pass for a single SANM (Self-Attention Network with Memory) layer.
  * Implements LayerNorm -> SelfAttention -> FSMN -> Residual -> LayerNorm -> MLP -> Residual.
@@ -80,7 +73,11 @@ static struct ggml_tensor * encoder_layer_sanm_forward(
   const int n_batch = cur->ne[2];
 
   struct ggml_tensor * residual = cur;
-
+  if (layer.e_norm_w1->ne[0] == layer.e_norm_w2->ne[0]) {
+    residual = ggml_cpy(
+            ctx, cur,
+            ggml_new_tensor_3d(ctx, cur->type, cur->ne[0], cur->ne[1], cur->ne[2]));
+  }
   // 1. Layer Norm 1
   cur = ggml_norm(ctx, cur, hparams.eps);
   cur = ggml_add(ctx, ggml_mul(ctx, cur, layer.e_norm_w1), layer.e_norm_b1);
@@ -88,7 +85,7 @@ static struct ggml_tensor * encoder_layer_sanm_forward(
   // 2. Self Attention (Linear Projections)
   struct ggml_tensor * Q = ggml_add(ctx, ggml_mul_mat_pad(ctx, ggml_cont(ctx, layer.e_attn_ln_q_w), cur), layer.e_attn_ln_q_b);
   struct ggml_tensor * K = ggml_add(ctx, ggml_mul_mat_pad(ctx, ggml_cont(ctx, layer.e_attn_ln_k_w), cur), layer.e_attn_ln_k_b);
-  struct ggml_tensor * V = ggml_add(ctx, ggml_mul_mat_pad(ctx, ggml_cont(ctx, layer.e_attn_ln_v_w), cur), layer.e_attn_ln_v_b);
+  struct ggml_tensor * V = ggml_add(ctx, ggml_mul_mat_pad(ctx, layer.e_attn_ln_v_w, cur), layer.e_attn_ln_v_b);
 
   // Reshape and Permute for multi-head attention
   struct ggml_tensor * Q_h = ggml_permute(ctx, ggml_reshape_4d(ctx, Q, n_state / n_head, n_head, n_ctx, n_batch), 0, 2, 1, 3);
@@ -104,18 +101,24 @@ static struct ggml_tensor * encoder_layer_sanm_forward(
   // Merge heads
   struct ggml_tensor * attn_out = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_permute(ctx, KQV, 0, 2, 1, 3)), n_state, n_ctx, n_batch);
   attn_out = ggml_add(ctx, ggml_mul_mat(ctx, layer.e_attn_ln_out_w, attn_out), layer.e_attn_ln_out_b);
+  ggml_set_name(attn_out, "attn_out");
 
   // 3. FSMN Block (Memory Block) using depth-wise convolution logic
   int padding = (hparams.fsmn_kernel_size - 1) / 2; // Kernel size 31
   struct ggml_tensor * fsmn_in = ggml_cont(ctx, ggml_transpose(ctx, V));
   struct ggml_tensor * im2col = ggml_im2col(ctx,
                                            layer.e_attn_fsmn_w,
-                                           ggml_reshape_3d(ctx, fsmn_in, fsmn_in->ne[0], fsmn_in->ne[2], fsmn_in->ne[1] * fsmn_in->ne[3]),
+                                           ggml_reshape_4d(ctx, fsmn_in, fsmn_in->ne[0], 1,  fsmn_in->ne[1], fsmn_in->ne[2] * fsmn_in->ne[3]),
                                            1, 0, padding, 0, 1, 0, false, GGML_TYPE_F32);
   struct ggml_tensor * fsmn_out = ggml_mul_mat(ctx, layer.e_attn_fsmn_w, im2col);
-  fsmn_out = ggml_reshape_3d(ctx, fsmn_out, n_state, n_ctx, n_batch);
+  fsmn_out = ggml_reshape_3d(ctx, fsmn_out, im2col->ne[1], im2col->ne[2], im2col->ne[3]);
+  fsmn_out = ggml_cont(ctx, ggml_transpose(ctx, fsmn_out));
+  fsmn_out = ggml_add(ctx, fsmn_out, V);
+  attn_out = ggml_add(ctx, fsmn_out, attn_out);
 
-  attn_out = ggml_add(ctx, attn_out, fsmn_out);
+  if (layer.e_norm_w1->ne[0] == layer.e_norm_w2->ne[0]) {
+    attn_out = ggml_add(ctx, attn_out, residual);
+  }
 
 
   // 4. Layer Norm 2 + MLP
@@ -127,6 +130,27 @@ static struct ggml_tensor * encoder_layer_sanm_forward(
   cur = ggml_add(ctx, ggml_mul_mat(ctx, layer.e_mlp_w2, cur), layer.e_mlp_b2);
 
   return ggml_add(ctx, cur, attn_out);
+}
+
+/**
+ * Helper to safely initialize a ggml context and graph.
+ * Prevents 0x0 crashes by checking allocation results.
+ */
+static bool init_compute_ctx(struct ggml_context ** ctx, struct ggml_cgraph ** gf, int n_nodes) {
+  // We add 1MB of buffer to the tensor overhead to be safe
+  size_t mem_size = n_nodes * ggml_tensor_overhead() + (1024 * 1024);
+  struct ggml_init_params params = { mem_size, nullptr, true };
+  *ctx = ggml_init(params);
+  if (!(*ctx)) {
+    RS_LOG_ERR("ggml_init failed: out of memory for context.");
+    return false;
+  }
+  *gf = ggml_new_graph_custom(*ctx, n_nodes, false);
+  if (!(*gf)) {
+    RS_LOG_ERR("ggml_new_graph_custom failed: too many nodes or out of memory.");
+    return false;
+  }
+  return true;
 }
 
 // --- SenseVoiceModel Implementation ---
@@ -196,7 +220,6 @@ bool SenseVoiceModel::Load(const std::unique_ptr<rs_context_t>& ctx, ggml_backen
 bool SenseVoiceModel::MapTensors(std::map<std::string, struct ggml_tensor*>& tensors) {
   try {
     encoder_->embedding = tensors.at("embed.weight");
-
     std::vector<SenseVoiceLayerEncoder> tmp_encoder0(1);
     SetLayerWeights(tmp_encoder0, tensors, 1, "encoders0");
     encoder_->encoder0 = tmp_encoder0[0];
@@ -254,56 +277,49 @@ std::shared_ptr<RSState> SenseVoiceModel::CreateState() {
  */
 bool SenseVoiceModel::Encode(const std::vector<float>& input_frames, RSState& state, ggml_backend_sched_t sched) {
   auto& sv_state = static_cast<SenseVoiceState&>(state);
-  int n_len = input_frames.size() / hparams_.n_mels;
+  int n_len = input_frames.size() / hparams_.feats_dim;
   int hidden = hparams_.n_encoder_hidden_state;
 
-  // 1. Initialize transient context for graph nodes
-  struct ggml_init_params params = { SENSE_VOICE_ENCODER_MAX_NODES * ggml_tensor_overhead(), nullptr, true };
-  struct ggml_context * ctx0 = ggml_init(params);
-  struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, SENSE_VOICE_ENCODER_MAX_NODES, false);
+  struct ggml_context * ctx0 = nullptr;
+  struct ggml_cgraph * gf = nullptr;
 
-  // 2. Define Input Tensors
+  if (!init_compute_ctx(&ctx0, &gf, SENSE_VOICE_ENCODER_MAX_NODES)) {
+      return false;
+  }
+
+  // Define Input Tensors
   struct ggml_tensor * feature = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams_.feats_dim, n_len);
-  ggml_set_name(feature, "feats");
-  ggml_set_input(feature);
-
   struct ggml_tensor * prompt_ids = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 4, 1);
-  ggml_set_name(prompt_ids, "embedding"); // Key from reference
-  ggml_set_input(prompt_ids);
-
   struct ggml_tensor * position = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, hparams_.feats_dim, n_len + 4, 1);
+
+  ggml_set_name(feature, "feats");
+  ggml_set_name(prompt_ids, "prompt_ids");
   ggml_set_name(position, "position");
+
+  ggml_set_input(feature);
+  ggml_set_input(prompt_ids);
   ggml_set_input(position);
 
-  // 3. Process Prompt Tokens (Language, Task, ITN)
+  // Graph construction logic...
   struct ggml_tensor * emb = ggml_get_rows(ctx0, encoder_->embedding, prompt_ids);
-  // Expand prompt embedding to match batch size (usually 1)
+  ggml_set_name(emb, "embedding");
   emb = ggml_repeat(ctx0, emb, ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, emb->ne[0], emb->ne[1], 1));
-
-  // 4. Concatenate Prompt and Mel features
   struct ggml_tensor * cur = ggml_concat(ctx0, emb, feature, 1);
   cur = ggml_scale(ctx0, cur, sqrtf(hidden));
-
-  // 5. Add Sinusoidal Positional Encoding
   cur = ggml_add(ctx0, position, cur);
 
-  // 6. Forward through SANM layers
   cur = encoder_layer_sanm_forward(hparams_, ctx0, cur, encoder_->encoder0);
-
   for (int i = 0; i < hparams_.n_encoder_layers - 1; ++i) {
     cur = encoder_layer_sanm_forward(hparams_, ctx0, cur, encoder_->encoders_layer[i]);
   }
 
-  // Encoder Post-Norm
   cur = ggml_norm(ctx0, cur, hparams_.eps);
   cur = ggml_add(ctx0, ggml_mul(ctx0, cur, encoder_->e_after_norm_w), encoder_->e_after_norm_b);
 
-  // Forward through Time-Parallel (TP) layers
   for (int i = 0; i < hparams_.n_tp_encoder_layers; ++i) {
     cur = encoder_layer_sanm_forward(hparams_, ctx0, cur, encoder_->tp_encoders_layer[i]);
   }
 
-  // TP Final Norm
   cur = ggml_norm(ctx0, cur, hparams_.eps);
   cur = ggml_add(ctx0, ggml_mul(ctx0, cur, encoder_->e_tp_norm_w), encoder_->e_tp_norm_b);
 
@@ -311,36 +327,45 @@ bool SenseVoiceModel::Encode(const std::vector<float>& input_frames, RSState& st
   ggml_set_output(cur);
   ggml_build_forward_expand(gf, cur);
 
-  // 7. Allocation Phase (CRITICAL for multi-backend safety)
+  // Allocate and execute
   if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+    // If this is the first run, GGML might fail to allocate while it calculates reserves.
+    // We check logs; if it still crashes here, the node count or memory is definitely the issue.
     ggml_free(ctx0);
     return false;
   }
 
-  // 8. Upload data to backend buffers
+  // Set data
   ggml_backend_tensor_set(feature, input_frames.data(), 0, input_frames.size() * sizeof(float));
-
   int p_tokens[4] = { sv_state.language_id, 1, 2, sv_state.use_itn ? 14 : 15 };
   ggml_backend_tensor_set(prompt_ids, p_tokens, 0, 4 * sizeof(int));
 
-  // Dynamic generation of sinusoidal positional encoding
-  std::vector<float> _pos((n_len + 4) * hidden);
-  for (int k = 1; k <= (n_len + 4); ++k) {
-    for (int i = 0; i < hidden / 2; ++i) {
-      float val = k * powf(10000.0f, -2.0f * i / hidden);
-      _pos[(k - 1) * hidden + i] = sinf(val);
-      _pos[(k - 1) * hidden + i + hidden / 2] = cosf(val);
+  // --- POSITIONAL ENCODING FIX ---
+  // Construct sinusoidal position embedding based on FunASR reference
+  auto p_n_len = position->ne[1];
+  auto p_dim = position->ne[0];
+  auto p_n_batch = position->ne[2];
+  std::vector<float> _position(p_n_len * p_dim * p_n_batch);
+
+  for (int b = 0; b < p_n_batch; b++) {
+    for (int k = 1; k <= p_n_len; k++) {
+      for (int i = 0; i < p_dim / 2; i++) {
+        float freq = pow(10000, -2.0 * i / p_dim);
+        _position[b * p_n_len * p_dim + (k - 1) * p_dim + i] = sinf(k * freq);
+        _position[b * p_n_len * p_dim + (k - 1) * p_dim + i + p_dim / 2] = cosf(k * freq);
+      }
     }
   }
-  ggml_backend_tensor_set(position, _pos.data(), 0, _pos.size() * sizeof(float));
 
-  // 9. Execute computation
+  ggml_backend_tensor_set(position, _position.data(), 0, ggml_nelements(position) * sizeof(float));
+
+  // ggml_backend_sched_set_eval_callback(sched, ggml_debug, new callback_data());
   if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
     ggml_free(ctx0);
     return false;
   }
 
-  // 10. Persist the results to state managed buffer before freeing graph context
+  // Persistence logic...
   if (sv_state.encoder_out == nullptr || sv_state.encoder_out->ne[0] != cur->ne[0] || sv_state.encoder_out->ne[1] != cur->ne[1]) {
     if (sv_state.buffer_persistent) ggml_backend_buffer_free(sv_state.buffer_persistent);
     sv_state.encoder_out = ggml_new_tensor_2d(sv_state.ctx_persistent, cur->type, cur->ne[0], cur->ne[1]);
@@ -355,55 +380,92 @@ bool SenseVoiceModel::Encode(const std::vector<float>& input_frames, RSState& st
   return true;
 }
 
+
 /**
- * Build and execute the CTC Decoder computation graph.
- * Hidden States -> Linear Projection -> Softmax -> Argmax -> Token IDs.
+ * Enhanced Decode function supporting Greedy and Beam Search.
  */
 bool SenseVoiceModel::Decode(RSState& state, ggml_backend_sched_t sched) {
-  auto& sv_state = static_cast<SenseVoiceState&>(state);
-  if (!sv_state.encoder_out) return false;
+    auto& sv_state = static_cast<SenseVoiceState&>(state);
+    if (!sv_state.encoder_out) return false;
 
-  struct ggml_context * ctx0 = ggml_init({ 128 * ggml_tensor_overhead(), nullptr, true });
-  struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, SENSE_VOICE_DECODER_MAX_NODES, false);
+    int T = sv_state.encoder_out->ne[1];
+    int V = hparams_.n_vocab;
+    int beam_size = 1; // You can pull this from params later
 
-  // Map decoder input to the shape of the persistent encoder output
-  struct ggml_tensor * encoder_in = ggml_new_tensor_2d(ctx0, sv_state.encoder_out->type,
-                                                      sv_state.encoder_out->ne[0], sv_state.encoder_out->ne[1]);
-  ggml_set_input(encoder_in);
+    struct ggml_context * ctx0 = ggml_init({ 256 * ggml_tensor_overhead(), nullptr, true });
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, SENSE_VOICE_DECODER_MAX_NODES, false);
 
-  // Step: Linear projection to vocab size (ctc_lo)
-  struct ggml_tensor * cur = ggml_mul_mat(ctx0, encoder_->ctc_out_linear_weight, encoder_in);
-  cur = ggml_add(ctx0, cur, encoder_->ctc_out_linear_bias);
+    struct ggml_tensor * encoder_in = ggml_new_tensor_2d(ctx0, sv_state.encoder_out->type,
+                                                        sv_state.encoder_out->ne[0], sv_state.encoder_out->ne[1]);
+    ggml_set_input(encoder_in);
 
-  // Step: Argmax over softmax probabilities
-  struct ggml_tensor * probs = ggml_soft_max(ctx0, cur);
-  struct ggml_tensor * argmax = ggml_argmax(ctx0, probs);
+    // 1. Linear projection to vocab size
+    struct ggml_tensor * cur = ggml_mul_mat(ctx0, encoder_->ctc_out_linear_weight, encoder_in);
+    cur = ggml_add(ctx0, cur, encoder_->ctc_out_linear_bias);
 
-  ggml_set_output(argmax);
-  ggml_build_forward_expand(gf, argmax);
+    // 2. Compute log-probabilities
+    struct ggml_tensor * log_probs =  ggml_log(ctx0, ggml_soft_max(ctx0, cur));
 
-  if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+    struct ggml_tensor * output_node = nullptr;
+
+    if (beam_size <= 1) {
+        // Greedy serach: Calculate argmax on backend
+        output_node = ggml_argmax(ctx0, log_probs);
+    } else {
+        // Beam Search Mode: We need the full log-probs on host
+        output_node = log_probs;
+    }
+    ggml_set_name(output_node, "output");
+
+    ggml_set_output(output_node);
+    ggml_build_forward_expand(gf, output_node);
+
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+        ggml_free(ctx0);
+        return false;
+    }
+
+    ggml_backend_tensor_copy(sv_state.encoder_out, encoder_in);
+
+    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+        ggml_free(ctx0);
+        return false;
+    }
+
+
+    // 3. Post-Processing on Host
+    if (beam_size <= 1) {
+        // --- Greedy Decoding ---
+        std::vector<int32_t> raw_ids(T);
+        ggml_backend_tensor_get(output_node, raw_ids.data(), 0, T * sizeof(int32_t));
+
+        // Use CTCDecoder to collapse repeats and remove blanks
+        sv_state.ids = CTCDecoder::GreedyDecode(raw_ids.data(), T);
+    } else {
+        // --- Beam Search Decoding ---
+        std::vector<float> host_log_probs(T * V);
+        ggml_backend_tensor_get(output_node, host_log_probs.data(), 0, T * V * sizeof(float));
+
+        sv_state.ids = CTCDecoder::BeamSearchDecode(host_log_probs.data(), T, V, beam_size);
+    }
+
+    for (auto id: sv_state.ids){ sv_state.tokens.push_back(this->vocab_.id_to_token[id]);}
+
     ggml_free(ctx0);
-    return false;
-  }
-
-  // Transfer persistent result to decoder input
-  ggml_backend_tensor_copy(sv_state.encoder_out, encoder_in);
-
-  if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
-    ggml_free(ctx0);
-    return false;
-  }
-
-  // Extract predicted Token IDs from backend to host vector
-  struct ggml_tensor * res_node = ggml_graph_node(gf, ggml_graph_n_nodes(gf) - 1);
-  sv_state.ids.resize(ggml_nelements(res_node));
-  ggml_backend_tensor_get(res_node, sv_state.ids.data(), 0, sv_state.ids.size() * sizeof(int32_t));
-
-  ggml_free(ctx0);
-  return true;
+    return true;
 }
 
+std:: string SenseVoiceModel::GetTranscription(RSState& state)
+{
+  auto& sv_state = static_cast<SenseVoiceState&>(state);
+  std::string result;
+  result.reserve(64);   // ⭐ 关键：避免反复 realloc
+
+  for (const auto& s : sv_state.tokens) {
+    result += s;
+  }
+  return result;
+}
 // Registration logic
 extern void rs_register_model_arch(const std::string& arch, std::function<std::shared_ptr<ISpeechModel>()> creator);
 namespace {

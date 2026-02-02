@@ -1,204 +1,226 @@
 #include "core/rs_context.h"
-#include "ggml-alloc.h"
-#include "ggml-backend.h"
-#include "ggml-metal.h"
-#include "ggml-opencl.h"
-#include "ggml-vulkan.h"
-#include "ggml-cann.h"
-#include "ggml-cpu.h"
-#include "gguf.h"
 #include "utils/rs_log.h"
-#include <functional>
+#include "ggml-alloc.h"
+#include "ggml-cpu.h"
+#include "ggml-backend.h"
+#include "gguf.h"
+
+// Include corresponding backend headers based on macro definitions
+#ifdef RS_USE_METAL
+#include "ggml-metal.h"
+#endif
+#ifdef RS_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+#ifdef RS_USE_VULKAN
+#include "ggml-vulkan.h"
+#endif
+#ifdef RS_USE_CANN
+#include "ggml-cann.h"
+#endif
+
 #include <iostream>
 #include <stdexcept>
+#include <functional>
 #include <unordered_map>
+#include <vector>
 
-// --- Factory Infrastructure (Auto-Registration) ---
-
-using ModelCreator = std::function<std::shared_ptr<ISpeechModel>()>;
+// Global registry for model architectures
 static std::unordered_map<std::string, ModelCreator>& get_model_registry() {
-  static std::unordered_map<std::string, ModelCreator> registry;
-  return registry;
+    static std::unordered_map<std::string, ModelCreator> registry;
+    return registry;
 }
 
 void rs_register_model_arch(const std::string& arch, ModelCreator creator) {
-  get_model_registry()[arch] = creator;
+    get_model_registry()[arch] = creator;
 }
 
-// --- rs_context_t Implementation ---
-
-rs_context_t::rs_context_t() : sched(nullptr) {
-  // Member 'backends' is default initialized as an empty vector
-}
+rs_context_t::rs_context_t() : sched(nullptr), ctx_gguf(nullptr), gguf_data(nullptr) {}
 
 rs_context_t::~rs_context_t() {
-  RS_LOG_INFO("Releasing RapidSpeech context resources...");
+    // IMPORTANT: Clear processor and model first.
+    // This ensures that any RSState or persistent backend buffers (especially Metal resources)
+    // are deallocated while the backends and scheduler are still valid.
+    processor.reset();
+    model.reset();
 
-  if (sched) {
-    ggml_backend_sched_free(sched);
-  }
-
-  for (auto backend : backends) {
-    ggml_backend_free(backend);
-  }
-}
-
-bool rs_context_t::init_backend() {
-  // 1. Try to initialize high-performance backends first
-
-#ifdef RS_USE_CUDA
-  if (params.use_gpu) {
-    ggml_backend_t cuda_backend = ggml_backend_cuda_init(0);
-    if (cuda_backend) {
-      RS_LOG_INFO("CUDA backend added to scheduler.");
-      backends.push_back(cuda_backend);
-    } else {
-      RS_LOG_WARN("CUDA requested but initialization failed.");
+    // Free weight buffers explicitly to satisfy Metal residency set assertions
+    for (auto buf : weight_buffers) {
+        ggml_backend_buffer_free(buf);
     }
-  }
-#endif
+    weight_buffers.clear();
 
-#ifdef RS_USE_METAL
-  if (params.use_gpu) {
-    ggml_backend_t metal_backend = ggml_backend_metal_init();
-    if (metal_backend) {
-      RS_LOG_INFO("Metal backend added to scheduler.");
-      backends.push_back(metal_backend);
-    } else {
-      RS_LOG_WARN("Metal requested but initialization failed.");
-    }
-  }
-#endif
+    // Now it is safe to free the scheduler as all its managed tensors/buffers are gone
+    if (sched) ggml_backend_sched_free(sched);
 
-#ifdef RS_USE_VULKAN
-  if (params.use_gpu) {
-    ggml_backend_t vulkan_backend = ggml_backend_vk_init(0);
-    if (vulkan_backend) {
-      RS_LOG_INFO("Vulkan backend added to scheduler.");
-      backends.push_back(vulkan_backend);
-    } else {
-      RS_LOG_WARN("Vulkan requested but initialization failed.");
-    }
-  }
-#endif
+    // Free all backend instances
+    for (auto b : backends) ggml_backend_free(b);
 
-#ifdef RS_USE_CANN
-  if (params.use_gpu) {
-    ggml_backend_t cann_backend = ggml_backend_cann_init(0);
-    if (cann_backend) {
-      RS_LOG_INFO("CANN backend added to scheduler.");
-      backends.push_back(cann_backend);
-    } else {
-      RS_LOG_WARN("CANN requested but initialization failed.");
-    }
-  }
-#endif
-
-#ifdef RS_USE_OPENCL
-  if (params.use_gpu) {
-    ggml_backend_t opencl_backend = ggml_backend_opencl_init();
-    if (opencl_backend) {
-      RS_LOG_INFO("OpenCL backend added to scheduler.");
-      backends.push_back(opencl_backend);
-    } else {
-      RS_LOG_WARN("OpenCL requested but initialization failed.");
-    }
-  }
-#endif
-
-  // 2. Always add CPU backend as a fallback
-  ggml_backend_t cpu_backend = ggml_backend_cpu_init();
-  if (cpu_backend) {
-    backends.push_back(cpu_backend);
-    RS_LOG_INFO("CPU backend added to scheduler.");
-  } else {
-    RS_LOG_ERR("Failed to initialize CPU backend.");
-    return false;
-  }
-
-  // 3. Initialize the scheduler
-  sched = ggml_backend_sched_new(backends.data(), nullptr, (int)backends.size(), SENSE_VOICE_MAX_GRAPH_SIZE, false, false);
-  if (!sched) {
-    RS_LOG_ERR("Failed to create ggml_backend_sched.");
-    return false;
-  }
-
-  return true;
+    // Cleanup GGUF related resources
+    if (ctx_gguf) gguf_free(ctx_gguf);
+    if (gguf_data) ggml_free(gguf_data);
 }
 
 /**
- * Internal C++ implementation of context creation.
- * This function handles the heavy lifting and is called by the C-API wrapper.
+ * Initialize backends: try CUDA -> Metal -> Vulkan -> CANN -> CPU in order of priority
  */
+bool rs_context_t::init_backend() {
+    bool gpu_initialized = false;
+
+    if (params.use_gpu) {
+#ifdef RS_USE_CUDA
+        if (!gpu_initialized) {
+            ggml_backend_t b = ggml_backend_cuda_init(0); // Use device 0 by default
+            if (b) {
+                backends.push_back(b);
+                RS_LOG_INFO("CUDA backend added to scheduler.");
+                gpu_initialized = true;
+            }
+        }
+#endif
+
+#ifdef RS_USE_METAL
+        if (!gpu_initialized) {
+            ggml_backend_t b = ggml_backend_metal_init();
+            if (b) {
+                backends.push_back(b);
+                RS_LOG_INFO("Metal backend added to scheduler.");
+                gpu_initialized = true;
+            }
+        }
+#endif
+
+#ifdef RS_USE_VULKAN
+        if (!gpu_initialized) {
+            ggml_backend_t b = ggml_backend_vk_init(0);
+            if (b) {
+                backends.push_back(b);
+                RS_LOG_INFO("Vulkan backend added to scheduler.");
+                gpu_initialized = true;
+            }
+        }
+#endif
+
+#ifdef RS_USE_CANN
+        if (!gpu_initialized) {
+            ggml_backend_t b = ggml_backend_cann_init(0);
+            if (b) {
+                backends.push_back(b);
+                RS_LOG_INFO("CANN backend added to scheduler.");
+                gpu_initialized = true;
+            }
+        }
+#endif
+
+        if (!gpu_initialized) {
+            RS_LOG_WARN("GPU requested but no supported GPU backend could be initialized. Falling back to CPU.");
+        }
+    }
+
+    // Always add CPU backend as a fallback or for collaborative computing
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    if (cpu) {
+        backends.push_back(cpu);
+    } else {
+        RS_LOG_ERR("Failed to initialize CPU backend.");
+        return false;
+    }
+
+    // Initialize the scheduler to distribute computation tasks across multiple backends.
+    sched = ggml_backend_sched_new(backends.data(), nullptr, (int)backends.size(), 16384, false, false);
+    return sched != nullptr;
+}
+
 rs_context_t* rs_context_init_internal(rs_init_params_t params) {
-  if (!params.model_path) {
-    RS_LOG_ERR("Model path is NULL.");
-    return nullptr;
-  }
+    auto ctx = std::make_unique<rs_context_t>();
+    ctx->params = params;
 
-  auto ctx = std::make_unique<rs_context_t>();
-  ctx->params = params;
+    // 1. Hardware detection and backend initialization
+    if (!ctx->init_backend()) {
+        RS_LOG_ERR("Failed to initialize backend scheduler.");
+        return nullptr;
+    }
 
-  // 1. Initialize Backends and Scheduler
-  if (!ctx->init_backend()) {
-    return nullptr;
-  }
+    // 2. Load GGUF handle and auto-populate ggml_context metadata
+    struct gguf_init_params g_params = {
+        /*.no_alloc =*/ true,
+        /*.ctx      =*/ &ctx->gguf_data
+    };
 
-  // 2. Open GGUF
-  struct gguf_init_params gguf_params = {
-      /* .no_alloc = */ true,
-      /* .ctx      = */ &ctx->gguf_data,
-  };
-  ctx->ctx_gguf = gguf_init_from_file(params.model_path, gguf_params);
-  if (!ctx->ctx_gguf) {
-    RS_LOG_ERR("Failed to load GGUF file: %s", params.model_path);
-    return nullptr;
-  }
+    ctx->ctx_gguf = gguf_init_from_file(params.model_path, g_params);
+    if (!ctx->ctx_gguf) {
+        RS_LOG_ERR("Failed to load GGUF file: %s", params.model_path);
+        return nullptr;
+    }
 
+    // 3. Allocate physical memory buffers on the primary backend (resolves buffer.buft == NULL)
+    // Capture the buffer handle so we can free it later
+    ggml_backend_buffer_t weight_buffer = ggml_backend_alloc_ctx_tensors(ctx->gguf_data, ctx->backends[0]);
+    if (weight_buffer) {
+        ctx->weight_buffers.push_back(weight_buffer);
+    }
 
-  RS_LOG_INFO("%s: gguf version: %d", __func__, gguf_get_version(ctx->ctx_gguf));
-  RS_LOG_INFO("%s: gguf alignment: %zu", __func__, gguf_get_alignment(ctx->ctx_gguf));
-  RS_LOG_INFO("%s: gguf data offset: %zu", __func__, gguf_get_data_offset(ctx->ctx_gguf));
+    // 4. Load tensor data from the binary blob in the file
+    FILE * f = fopen(params.model_path, "rb");
+    if (!f) {
+        RS_LOG_ERR("Failed to open model file for data loading: %s", params.model_path);
+        return nullptr;
+    }
 
-  // 3. Resolve Architecture
-  int key_id = gguf_find_key(ctx->ctx_gguf, "general.architecture");
-  if (key_id == -1) {
-    RS_LOG_ERR("GGUF file missing 'general.architecture' key.");
-    gguf_free(ctx->ctx_gguf);
-    return nullptr;
-  }
-  std::string arch = gguf_get_val_str(ctx->ctx_gguf, key_id);
-  RS_LOG_INFO("Architecture detected: %s", arch.c_str());
+    size_t data_offset = gguf_get_data_offset(ctx->ctx_gguf);
+    int64_t n_tensors = gguf_get_n_tensors(ctx->ctx_gguf);
+    std::vector<char> read_buf;
 
-  // 4. Create Model instance via Registry
-  auto& registry = get_model_registry();
-  auto it = registry.find(arch);
-  if (it == registry.end()) {
-    RS_LOG_ERR("Unsupported architecture: %s", arch.c_str());
-    gguf_free(ctx->ctx_gguf);
-    return nullptr;
-  }
+    for (int64_t i = 0; i < n_tensors; ++i) {
+        const char * name = gguf_get_tensor_name(ctx->ctx_gguf, i);
+        struct ggml_tensor * t = ggml_get_tensor(ctx->gguf_data, name);
 
-  ctx->model = it->second();
-  if (!ctx->model) {
-    RS_LOG_ERR("Model creator for '%s' returned NULL.", arch.c_str());
-    gguf_free(ctx->ctx_gguf);
-    return nullptr;
-  }
+        if (t) {
+            size_t t_offset = gguf_get_tensor_offset(ctx->ctx_gguf, i);
+            size_t t_size = ggml_nbytes(t);
 
-  // 5. Load Weights
-  if (ctx->model->Load(ctx, ctx->backends[0])) {
+            if (t_size > 0) {
+                if (read_buf.size() < t_size) read_buf.resize(t_size);
 
-    gguf_free(ctx->ctx_gguf);
+                fseek(f, data_offset + t_offset, SEEK_SET);
+                if (fread(read_buf.data(), 1, t_size, f) != t_size) {
+                    RS_LOG_ERR("Failed to read data for tensor: %s", name);
+                    fclose(f);
+                    return nullptr;
+                }
 
-    // 6. Initialize Processor
+                ggml_backend_tensor_set(t, read_buf.data(), 0, t_size);
+            }
+        }
+    }
+    fclose(f);
+
+    // 5. Identify and load model architecture
+    int64_t arch_key = gguf_find_key(ctx->ctx_gguf, "general.architecture");
+    if (arch_key == -1) {
+        RS_LOG_ERR("GGUF file missing 'general.architecture' key.");
+        return nullptr;
+    }
+    std::string arch = gguf_get_val_str(ctx->ctx_gguf, arch_key);
+    RS_LOG_INFO("Architecture detected: %s", arch.c_str());
+
+    auto it = get_model_registry().find(arch);
+    if (it == get_model_registry().end()) {
+        RS_LOG_ERR("Unsupported architecture: %s", arch.c_str());
+        return nullptr;
+    }
+
+    ctx->model = it->second();
+
+    // 6. Initialize processor and audio frontend
     ctx->processor = std::make_unique<RSProcessor>(ctx->model, ctx->sched);
+
+    // 7. Execute model-specific Load (e.g., mapping pointers, loading CMVN)
+    if (!ctx->model->Load(ctx, ctx->backends[0])) {
+        RS_LOG_ERR("Model load failed.");
+        return nullptr;
+    }
 
     RS_LOG_INFO("RapidSpeech context core initialized successfully.");
     return ctx.release();
-  } else {
-    RS_LOG_ERR("Failed to load model weights.");
-    gguf_free(ctx->ctx_gguf);
-    return nullptr;
-  }
 }

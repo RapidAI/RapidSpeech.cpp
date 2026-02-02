@@ -71,6 +71,7 @@ public:
   // Fixed: added ggml_backend_sched_t to match ISpeechModel interface
   bool Encode(const std::vector<float>& input_frames, RSState& state, ggml_backend_sched_t sched) override;
   bool Decode(RSState& state, ggml_backend_sched_t sched) override;
+  std:: string GetTranscription(RSState& state) override;
 
   const RSModelMeta& GetMeta() const override { return meta_; }
 
