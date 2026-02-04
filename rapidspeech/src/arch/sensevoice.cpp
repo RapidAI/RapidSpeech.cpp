@@ -451,7 +451,6 @@ bool SenseVoiceModel::Decode(RSState& state, ggml_backend_sched_t sched) {
 
         sv_state.ids = CTCDecoder::BeamSearchDecode(host_log_probs.data(), T, V, beam_size);
     }
-
     for (auto id: sv_state.ids){ sv_state.tokens.push_back(this->vocab_.id_to_token[id]);}
 
     ggml_free(ctx0);
@@ -467,6 +466,7 @@ std:: string SenseVoiceModel::GetTranscription(RSState& state)
   for (const auto& s : sv_state.tokens) {
     result += s;
   }
+  sv_state.tokens.clear();
   return result;
 }
 // Registration logic

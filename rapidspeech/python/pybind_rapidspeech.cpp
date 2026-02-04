@@ -75,7 +75,7 @@ PYBIND11_MODULE(rapidspeech, m) {
 
         .def("push_audio", &RSAsrOffline::push_audio,
              py::arg("pcm"),
-             "Push float32 PCM audio")
+             py::call_guard<py::gil_scoped_release>())
 
         .def("process", &RSAsrOffline::process, py::call_guard<py::gil_scoped_release>())
 

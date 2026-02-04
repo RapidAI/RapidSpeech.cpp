@@ -77,12 +77,12 @@ int RSProcessor::Process() {
   }
   std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
 
-  text_accumulator_ = model_->GetTranscription(*state_);
   RS_LOG_INFO("RTF is: %f", std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1e6 / pcm_duration);
   return 1;
 }
 
 std::string RSProcessor::GetTextResult() {
+  text_accumulator_ = model_->GetTranscription(*state_);
   return text_accumulator_;
 }
 
