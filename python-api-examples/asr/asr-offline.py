@@ -1,20 +1,11 @@
-import array
-import os
-import struct
 import argparse
+import array
+import struct
 import time
 
 import numpy as np
-import psutil
-
 import rapidspeech
 
-# 尝试将当前进程设置为高优先级
-p = psutil.Process(os.getpid())
-try:
-    p.nice(-20) # 越高越优先（需 sudo 权限）
-except:
-    pass
 
 def read_wav(file_path):
     with open(file_path, "rb") as f:
@@ -47,6 +38,7 @@ def read_wav(file_path):
         data = data.reshape(-1, channels)
     return data
 
+
 def main():
     parser = argparse.ArgumentParser(description="RapidSpeech ASR Python Demo")
     parser.add_argument("--model", required=True, help="模型文件路径 (.gguf)")
@@ -57,9 +49,7 @@ def main():
 
     # 初始化上下文
     ctx = rapidspeech.asr_offline(
-        model_path=args.model,
-        n_threads=args.threads,
-        use_gpu=bool(args.gpu)
+        model_path=args.model, n_threads=args.threads, use_gpu=bool(args.gpu)
     )
 
     # 读取 wav
