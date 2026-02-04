@@ -8,7 +8,10 @@
 #include <cmath>
 #include <cstring>
 #include <functional>
+
+#include "gguf.h"
 #include "utils/debug_utils.h"
+#include "utils/rs_wav.h"
 
 // Increased node limit to handle deep SenseVoice graphs (50+ layers)
 #define SENSE_VOICE_ENCODER_MAX_NODES 6144

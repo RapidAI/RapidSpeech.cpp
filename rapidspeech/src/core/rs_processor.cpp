@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 #include <iostream>
 #include <algorithm>
+#include <chrono>
 
 RSProcessor::RSProcessor(std::shared_ptr<ISpeechModel> model, ggml_backend_sched_t sched)
     : model_(model), sched_(sched) {
@@ -47,7 +48,7 @@ int RSProcessor::Process() {
 
   std::vector<float> pcm_chunk = audio_buffer_.Pop(audio_buffer_.Size());
   float pcm_duration = pcm_chunk.size() / model_->GetMeta().audio_sample_rate;
-  std::chrono::steady_clock::time_point start = std::chrono::high_resolution_clock::now();
+  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
   std::vector<float> features;
   audio_proc_->Compute(pcm_chunk, features);
 
@@ -74,7 +75,7 @@ int RSProcessor::Process() {
     RS_LOG_ERR("Model decoding failed.");
     return -1;
   }
-  std::chrono::steady_clock::time_point end = std::chrono::high_resolution_clock::now();
+  std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
 
   text_accumulator_ = model_->GetTranscription(*state_);
   RS_LOG_INFO("RTF is: %f", std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1e6 / pcm_duration);
