@@ -5,12 +5,21 @@ project(RapidSpeech.cpp VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+message(STATUS "CMAKE_INSTALL_PREFIX: ${CMAKE_INSTALL_PREFIX}")
+
 # --- Compilation Options ---
 option(RS_BUILD_TESTS "Build test executables" ON)
 option(RS_CUDA "Enable CUDA acceleration" OFF)
 option(RS_VULKAN "Enable Vulkan acceleration" OFF)
 option(RS_CANN "Enable CANN acceleration (Huawei)" OFF)
 option(RS_OPENCL "Enable OpenCL acceleration" OFF)
+option(RS_ENABLE_PYTHON "Enable Python bindings via pybind11" OFF)
+
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
+
+if (RS_ENABLE_PYTHON)
+    include(pybind11)
+endif()
 
 # Auto-detect Apple platform to set default value for Metal
 if (APPLE)
@@ -51,78 +60,110 @@ endif()
 add_subdirectory(${GGML_PATH} ggml)
 
 # --- Core Source Files ---
-include_directories(include src)
+include_directories(include rapidspeech/src)
 
 set(RS_SOURCES
-        src/core/rs_context.cpp
-        src/core/rs_processor.cpp
-        src/frontend/audio_processor.cpp
-        src/frontend/fftsg.c
-        src/utils/rs_log.cpp
-        src/arch/sensevoice.cpp
-        src/utils/rs_wav.cpp
+        rapidspeech/src/core/rs_context.cpp
+        rapidspeech/src/core/rs_processor.cpp
+        rapidspeech/src/frontend/audio_processor.cpp
+        rapidspeech/src/frontend/fftsg.c
+        rapidspeech/src/utils/rs_log.cpp
+        rapidspeech/src/arch/sensevoice.cpp
+        rapidspeech/src/arch/funasr-nano.cpp
+        rapidspeech/src/utils/rs_wav.cpp
 )
+
 
 # --- Library Compilation ---
-add_library(rapidspeech SHARED
+add_library(rapidspeech-core SHARED
         ${RS_SOURCES}
-        src/c_api/rapidspeech_c.cpp
+        rapidspeech/src/c_api/rapidspeech_c.cpp
 )
 
-target_link_libraries(rapidspeech PRIVATE ggml)
+target_link_libraries(rapidspeech-core PRIVATE ggml)
 
 # --- Hardware Acceleration Logic ---
 
 # 1. CUDA Configuration
 if (RS_CUDA)
     message(STATUS "RapidSpeech: CUDA acceleration enabled.")
-    target_compile_definitions(rapidspeech PRIVATE RS_USE_CUDA)
+    target_compile_definitions(rapidspeech-core PRIVATE RS_USE_CUDA)
     if (TARGET ggml-cuda)
-        target_link_libraries(rapidspeech PRIVATE ggml-cuda)
+        target_link_libraries(rapidspeech-core PRIVATE ggml-cuda)
     endif()
 endif()
 
 # 2. Metal Configuration (Apple Platforms)
 if (RS_METAL AND APPLE)
     message(STATUS "RapidSpeech: Metal acceleration enabled.")
-    target_compile_definitions(rapidspeech PRIVATE RS_USE_METAL)
+    target_compile_definitions(rapidspeech-core PRIVATE RS_USE_METAL)
     if (TARGET ggml-metal)
-        target_link_libraries(rapidspeech PRIVATE ggml-metal)
+        target_link_libraries(rapidspeech-core PRIVATE ggml-metal)
     endif()
-    target_link_libraries(rapidspeech PRIVATE "-framework Foundation" "-framework Metal" "-framework MetalKit")
+    target_link_libraries(rapidspeech-core PRIVATE "-framework Foundation" "-framework Metal" "-framework MetalKit")
 endif()
 
 # 3. Vulkan Configuration
 if (RS_VULKAN)
     message(STATUS "RapidSpeech: Vulkan acceleration enabled.")
-    target_compile_definitions(rapidspeech PRIVATE RS_USE_VULKAN)
+    target_compile_definitions(rapidspeech-core PRIVATE RS_USE_VULKAN)
     if (TARGET ggml-vulkan)
-        target_link_libraries(rapidspeech PRIVATE ggml-vulkan)
+        target_link_libraries(rapidspeech-core PRIVATE ggml-vulkan)
     endif()
 endif()
 
 # 4. CANN Configuration (Huawei Ascend)
 if (RS_CANN)
     message(STATUS "RapidSpeech: CANN acceleration enabled.")
-    target_compile_definitions(rapidspeech PRIVATE RS_USE_CANN)
+    target_compile_definitions(rapidspeech-core PRIVATE RS_USE_CANN)
     if (TARGET ggml-cann)
-        target_link_libraries(rapidspeech PRIVATE ggml-cann)
+        target_link_libraries(rapidspeech-core PRIVATE ggml-cann)
     endif()
 endif()
 
 # 5. OpenCL Configuration
 if (RS_OPENCL)
     message(STATUS "RapidSpeech: OpenCL acceleration enabled.")
-    target_compile_definitions(rapidspeech PRIVATE RS_USE_OPENCL)
+    target_compile_definitions(rapidspeech-core PRIVATE RS_USE_OPENCL)
     if (TARGET ggml-opencl)
-        target_link_libraries(rapidspeech PRIVATE ggml-opencl)
+        target_link_libraries(rapidspeech-core PRIVATE ggml-opencl)
     endif()
+endif()
+
+if (RS_ENABLE_PYTHON)
+
+    pybind11_add_module(rapidspeech
+            rapidspeech/python/pybind_rapidspeech.cpp
+    )
+
+
+    install(TARGETS rapidspeech
+            LIBRARY DESTINATION lib
+    )
+
+    target_link_libraries(rapidspeech
+            PRIVATE rapidspeech-core
+    )
+
+    target_include_directories(rapidspeech
+            PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+
+    # Linux / macOS：确保符号可见
+    set_target_properties(rapidspeech PROPERTIES
+            CXX_VISIBILITY_PRESET hidden
+            VISIBILITY_INLINES_HIDDEN ON
+    )
+
 endif()
 
 # --- Example Executables ---
 add_executable(rs-asr-offline examples/rs-asr-offline.cpp)
-target_link_libraries(rs-asr-offline PRIVATE rapidspeech)
-
+target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core)
+install(TARGETS rs-asr-offline
+        RUNTIME DESTINATION bin
+)
 # --- Tests ---
 if (RS_BUILD_TESTS)
     message(STATUS "Tests are enabled.")
@@ -138,7 +179,7 @@ if (RS_BUILD_TESTS)
 
         if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${test_source}")
             add_executable(${test_target} ${test_source})
-            target_link_libraries(${test_target} PRIVATE rapidspeech ggml)
+            target_link_libraries(${test_target} PRIVATE rapidspeech-core ggml)
             add_test(NAME ${test_target} COMMAND ${test_target})
         endif()
     endforeach()
