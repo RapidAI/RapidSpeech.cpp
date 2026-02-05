@@ -2,7 +2,6 @@
 #include "utils/rs_log.h"
 #include "ggml-backend.h"
 #include <iostream>
-#include <algorithm>
 #include <chrono>
 
 RSProcessor::RSProcessor(std::shared_ptr<ISpeechModel> model, ggml_backend_sched_t sched)

@@ -120,6 +120,7 @@ bool rs_context_t::init_backend() {
     // Always add CPU backend as a fallback or for collaborative computing
     ggml_backend_t cpu = ggml_backend_cpu_init();
     if (cpu) {
+        ggml_backend_cpu_set_n_threads(cpu, params.n_threads);
         backends.push_back(cpu);
     } else {
         RS_LOG_ERR("Failed to initialize CPU backend.");
