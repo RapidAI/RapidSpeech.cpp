@@ -20,6 +20,7 @@ struct STFTConfig {
   int lfr_n = 6;        // Stride 6 frames
 
   bool use_cmvn = true;
+  int fbank_num_threads = 2;
   // Default CMVN values are usually provided via weights/file
 };
 
@@ -57,6 +58,10 @@ private:
   void ComputeFbank(const std::vector<float>& samples, std::vector<float>& output_mel);
   void ApplyLFR(const std::vector<float>& input_mel, int n_frames, std::vector<float>& output_lfr);
   void ApplyCMVN(std::vector<float>& feats);
+  void ProcessFrame(int i, const std::vector<float>& samples,
+                                        std::vector<double>& window,
+                                        std::vector<double>& power_spec,
+                                        std::vector<float>& output_mel);
 
   // Mathematical utilities
   int RoundToPowerOfTwo(int n);
