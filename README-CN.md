@@ -4,8 +4,8 @@
 
 简体中文 | [English](./README.md)
 
-<a href="https://huggingface.co/lovemefan/RapidSpeech" target="_blank"><img src="https://img.shields.io/badge/🤗-Hugging Face-blue"></a>
-<a href="https://www.modelscope.cn/models/lovemefan/RapidSpeech" target="_blank"><img src="https://img.shields.io/badge/ModelScope-blue"></a>
+<a href="https://huggingface.co/RapidAI/RapidSpeech" target="_blank"><img src="https://img.shields.io/badge/🤗-Hugging Face-blue"></a>
+<a href="https://www.modelscope.cn/models/RapidAI/RapidSpeech" target="_blank"><img src="https://img.shields.io/badge/ModelScope-blue"></a>
 <a href="https://github.com/RapidAI/RapidSpeech.cpp/stargazers"><img src="https://img.shields.io/github/stars/RapidAI/RapidSpeech.cpp?color=ccf"></a>
 
 # RapidSpeech.cpp 🎙️
@@ -85,8 +85,8 @@ RapidSpeech.cpp 并非“单模型推理工具”，而是一套面向真实业�
 
 请从以下平台下载对应模型：
 
-- 🤗 Hugging Face：https://huggingface.co/lovemefan/RapidSpeech
-- ModelScope：https://www.modelscope.cn/models/lovemefan/RapidSpeech
+- 🤗 Hugging Face：https://huggingface.co/RapidAI/RapidSpeech
+- ModelScope：https://www.modelscope.cn/models/RapidAI/RapidSpeech
 
 ### 构建与运行
 

@@ -4,8 +4,8 @@
 
 English | [简体中文](./README-CN.md)
 
-<a href="https://huggingface.co/lovemefan/RapidSpeech" target="_blank"><img src="https://img.shields.io/badge/🤗-Hugging Face-blue"></a>
-<a href="https://www.modelscope.cn/models/lovemefan/RapidSpeech" target="_blank"><img src="https://img.shields.io/badge/ModelScope-blue"></a>
+<a href="https://huggingface.co/RapidAI/RapidSpeech" target="_blank"><img src="https://img.shields.io/badge/🤗-Hugging Face-blue"></a>
+<a href="https://www.modelscope.cn/models/RapidAI/RapidSpeech/files?version=main" target="_blank"><img src="https://img.shields.io/badge/ModelScope-blue"></a>
 <a href="https://github.com/RapidAI/RapidSpeech.cpp/stargazers"><img src="https://img.shields.io/github/stars/RapidAI/RapidSpeech.cpp?color=ccf"></a>
 
 # RapidSpeech.cpp 🎙️
@@ -86,14 +86,15 @@ RapidSpeech.cpp is not just an inference wrapper — it is a full-featured speec
 
 Models are available on:
 
-- 🤗 Hugging Face: https://huggingface.co/lovemefan/RapidSpeech
-- ModelScope: https://www.modelscope.cn/models/lovemefan/RapidSpeech
+- 🤗 Hugging Face: https://huggingface.co/RapidAI/RapidSpeech
+- ModelScope: https://www.modelscope.cn/models/RapidAI/RapidSpeech
 
 ### Build & Run
 
 ```bash
 git clone https://github.com/RapidAI/RapidSpeech.cpp
 cd RapidSpeech.cpp
+git submodule sync && git submodule update --init --recursive
 cmake -B build
 cmake --build build --config Release
 
