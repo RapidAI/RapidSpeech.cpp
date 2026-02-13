@@ -78,9 +78,6 @@ bool load_wav_file(const char* filename, std::vector<float>& data, int* sample_r
     return true;
 }
 
-static float DEFAULT_CMVN_MEANS[560];
-
-static float DEFAULT_CMVN_VARS[560];
 
 /**
  * Helper to load CMVN from GGUF or fallback to defaults.
@@ -109,12 +106,5 @@ void load_cmvn_params(struct gguf_context * ctx_gguf, std::vector<float>& means,
     } else {
       RS_LOG_WARN("CMVN metadata size mismatch (expected 560, got %d). Falling back.", n_means);
     }
-  }
-
-  // 2. Fallback to hardcoded defaults if GGUF doesn't have them
-  if (!loaded) {
-    RS_LOG_ERR("Can not found CMVN metadata from gguf file.");
-    means.assign(DEFAULT_CMVN_MEANS, DEFAULT_CMVN_MEANS + 560);
-    vars.assign(DEFAULT_CMVN_VARS, DEFAULT_CMVN_VARS + 560);
   }
 }

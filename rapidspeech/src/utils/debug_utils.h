@@ -78,7 +78,7 @@ static void print_tensor(struct ggml_tensor *t)
            src1 ? src1_str : "",
            ggml_ne_string(t).c_str());
 
-    ggml_print_tensor( (uint8_t *) t->data, t->type, t->ne, t->nb, 3);
+    ggml_print_tensor( (uint8_t *) t->data, t->type, t->ne, t->nb, 8);
     printf("\n");
 }
 

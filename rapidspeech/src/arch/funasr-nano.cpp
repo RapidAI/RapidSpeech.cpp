@@ -1,161 +1,50 @@
 #include "funasr-nano.h"
-#include "ctc_decoder.h"
 #include "core/rs_context.h"
-#include "utils/rs_log.h"
-#include "ggml.h"
+#include "ctc_decoder.h"
 #include "ggml-backend.h"
-#include <functional>
+#include "ggml.h"
 #include "gguf.h"
+#include "sensevoice.h"
 #include "utils/debug_utils.h"
+#include "utils/rs_log.h"
 #include "utils/rs_wav.h"
+#include <functional>
+
+#include "ggml-cpu.h"
 
 // Increased node limit to handle deep FunASRNano graphs (50+ layers)
 #define FUNASR_NANO_ENCODER_MAX_NODES 6144
-#define FUNASR_NANO_DECODER_MAX_NODES 128
+#define FUNASR_NANO_DECODER_MAX_NODES 1024
 
 struct FunASRNanoState : public RSState {
-  struct ggml_context * ctx_persistent = nullptr;
+  struct ggml_context *ctx_persistent = nullptr;
   ggml_backend_buffer_t buffer_persistent = nullptr;
-  struct ggml_tensor * encoder_out = nullptr;
+  struct ggml_tensor *encoder_out = nullptr;
 
   std::vector<int32_t> ids;
   std::vector<std::string> tokens;
   int language_id = 0;
-  bool use_itn = true;
 
   FunASRNanoState() {
     // Increase persistent context to ensure enough room for tensor metadata
-    struct ggml_init_params params = { 512 * ggml_tensor_overhead(), nullptr, true };
+    struct ggml_init_params params = {512 * ggml_tensor_overhead(), nullptr,
+                                      true};
     ctx_persistent = ggml_init(params);
   }
 
   ~FunASRNanoState() {
-    if (buffer_persistent) ggml_backend_buffer_free(buffer_persistent);
-    if (ctx_persistent) ggml_free(ctx_persistent);
+    if (buffer_persistent)
+      ggml_backend_buffer_free(buffer_persistent);
+    if (ctx_persistent)
+      ggml_free(ctx_persistent);
   }
 };
-
-// --- Internal Mathematical Helpers ---
-
-/**
- * Matrix multiplication with padding optimization for better performance on Apple Metal.
- */
-static struct ggml_tensor * ggml_mul_mat_pad(struct ggml_context * ctx, struct ggml_tensor * x, struct ggml_tensor * y, int pad = 32) {
-  const int n_pad_req = 8;
-  if (x->ne[0] % pad == 0 || x->ne[0] / pad < n_pad_req) {
-    return ggml_mul_mat(ctx, x, y);
-  }
-
-  struct ggml_tensor * x_0 = ggml_view_3d(ctx, x, (x->ne[0]/pad)*pad, x->ne[1], x->ne[2], x->nb[1], x->nb[2], 0);
-  struct ggml_tensor * x_1 = ggml_view_3d(ctx, x,  x->ne[0]%pad,      x->ne[1], x->ne[2], x->nb[1], x->nb[2], x_0->ne[0]*x_0->nb[0]);
-
-  struct ggml_tensor * y_0 = ggml_view_3d(ctx, y, (y->ne[0]/pad)*pad, y->ne[1], y->ne[2], y->nb[1], y->nb[2], 0);
-  struct ggml_tensor * y_1 = ggml_view_3d(ctx, y,  y->ne[0]%pad,      y->ne[1], y->ne[2], y->nb[1], y->nb[2], y_0->ne[0]*y_0->nb[0]);
-
-  return ggml_add(ctx, ggml_mul_mat(ctx, x_0, y_0), ggml_mul_mat(ctx, x_1, y_1));
-}
-
-
-/**
- * Forward pass for a single SANM (Self-Attention Network with Memory) layer.
- * Implements LayerNorm -> SelfAttention -> FSMN -> Residual -> LayerNorm -> MLP -> Residual.
- */
-static struct ggml_tensor * encoder_layer_sanm_forward(
-    const FunASRNanoHParams &hparams,
-    struct ggml_context * ctx,
-    struct ggml_tensor * cur,
-    FunASRNanoLayerEncoder &layer) {
-
-  const int n_state = hparams.n_encoder_hidden_state;
-  const int n_head = hparams.n_encoder_attention_heads;
-  const int n_ctx = cur->ne[1];
-  const int n_batch = cur->ne[2];
-
-  struct ggml_tensor * residual = cur;
-  if (layer.e_norm_w1->ne[0] == layer.e_norm_w2->ne[0]) {
-    residual = ggml_cpy(
-            ctx, cur,
-            ggml_new_tensor_3d(ctx, cur->type, cur->ne[0], cur->ne[1], cur->ne[2]));
-  }
-  // 1. Layer Norm 1
-  cur = ggml_norm(ctx, cur, hparams.eps);
-  cur = ggml_add(ctx, ggml_mul(ctx, cur, layer.e_norm_w1), layer.e_norm_b1);
-
-  // 2. Self Attention (Linear Projections)
-  struct ggml_tensor * Q = ggml_add(ctx, ggml_mul_mat_pad(ctx, ggml_cont(ctx, layer.e_attn_ln_q_w), cur), layer.e_attn_ln_q_b);
-  struct ggml_tensor * K = ggml_add(ctx, ggml_mul_mat_pad(ctx, ggml_cont(ctx, layer.e_attn_ln_k_w), cur), layer.e_attn_ln_k_b);
-  struct ggml_tensor * V = ggml_add(ctx, ggml_mul_mat_pad(ctx, layer.e_attn_ln_v_w, cur), layer.e_attn_ln_v_b);
-
-  // Reshape and Permute for multi-head attention
-  struct ggml_tensor * Q_h = ggml_permute(ctx, ggml_reshape_4d(ctx, Q, n_state / n_head, n_head, n_ctx, n_batch), 0, 2, 1, 3);
-  struct ggml_tensor * K_h = ggml_permute(ctx, ggml_reshape_4d(ctx, K, n_state / n_head, n_head, n_ctx, n_batch), 0, 2, 1, 3);
-  struct ggml_tensor * V_h = ggml_permute(ctx, ggml_reshape_4d(ctx, V, n_state / n_head, n_head, n_ctx, n_batch), 0, 2, 1, 3);
-
-  // Scaled Dot-Product Attention
-  float scale = 1.0f / sqrtf(float(n_state) / n_head);
-  struct ggml_tensor * KQ = ggml_mul_mat(ctx, K_h, Q_h);
-  struct ggml_tensor * KQ_soft_max = ggml_soft_max_ext(ctx, KQ, nullptr, scale, 0.0f);
-  struct ggml_tensor * KQV = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, V_h)), KQ_soft_max);
-
-  // Merge heads
-  struct ggml_tensor * attn_out = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_permute(ctx, KQV, 0, 2, 1, 3)), n_state, n_ctx, n_batch);
-  attn_out = ggml_add(ctx, ggml_mul_mat(ctx, layer.e_attn_ln_out_w, attn_out), layer.e_attn_ln_out_b);
-  ggml_set_name(attn_out, "attn_out");
-
-  // 3. FSMN Block (Memory Block) using depth-wise convolution logic
-  int padding = (hparams.fsmn_kernel_size - 1) / 2; // Kernel size 31
-  struct ggml_tensor * fsmn_in = ggml_cont(ctx, ggml_transpose(ctx, V));
-  struct ggml_tensor * im2col = ggml_im2col(ctx,
-                                           layer.e_attn_fsmn_w,
-                                           ggml_reshape_4d(ctx, fsmn_in, fsmn_in->ne[0], 1,  fsmn_in->ne[1], fsmn_in->ne[2] * fsmn_in->ne[3]),
-                                           1, 0, padding, 0, 1, 0, false, GGML_TYPE_F32);
-  struct ggml_tensor * fsmn_out = ggml_mul_mat(ctx, layer.e_attn_fsmn_w, im2col);
-  fsmn_out = ggml_reshape_3d(ctx, fsmn_out, im2col->ne[1], im2col->ne[2], im2col->ne[3]);
-  fsmn_out = ggml_cont(ctx, ggml_transpose(ctx, fsmn_out));
-  fsmn_out = ggml_add(ctx, fsmn_out, V);
-  attn_out = ggml_add(ctx, fsmn_out, attn_out);
-
-  if (layer.e_norm_w1->ne[0] == layer.e_norm_w2->ne[0]) {
-    attn_out = ggml_add(ctx, attn_out, residual);
-  }
-
-
-  // 4. Layer Norm 2 + MLP
-  cur = ggml_norm(ctx, attn_out, hparams.eps);
-  cur = ggml_add(ctx, ggml_mul(ctx, cur, layer.e_norm_w2), layer.e_norm_b2);
-
-  cur = ggml_add(ctx, ggml_mul_mat(ctx, layer.e_mlp_w1, cur), layer.e_mlp_b1);
-  cur = ggml_relu(ctx, cur);
-  cur = ggml_add(ctx, ggml_mul_mat(ctx, layer.e_mlp_w2, cur), layer.e_mlp_b2);
-
-  return ggml_add(ctx, cur, attn_out);
-}
-
-/**
- * Helper to safely initialize a ggml context and graph.
- * Prevents 0x0 crashes by checking allocation results.
- */
-static bool init_compute_ctx(struct ggml_context ** ctx, struct ggml_cgraph ** gf, int n_nodes) {
-  // We add 1MB of buffer to the tensor overhead to be safe
-  size_t mem_size = n_nodes * ggml_tensor_overhead() + (1024 * 1024);
-  struct ggml_init_params params = { mem_size, nullptr, true };
-  *ctx = ggml_init(params);
-  if (!(*ctx)) {
-    RS_LOG_ERR("ggml_init failed: out of memory for context.");
-    return false;
-  }
-  *gf = ggml_new_graph_custom(*ctx, n_nodes, false);
-  if (!(*gf)) {
-    RS_LOG_ERR("ggml_new_graph_custom failed: too many nodes or out of memory.");
-    return false;
-  }
-  return true;
-}
 
 // --- FunASRNanoModel Implementation ---
 
 FunASRNanoModel::FunASRNanoModel() : ctx_weights_(nullptr) {
-  encoder_ = std::make_unique<FunASRNanoEncoder>();
+  encoder_ = std::make_unique<SenseVoiceEncoderModel>();
+  decoder_ = std::make_unique<FunASRNanoTransformerDecoder>();
 }
 
 FunASRNanoModel::~FunASRNanoModel() {
@@ -165,26 +54,45 @@ FunASRNanoModel::~FunASRNanoModel() {
   }
 }
 
-bool FunASRNanoModel::Load(const std::unique_ptr<rs_context_t>& ctx, ggml_backend_t backend) {
+bool FunASRNanoModel::Load(const std::unique_ptr<rs_context_t> &ctx,
+                           ggml_backend_t backend) {
   if (!ctx || !ctx->ctx_gguf || !ctx->gguf_data) {
     RS_LOG_ERR("Invalid context provided to FunASRNanoModel::Load");
     return false;
   }
 
-  gguf_context * ctx_gguf = ctx->ctx_gguf;
-  ggml_context * gguf_data = ctx->gguf_data;
+  gguf_context *ctx_gguf = ctx->ctx_gguf;
+  ggml_context *gguf_data = ctx->gguf_data;
 
   // 1. Load Hyperparameters from GGUF KV
-  hparams_.n_vocab = gguf_get_val_i32(ctx_gguf, gguf_find_key(ctx_gguf, "tokenizer.vocab_size"));
-  hparams_.n_encoder_hidden_state = gguf_get_val_i32(ctx_gguf, gguf_find_key(ctx_gguf, "encoder.output_size"));
-  hparams_.n_encoder_linear_units = gguf_get_val_i32(ctx_gguf, gguf_find_key(ctx_gguf, "encoder.linear_units"));
-  hparams_.n_encoder_attention_heads = gguf_get_val_i32(ctx_gguf, gguf_find_key(ctx_gguf, "encoder.attention_heads"));
-  hparams_.n_encoder_layers = gguf_get_val_i32(ctx_gguf, gguf_find_key(ctx_gguf, "encoder.num_blocks"));
-  hparams_.n_tp_encoder_layers = gguf_get_val_i32(ctx_gguf, gguf_find_key(ctx_gguf, "encoder.tp_blocks"));
-  hparams_.n_mels = 80;
+  hparams_.n_vocab = gguf_get_val_i32(
+      ctx_gguf, gguf_find_key(ctx_gguf, "tokenizer.vocab_size"));
+  hparams_.n_encoder_hidden_state = gguf_get_val_i32(
+      ctx_gguf, gguf_find_key(ctx_gguf, "encoder.output_size"));
+  hparams_.n_encoder_linear_units = gguf_get_val_i32(
+      ctx_gguf, gguf_find_key(ctx_gguf, "encoder.linear_units"));
+  hparams_.n_encoder_attention_heads = gguf_get_val_i32(
+      ctx_gguf, gguf_find_key(ctx_gguf, "encoder.attention_heads"));
+  hparams_.n_encoder_layers =
+      gguf_get_val_i32(ctx_gguf, gguf_find_key(ctx_gguf, "encoder.num_blocks"));
+  hparams_.n_tp_encoder_layers =
+      gguf_get_val_i32(ctx_gguf, gguf_find_key(ctx_gguf, "encoder.tp_blocks"));
+  hparams_.n_ctc_layers =
+      gguf_get_val_i32(ctx_gguf, gguf_find_key(ctx_gguf, "ctc.n_layer"));
+  hparams_.ctc_downsample_rate =
+      gguf_get_val_i32(ctx_gguf, gguf_find_key(ctx_gguf, "ctc.downsample_rate"));
+  hparams_.ctc_encoder_dim =
+      gguf_get_val_i32(ctx_gguf, gguf_find_key(ctx_gguf, "ctc.encoder_dim"));
+  hparams_.ctc_llm_dim =
+      gguf_get_val_i32(ctx_gguf, gguf_find_key(ctx_gguf, "ctc.llm_dim"));
+  hparams_.ctc_ffn_dim =
+      gguf_get_val_i32(ctx_gguf, gguf_find_key(ctx_gguf, "ctc.ffn_dim"));
+  hparams_.n_mels =
+      gguf_get_val_i32(ctx_gguf, gguf_find_key(ctx_gguf, "frontend.num_mels"));
 
-  meta_.arch_name = "FunASRNanoSmall";
-  meta_.audio_sample_rate = 16000;
+  meta_.arch_name = "FunASRNano";
+  meta_.audio_sample_rate = gguf_get_val_i32(
+      ctx_gguf, gguf_find_key(ctx_gguf, "frontend.sample_rate"));
   meta_.n_mels = hparams_.n_mels;
   meta_.vocab_size = hparams_.n_vocab;
 
@@ -193,7 +101,7 @@ bool FunASRNanoModel::Load(const std::unique_ptr<rs_context_t>& ctx, ggml_backen
   if (token_idx != -1) {
     int n_vocab = gguf_get_arr_n(ctx_gguf, token_idx);
     for (int i = 0; i < n_vocab; i++) {
-      vocab_.id_to_token[i] = gguf_get_arr_str(ctx_gguf, token_idx, i);
+        vocab_.id_to_token[i] = gguf_get_arr_str(ctx_gguf, token_idx, i);
     }
   }
 
@@ -205,34 +113,68 @@ bool FunASRNanoModel::Load(const std::unique_ptr<rs_context_t>& ctx, ggml_backen
   }
 
   // 4. Map Tensors from ggml_data
-  std::map<std::string, struct ggml_tensor*> tensors;
+  std::map<std::string, struct ggml_tensor *> tensors;
   const int n_tensors = gguf_get_n_tensors(ctx_gguf);
   for (int i = 0; i < n_tensors; ++i) {
-    const char * name = gguf_get_tensor_name(ctx_gguf, i);
-    struct ggml_tensor * t = ggml_get_tensor(gguf_data, name);
-    if (t) tensors[name] = t;
+    const char *name = gguf_get_tensor_name(ctx_gguf, i);
+    struct ggml_tensor *t = ggml_get_tensor(gguf_data, name);
+    if (t)
+      tensors[name] = t;
   }
 
   return MapTensors(tensors);
 }
 
-bool FunASRNanoModel::MapTensors(std::map<std::string, struct ggml_tensor*>& tensors) {
+bool FunASRNanoModel::MapTensors(
+    std::map<std::string, struct ggml_tensor *> &tensors) {
   try {
-    encoder_->embedding = tensors.at("embed.weight");
-    std::vector<FunASRNanoLayerEncoder> tmp_encoder0(1);
-    SetLayerWeights(tmp_encoder0, tensors, 1, "encoders0");
-    encoder_->encoder0 = tmp_encoder0[0];
+    encoder_->MapTensors(tensors);
 
-    SetLayerWeights(encoder_->encoders_layer, tensors, hparams_.n_encoder_layers - 1, "encoders");
-    SetLayerWeights(encoder_->tp_encoders_layer, tensors, hparams_.n_tp_encoder_layers, "tp_encoders");
+    // ctc decoder
+    decoder_->decoders_layer.resize(hparams_.n_ctc_layers);
 
-    encoder_->e_after_norm_w = tensors.at("encoder.after_norm.weight");
-    encoder_->e_after_norm_b = tensors.at("encoder.after_norm.bias");
-    encoder_->e_tp_norm_w    = tensors.at("encoder.tp_norm.weight");
-    encoder_->e_tp_norm_b    = tensors.at("encoder.tp_norm.bias");
+    decoder_->linear1_weight = tensors.at("ctc_decoder.linear1.weight");
+    decoder_->linear1_bias = tensors.at("ctc_decoder.linear1.bias");
+    decoder_->linear2_weight = tensors.at("ctc_decoder.linear2.weight");
+    decoder_->linear2_bias = tensors.at("ctc_decoder.linear2.bias");
 
-    encoder_->ctc_out_linear_weight = tensors.at("ctc.ctc_lo.weight");
-    encoder_->ctc_out_linear_bias   = tensors.at("ctc.ctc_lo.bias");
+    for (int i = 0; i < hparams_.n_ctc_layers; ++i) {
+      // ctc_decoder.blocks.4.self_attn.linear_q.weight
+      std::string p = "ctc_decoder.blocks." + std::to_string(i);
+      decoder_->decoders_layer[i].self_attn_linear_q_weight =
+          tensors.at(p + ".self_attn.linear_q.weight");
+      decoder_->decoders_layer[i].self_attn_linear_q_bias =
+          tensors.at(p + ".self_attn.linear_q.bias");
+      decoder_->decoders_layer[i].self_attn_linear_k_weight =
+          tensors.at(p + ".self_attn.linear_k.weight");
+      decoder_->decoders_layer[i].self_attn_linear_k_bias =
+          tensors.at(p + ".self_attn.linear_k.bias");
+      decoder_->decoders_layer[i].self_attn_linear_v_weight =
+          tensors.at(p + ".self_attn.linear_v.weight");
+      decoder_->decoders_layer[i].self_attn_linear_v_bias =
+          tensors.at(p + ".self_attn.linear_v.bias");
+      decoder_->decoders_layer[i].self_attn_linear_out_weight =
+          tensors.at(p + ".self_attn.linear_out.weight");
+      decoder_->decoders_layer[i].self_attn_linear_out_bias =
+          tensors.at(p + ".self_attn.linear_out.bias");
+      decoder_->decoders_layer[i].feed_forward_w_1_weight =
+          tensors.at(p + ".feed_forward.w_1.weight");
+      decoder_->decoders_layer[i].feed_forward_w_1_bias =
+          tensors.at(p + ".feed_forward.w_1.bias");
+      decoder_->decoders_layer[i].feed_forward_w_2_weight =
+          tensors.at(p + ".feed_forward.w_2.weight");
+      decoder_->decoders_layer[i].feed_forward_w_2_bias =
+          tensors.at(p + ".feed_forward.w_2.bias");
+      decoder_->decoders_layer[i].norm1_weight =
+          tensors.at(p + ".norm1.weight");
+      decoder_->decoders_layer[i].norm1_bias = tensors.at(p + ".norm1.bias");
+      decoder_->decoders_layer[i].norm2_weight =
+          tensors.at(p + ".norm2.weight");
+      decoder_->decoders_layer[i].norm2_bias = tensors.at(p + ".norm2.bias");
+    }
+
+    decoder_->ctc_out_linear_weight = tensors.at("ctc.ctc_lo.weight");
+    decoder_->ctc_out_linear_bias = tensors.at("ctc.ctc_lo.bias");
 
     return true;
   } catch (...) {
@@ -241,237 +183,226 @@ bool FunASRNanoModel::MapTensors(std::map<std::string, struct ggml_tensor*>& ten
   }
 }
 
-bool FunASRNanoModel::SetLayerWeights(std::vector<FunASRNanoLayerEncoder>& layers, std::map<std::string, struct ggml_tensor*>& tensors, int n_layers, const std::string& prefix) {
-  layers.resize(n_layers);
-  for (int i = 0; i < n_layers; ++i) {
-    std::string p = "encoder." + prefix + "." + std::to_string(i);
-    layers[i].e_attn_ln_out_w = tensors.at(p + ".self_attn.linear_out.weight");
-    layers[i].e_attn_ln_out_b = tensors.at(p + ".self_attn.linear_out.bias");
-    layers[i].e_attn_ln_q_w   = tensors.at(p + ".self_attn.linear_q.weight");
-    layers[i].e_attn_ln_q_b   = tensors.at(p + ".self_attn.linear_q.bias");
-    layers[i].e_attn_ln_k_w   = tensors.at(p + ".self_attn.linear_k.weight");
-    layers[i].e_attn_ln_k_b   = tensors.at(p + ".self_attn.linear_k.bias");
-    layers[i].e_attn_ln_v_w   = tensors.at(p + ".self_attn.linear_v.weight");
-    layers[i].e_attn_ln_v_b   = tensors.at(p + ".self_attn.linear_v.bias");
-    layers[i].e_attn_fsmn_w   = tensors.at(p + ".self_attn.fsmn_block.weight");
-    layers[i].e_mlp_w1        = tensors.at(p + ".feed_forward.w_1.weight");
-    layers[i].e_mlp_b1        = tensors.at(p + ".feed_forward.w_1.bias");
-    layers[i].e_mlp_w2        = tensors.at(p + ".feed_forward.w_2.weight");
-    layers[i].e_mlp_b2        = tensors.at(p + ".feed_forward.w_2.bias");
-    layers[i].e_norm_w1       = tensors.at(p + ".norm1.weight");
-    layers[i].e_norm_b1       = tensors.at(p + ".norm1.bias");
-    layers[i].e_norm_w2       = tensors.at(p + ".norm2.weight");
-    layers[i].e_norm_b2       = tensors.at(p + ".norm2.bias");
-  }
-  return true;
-}
-
 std::shared_ptr<RSState> FunASRNanoModel::CreateState() {
   return std::make_shared<FunASRNanoState>();
 }
 
 /**
  * Build and execute the Encoder computation graph.
- * 4 Prompt Tokens + Mel Features -> SANM Encoders -> Parallel Encoders -> Hidden States.
+ * 4 Prompt Tokens + Mel Features -> SANM Encoders -> Parallel Encoders ->
+ * Hidden States.
  */
-bool FunASRNanoModel::Encode(const std::vector<float>& input_frames, RSState& state, ggml_backend_sched_t sched) {
-  auto& sv_state = static_cast<FunASRNanoState&>(state);
-  int n_len = input_frames.size() / hparams_.feats_dim;
-  int hidden = hparams_.n_encoder_hidden_state;
+bool FunASRNanoModel::Encode(const std::vector<float> &input_frames,
+                             RSState &state, ggml_backend_sched_t sched) {
+  return encoder_->Encode(input_frames, state, sched);
+}
 
-  struct ggml_context * ctx0 = nullptr;
-  struct ggml_cgraph * gf = nullptr;
+static struct ggml_tensor *
+decoder_forward(const FunASRNanoHParams &hparams, struct ggml_context *ctx,
+                    struct ggml_tensor *cur,
+                    FunASRNanoTransformerDecoder &layers){
+    // --- 1. Downsampling & Initial Projection ---
+    // PyTorch: x.view(batch, chunk_num, dim * k)
+    const int k = hparams.ctc_downsample_rate;
+    const int encoder_dim = cur->ne[0];
+    const int seq_len = cur->ne[1];
+    const int batch_size = cur->ne[2];
+    const int chunk_num = (seq_len + k - 1) / k;
 
-  if (!init_compute_ctx(&ctx0, &gf, FUNASR_NANO_ENCODER_MAX_NODES)) {
-      return false;
-  }
+    // Reshape to flatten the downsample dimension into the feature dimension
+    // Result shape: [encoder_dim * k, chunk_num, batch_size]
+    cur = ggml_reshape_3d(ctx, ggml_cont(ctx, cur), encoder_dim * k, chunk_num, batch_size);
 
-  // Define Input Tensors
-  struct ggml_tensor * feature = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams_.feats_dim, n_len);
-  struct ggml_tensor * prompt_ids = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 4, 1);
-  struct ggml_tensor * position = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, hparams_.feats_dim, n_len + 4, 1);
+    // Linear 1 + ReLU
+    cur = ggml_mul_mat(ctx, layers.linear1_weight, cur);
+    cur = ggml_add(ctx, cur, layers.linear1_bias);
+    cur = ggml_relu_inplace(ctx, cur);
 
-  ggml_set_name(feature, "feats");
-  ggml_set_name(prompt_ids, "prompt_ids");
-  ggml_set_name(position, "position");
+    // Linear 2 -> Result shape: [llm_dim, chunk_num, batch_size]
+    cur = ggml_mul_mat(ctx, layers.linear2_weight, cur);
+    cur = ggml_add(ctx, cur, layers.linear2_bias);
 
-  ggml_set_input(feature);
-  ggml_set_input(prompt_ids);
-  ggml_set_input(position);
+    // --- 2. Transformer Encoder Blocks Loop ---
+    const int llm_dim = cur->ne[0];
+    const int n_head = hparams.ctc_attention_heads;
+    const int d_k = llm_dim / n_head;
+    const float scale = 1.0f / sqrtf((float)d_k);
 
-  // Graph construction logic...
-  struct ggml_tensor * emb = ggml_get_rows(ctx0, encoder_->embedding, prompt_ids);
-  ggml_set_name(emb, "embedding");
-  emb = ggml_repeat(ctx0, emb, ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, emb->ne[0], emb->ne[1], 1));
-  struct ggml_tensor * cur = ggml_concat(ctx0, emb, feature, 1);
-  cur = ggml_scale(ctx0, cur, sqrtf(hidden));
-  cur = ggml_add(ctx0, position, cur);
+    for (auto layer: layers.decoders_layer) {
+        // --- Sub-layer 1: Multi-Head Attention ---
+        struct ggml_tensor * block_input = cur;
+        // Pre-Norm
+        cur = ggml_norm(ctx, cur, hparams.eps);
+        cur = ggml_add(ctx, ggml_mul(ctx, cur, layer.norm1_weight), layer.norm1_bias);
 
-  cur = encoder_layer_sanm_forward(hparams_, ctx0, cur, encoder_->encoder0);
-  for (int i = 0; i < hparams_.n_encoder_layers - 1; ++i) {
-    cur = encoder_layer_sanm_forward(hparams_, ctx0, cur, encoder_->encoders_layer[i]);
-  }
+        // Q, K, V Projections
+        struct ggml_tensor * q = ggml_add(ctx, ggml_mul_mat(ctx, layer.self_attn_linear_q_weight, cur), layer.self_attn_linear_q_bias);
+        struct ggml_tensor * k_vec = ggml_add(ctx, ggml_mul_mat(ctx, layer.self_attn_linear_k_weight, cur), layer.self_attn_linear_k_bias);
+        struct ggml_tensor * v = ggml_add(ctx, ggml_mul_mat(ctx, layer.self_attn_linear_v_weight, cur), layer.self_attn_linear_v_bias);
 
-  cur = ggml_norm(ctx0, cur, hparams_.eps);
-  cur = ggml_add(ctx0, ggml_mul(ctx0, cur, encoder_->e_after_norm_w), encoder_->e_after_norm_b);
+        // Reshape for MHA: [d_k, chunk_num, head, batch]
+        q = ggml_permute(ctx, ggml_reshape_4d(ctx, q, d_k, n_head, chunk_num, batch_size), 0, 2, 1, 3);
+        k_vec = ggml_permute(ctx, ggml_reshape_4d(ctx, k_vec, d_k, n_head, chunk_num, batch_size), 0, 2, 1, 3);
+        v = ggml_permute(ctx, ggml_reshape_4d(ctx, v, d_k, n_head, chunk_num, batch_size), 0, 2, 1, 3);
 
-  for (int i = 0; i < hparams_.n_tp_encoder_layers; ++i) {
-    cur = encoder_layer_sanm_forward(hparams_, ctx0, cur, encoder_->tp_encoders_layer[i]);
-  }
+        // Multi-head Attention Score: (Q * K^T) * scale
+        // ggml_mul_mat(k, q) computes dot product over the first dimension (d_k)
+        struct ggml_tensor * scores = ggml_mul_mat(ctx, k_vec, q);
+        scores = ggml_scale_inplace(ctx, scores, scale);
 
-  cur = ggml_norm(ctx0, cur, hparams_.eps);
-  cur = ggml_add(ctx0, ggml_mul(ctx0, cur, encoder_->e_tp_norm_w), encoder_->e_tp_norm_b);
+        // Softmax
+        struct ggml_tensor * probs = ggml_soft_max_inplace(ctx, scores);
 
-  ggml_set_name(cur, "encoder_out");
-  ggml_set_output(cur);
-  ggml_build_forward_expand(gf, cur);
+        // 3. Calculate Context: [d_k, L, H, B] @ [L, L, H, B]
+        // Problem: V's ne[0] is d_k, but Probs' ne[0] is L. They must match.
+        // Solution: Transpose V so its ne[0] is L.
+        struct ggml_tensor * v_T = ggml_cont(ctx, ggml_permute(ctx, v, 1, 0, 2, 3)); // [L, d_k, H, B]
 
-  // Allocate and execute
+        // Now multiply: [L, d_k, H, B] @ [L, L, H, B]
+        // GGML reduces ne[0] (L).
+        // Result ne[0] = Probs->ne[1] (L), ne[1] = v_T->ne[1] (d_k)
+        struct ggml_tensor * context = ggml_mul_mat(ctx, v_T, probs); // [L, d_k, H, B]
+
+        // 4. Final Transpose back to standard: [d_k, L, H, B]
+        context = ggml_cont(ctx, ggml_permute(ctx, context, 0, 2, 1,3));
+        context = ggml_reshape_3d(ctx, context, llm_dim, chunk_num, batch_size);
+
+        // Output Projection & Residual Connection
+        cur = ggml_mul_mat(ctx, layer.self_attn_linear_out_weight, context);
+        cur = ggml_add(ctx, cur, layer.self_attn_linear_out_bias);
+        cur = ggml_add(ctx, cur, block_input);
+
+        // --- Sub-layer 2: Feed Forward Network (FFN) ---
+        struct ggml_tensor * ffn_input = cur;
+
+        // Pre-Norm
+        cur = ggml_norm(ctx, cur, hparams.eps);
+        cur = ggml_add(ctx, ggml_mul(ctx, cur, layer.norm2_weight), layer.norm2_bias);
+
+        // FFN: Linear 1 -> ReLU -> Linear 2
+        cur = ggml_mul_mat(ctx, layer.feed_forward_w_1_weight, cur);
+        cur = ggml_add(ctx, cur, layer.feed_forward_w_1_bias);
+        cur = ggml_relu_inplace(ctx, cur);
+
+        cur = ggml_mul_mat(ctx, layer.feed_forward_w_2_weight, cur);
+        cur = ggml_add(ctx, cur, layer.feed_forward_w_2_bias);
+
+        // Residual Connection
+        cur = ggml_add(ctx, cur, ffn_input);
+    }
+
+    return cur;
+
+
+}
+
+bool FunASRNanoModel::DecodeWithLLM(RSState &state,
+                                    ggml_backend_sched_t sched) {
+  return true;
+};
+
+bool FunASRNanoModel::DecodeWithoutLLM(RSState &state,
+                                       ggml_backend_sched_t sched) {
+  auto &sv_state = static_cast<SenseVoiceState &>(state);
+  if (!sv_state.encoder_out)
+    return false;
+
+  int T = sv_state.encoder_out->ne[1];
+  int V = hparams_.n_vocab;
+
+
+
+  struct ggml_context *ctx0 =
+      ggml_init({2 * 1024 * ggml_tensor_overhead(), nullptr, true});
+  struct ggml_cgraph *gf =
+      ggml_new_graph_custom(ctx0, FUNASR_NANO_DECODER_MAX_NODES, false);
+
+  struct ggml_tensor *encoder_in = ggml_new_tensor_2d(
+      ctx0, sv_state.encoder_out->type, sv_state.encoder_out->ne[0],
+      sv_state.encoder_out->ne[1]);
+  ggml_set_input(encoder_in);
+
+  // transformer
+
+    struct ggml_tensor *cur =  decoder_forward(hparams_, ctx0, encoder_in, *decoder_);
+
+  // 1. Linear projection to vocab size
+  cur = ggml_mul_mat(ctx0, decoder_->ctc_out_linear_weight, cur);
+  cur = ggml_add(ctx0, cur, decoder_->ctc_out_linear_bias);
+
+  // 2. Compute log-probabilities
+  struct ggml_tensor *log_probs = ggml_log(ctx0, ggml_soft_max(ctx0, cur));
+
+  struct ggml_tensor *output_node = nullptr;
+
+  if (beam_size <= 1)
+    // Greedy serach: Calculate argmax on backend
+    output_node = ggml_argmax(ctx0, log_probs);
+
+  ggml_set_name(output_node, "output");
+
+  ggml_set_output(output_node);
+  ggml_build_forward_expand(gf, output_node);
+
   if (!ggml_backend_sched_alloc_graph(sched, gf)) {
-    // If this is the first run, GGML might fail to allocate while it calculates reserves.
-    // We check logs; if it still crashes here, the node count or memory is definitely the issue.
     ggml_free(ctx0);
     return false;
   }
-
-  // Set data
-  ggml_backend_tensor_set(feature, input_frames.data(), 0, input_frames.size() * sizeof(float));
-  int p_tokens[4] = { sv_state.language_id, 1, 2, sv_state.use_itn ? 14 : 15 };
-  ggml_backend_tensor_set(prompt_ids, p_tokens, 0, 4 * sizeof(int));
-
-  // --- POSITIONAL ENCODING FIX ---
-  // Construct sinusoidal position embedding based on FunASR reference
-  auto p_n_len = position->ne[1];
-  auto p_dim = position->ne[0];
-  auto p_n_batch = position->ne[2];
-  std::vector<float> _position(p_n_len * p_dim * p_n_batch);
-
-  for (int b = 0; b < p_n_batch; b++) {
-    for (int k = 1; k <= p_n_len; k++) {
-      for (int i = 0; i < p_dim / 2; i++) {
-        float freq = pow(10000, -2.0 * i / p_dim);
-        _position[b * p_n_len * p_dim + (k - 1) * p_dim + i] = sinf(k * freq);
-        _position[b * p_n_len * p_dim + (k - 1) * p_dim + i + p_dim / 2] = cosf(k * freq);
-      }
-    }
-  }
-
-  ggml_backend_tensor_set(position, _position.data(), 0, ggml_nelements(position) * sizeof(float));
-
-  // ggml_backend_sched_set_eval_callback(sched, ggml_debug, new callback_data());
+  ggml_backend_tensor_copy(sv_state.encoder_out, encoder_in);
+    // ggml_backend_sched_set_eval_callback(sched, ggml_debug, new callback_data());
   if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
     ggml_free(ctx0);
     return false;
   }
-
-  // Persistence logic...
-  if (sv_state.encoder_out == nullptr || sv_state.encoder_out->ne[0] != cur->ne[0] || sv_state.encoder_out->ne[1] != cur->ne[1]) {
-    if (sv_state.buffer_persistent) ggml_backend_buffer_free(sv_state.buffer_persistent);
-    sv_state.encoder_out = ggml_new_tensor_2d(sv_state.ctx_persistent, cur->type, cur->ne[0], cur->ne[1]);
-    ggml_backend_t primary_backend = ggml_backend_sched_get_backend(sched, 0);
-    sv_state.buffer_persistent = ggml_backend_alloc_buffer(primary_backend, ggml_nbytes(sv_state.encoder_out));
-    void * base_addr = ggml_backend_buffer_get_base(sv_state.buffer_persistent);
-    ggml_backend_tensor_alloc(sv_state.buffer_persistent, sv_state.encoder_out, base_addr);
+    // print_tensor(output_node);
+  if (beam_size <= 1) {
+    raw_ids.resize(T);
+    ggml_backend_tensor_get(output_node, raw_ids.data(), 0,
+                            T * sizeof(int32_t));
+  } else {
+    host_log_probs.resize(T * V);
+    ggml_backend_tensor_get(output_node, host_log_probs.data(), 0,
+                            T * V * sizeof(float));
   }
-  ggml_backend_tensor_copy(cur, sv_state.encoder_out);
-
+    sv_state.ids = CTCDecoder::GreedyDecode(raw_ids.data(), T);
   ggml_free(ctx0);
   return true;
-}
-
+};
 
 /**
  * Enhanced Decode function supporting Greedy and Beam Search.
  */
-bool FunASRNanoModel::Decode(RSState& state, ggml_backend_sched_t sched) {
-    auto& sv_state = static_cast<FunASRNanoState&>(state);
-    if (!sv_state.encoder_out) return false;
-
-    int T = sv_state.encoder_out->ne[1];
-    int V = hparams_.n_vocab;
-    int beam_size = 1; // You can pull this from params later
-
-    struct ggml_context * ctx0 = ggml_init({ 256 * ggml_tensor_overhead(), nullptr, true });
-    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, FUNASR_NANO_DECODER_MAX_NODES, false);
-
-    struct ggml_tensor * encoder_in = ggml_new_tensor_2d(ctx0, sv_state.encoder_out->type,
-                                                        sv_state.encoder_out->ne[0], sv_state.encoder_out->ne[1]);
-    ggml_set_input(encoder_in);
-
-    // 1. Linear projection to vocab size
-    struct ggml_tensor * cur = ggml_mul_mat(ctx0, encoder_->ctc_out_linear_weight, encoder_in);
-    cur = ggml_add(ctx0, cur, encoder_->ctc_out_linear_bias);
-
-    // 2. Compute log-probabilities
-    struct ggml_tensor * log_probs =  ggml_log(ctx0, ggml_soft_max(ctx0, cur));
-
-    struct ggml_tensor * output_node = nullptr;
-
-    if (beam_size <= 1) {
-        // Greedy serach: Calculate argmax on backend
-        output_node = ggml_argmax(ctx0, log_probs);
-    } else {
-        // Beam Search Mode: We need the full log-probs on host
-        output_node = log_probs;
-    }
-    ggml_set_name(output_node, "output");
-
-    ggml_set_output(output_node);
-    ggml_build_forward_expand(gf, output_node);
-
-    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
-        ggml_free(ctx0);
-        return false;
+bool FunASRNanoModel::Decode(RSState &state, ggml_backend_sched_t sched) {
+    auto &sv_state = static_cast<SenseVoiceState &>(state);
+    DecodeWithoutLLM(state, sched);
+    for (auto id : sv_state.ids) {
+        sv_state.tokens.push_back(this->vocab_.id_to_token[id]);
     }
 
-    ggml_backend_tensor_copy(sv_state.encoder_out, encoder_in);
-
-    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
-        ggml_free(ctx0);
-        return false;
-    }
-
-
-    // 3. Post-Processing on Host
-    if (beam_size <= 1) {
-        // --- Greedy Decoding ---
-        std::vector<int32_t> raw_ids(T);
-        ggml_backend_tensor_get(output_node, raw_ids.data(), 0, T * sizeof(int32_t));
-
-        // Use CTCDecoder to collapse repeats and remove blanks
-        sv_state.ids = CTCDecoder::GreedyDecode(raw_ids.data(), T);
-    } else {
-        // --- Beam Search Decoding ---
-        std::vector<float> host_log_probs(T * V);
-        ggml_backend_tensor_get(output_node, host_log_probs.data(), 0, T * V * sizeof(float));
-
-        sv_state.ids = CTCDecoder::BeamSearchDecode(host_log_probs.data(), T, V, beam_size);
-    }
-
-    for (auto id: sv_state.ids){ sv_state.tokens.push_back(this->vocab_.id_to_token[id]);}
-
-    ggml_free(ctx0);
-    return true;
+  return true;
 }
 
-std:: string FunASRNanoModel::GetTranscription(RSState& state)
-{
-  auto& sv_state = static_cast<FunASRNanoState&>(state);
+std::string FunASRNanoModel::GetTranscription(RSState &state) {
+  auto &sv_state = static_cast<FunASRNanoState &>(state);
   std::string result;
-  result.reserve(64);   // ⭐ 关键：避免反复 realloc
+  result.reserve(64); // ⭐ 关键：避免反复 realloc
 
-  for (const auto& s : sv_state.tokens) {
+  for (const auto &s : sv_state.tokens) {
     result += s;
   }
   sv_state.tokens.clear();
   return result;
 }
+
 // Registration logic
-extern void rs_register_model_arch(const std::string& arch, std::function<std::shared_ptr<ISpeechModel>()> creator);
+extern void
+rs_register_model_arch(const std::string &arch,
+                       std::function<std::shared_ptr<ISpeechModel>()> creator);
 namespace {
 struct FunASRNanoRegistrar {
   FunASRNanoRegistrar() {
-    rs_register_model_arch("FunASRNano", [](){ return std::make_shared<FunASRNanoModel>(); });
+    rs_register_model_arch(
+        "FunASRNano", []() { return std::make_shared<FunASRNanoModel>(); });
   }
 } global_FunASRNano_reg;
-}
+} // namespace

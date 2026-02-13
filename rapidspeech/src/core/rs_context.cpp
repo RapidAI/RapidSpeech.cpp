@@ -225,3 +225,24 @@ rs_context_t* rs_context_init_internal(rs_init_params_t params) {
     RS_LOG_INFO("RapidSpeech context core initialized successfully.");
     return ctx.release();
 }
+
+/**
+ * Helper to safely initialize a ggml context and graph.
+ * Prevents 0x0 crashes by checking allocation results.
+ */
+bool init_compute_ctx(struct ggml_context ** ctx, struct ggml_cgraph ** gf, int n_nodes) {
+    // We add 1MB of buffer to the tensor overhead to be safe
+    size_t mem_size = n_nodes * ggml_tensor_overhead() + (1024 * 1024);
+    struct ggml_init_params params = { mem_size, nullptr, true };
+    *ctx = ggml_init(params);
+    if (!(*ctx)) {
+        RS_LOG_ERR("ggml_init failed: out of memory for context.");
+        return false;
+    }
+    *gf = ggml_new_graph_custom(*ctx, n_nodes, false);
+    if (!(*gf)) {
+        RS_LOG_ERR("ggml_new_graph_custom failed: too many nodes or out of memory.");
+        return false;
+    }
+    return true;
+}

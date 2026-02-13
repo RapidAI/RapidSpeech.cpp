@@ -69,6 +69,7 @@ set(RS_SOURCES
         rapidspeech/src/frontend/fftsg.c
         rapidspeech/src/utils/rs_log.cpp
         rapidspeech/src/arch/sensevoice.cpp
+        rapidspeech/src/arch/sensevoice_encoder.cpp
         rapidspeech/src/arch/funasr-nano.cpp
         rapidspeech/src/utils/rs_wav.cpp
 )

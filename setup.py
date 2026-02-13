@@ -169,7 +169,7 @@ class BuildExtension(build_ext):
                 raise Exception(
                     "\nBuild rapidspeech failed. Please check the error message.\n"
                     "You can ask for help by creating an issue on GitHub.\n"
-                    "\nClick:\n\thttps://xxx/rapidspeech/issues/new\n"  # noqa
+                    "\nClick:\n\thttps://github.com/RapidAI/RapidSpeech.cpp/issues/new\n"  # noqa
                 )
 
 
@@ -235,8 +235,8 @@ setuptools.setup(
     name=package_name,
     python_requires=">=3.7",
     version="v1.0",
-    author="xxx",
-    author_email="xxx",
+    author="lovemefan",
+    author_email="lovemefan@outlook.com",
     packages=["rapidspeech"],
     data_files=(
         [
@@ -249,7 +249,7 @@ setuptools.setup(
         if get_binaries_to_install()
         else None
     ),
-    url="xxxx",
+    url="https://github.com/RapidAI/RapidSpeech.cpp",
     long_description=read_long_description(),
     long_description_content_type="text/markdown",
     ext_modules=[cmake_extension("rapidspeech")],

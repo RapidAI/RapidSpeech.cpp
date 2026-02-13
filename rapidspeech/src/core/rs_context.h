@@ -45,3 +45,5 @@ void rs_register_model_arch(const std::string& arch, ModelCreator creator);
  * Internal entry point for context initialization.
  */
 rs_context_t* rs_context_init_internal(rs_init_params_t params);
+
+bool init_compute_ctx(struct ggml_context ** ctx, struct ggml_cgraph ** gf, int n_nodes);

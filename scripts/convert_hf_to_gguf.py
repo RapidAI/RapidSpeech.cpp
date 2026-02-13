@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 import argparse
-import os
-import sys
+import json
 import yaml
 import numpy as np
 import torch
-import contextlib
 from pathlib import Path
-from typing import Iterator
 from gguf import GGUFWriter, GGMLQuantizationType
 
 # Mapping of SenseVoice internal architecture names to GGUF strings
 ARCH_MAP = {
     "SenseVoiceSmall": "SenseVoiceSmall",
-    "Funasr-nano": "Funasr-nano",
+    "FunASRNano": "FunASRNano"
 }
 def load_cmvn(mvn_path: str):
     """
@@ -62,7 +59,7 @@ def write_tensor(writer: GGUFWriter, name: str, data_torch: torch.Tensor, ftype:
         return
 
     # Convert to numpy
-    data = data_torch.float().numpy()
+    data = data_torch.detach().float().numpy()
 
     # Specific type handling for FSMN and specific VAD layers as per reference
     if 'fsmn_block.weight' in name or name.startswith('_model.'):
@@ -79,6 +76,7 @@ def main():
     parser.add_argument("--model-dir", type=str, required=True, help="Directory with config.yaml, model.pt, am.mvn")
     parser.add_argument("--output", type=str, required=True, help="Output .gguf file path")
     parser.add_argument("--out-type", type=str, choices=["f32", "f16"], default="f32")
+    parser.add_argument("--without_llm", action="store_true", default=False, help="Exclude LLM weights if present")
     args = parser.parse_args()
 
     model_dir = Path(args.model_dir)
@@ -94,7 +92,26 @@ def main():
 
     # 2. Set Parameters from YAML (Frontend & Encoder)
     fconf = hparams.get("frontend_conf", {})
-    econf = hparams.get("encoder_conf", {})
+    econf = hparams.get("encoder_conf", {}) if arch_name == 'SenseVoiceSmall' else hparams.get("audio_encoder_conf", {})
+    if arch_name == 'FunASRNano':
+        ctc_conf = hparams.get("ctc_decoder_conf", {})
+        writer.add_int32("ctc.downsample_rate", ctc_conf.get("downsample_rate", 1))
+        writer.add_int32("ctc.ffn_dim", ctc_conf.get("ffn_dim", 0))
+        writer.add_int32("ctc.llm_dim", ctc_conf.get("llm_dim", 0))
+        writer.add_int32("ctc.encoder_dim", ctc_conf.get("encoder_dim", 0))
+        writer.add_int32("ctc.n_layer", ctc_conf.get("n_layer", 0))
+        writer.add_int32("ctc.odim", ctc_conf.get("odim", 0))
+
+        if not args.without_llm:
+            adaptor_conf = hparams.get("audio_adaptor_conf", {})
+
+            writer.add_int32("adaptor.ffn_dim", adaptor_conf.get("ffn_dim", 0))
+            writer.add_int32("adaptor.downsample_rate", adaptor_conf.get("downsample_rate", 1))
+            writer.add_int32("adaptor.llm_dim:", adaptor_conf.get("llm_dim:", 0))
+            writer.add_int32("adaptor.encoder_dim", adaptor_conf.get("encoder_dim", 0))
+            writer.add_int32("adaptor.n_layer", adaptor_conf.get("n_layer", 0))
+
+
 
     writer.add_int32("frontend.sample_rate", fconf.get("fs", 16000))
     writer.add_string("frontend.window", fconf.get("window", "hamming"))
@@ -119,20 +136,73 @@ def main():
             writer.add_array("model.cmvn_vars", vars.tolist())
 
     # 4. Set Vocabulary
-    vocab_model = model_dir / "chn_jpn_yue_eng_ko_spectok.bpe.model"
-    if vocab_model.exists():
-        import sentencepiece as spm
-        sp = spm.SentencePieceProcessor()
-        sp.load(str(vocab_model))
-        tokens = [sp.id_to_piece(i).replace(" ", " ") for i in range(sp.vocab_size())]
-        writer.add_int32("tokenizer.vocab_size", sp.vocab_size())
-        writer.add_token_list(tokens)
-        writer.add_string("tokenizer.unk_symbol", "<unk>")
+    if arch_name == "SenseVoiceSmall":
+        vocab_model = model_dir / "chn_jpn_yue_eng_ko_spectok.bpe.model"
+        if vocab_model.exists():
+            import sentencepiece as spm
+            sp = spm.SentencePieceProcessor()
+            sp.load(str(vocab_model))
+            tokens = [sp.id_to_piece(i).replace(" ", " ") for i in range(sp.vocab_size())]
+            writer.add_int32("tokenizer.vocab_size", sp.vocab_size())
+            writer.add_token_list(tokens)
+            writer.add_string("tokenizer.unk_symbol", "<unk>")
+
+    elif arch_name == "FunASRNano":
+        config_path = model_dir / "Qwen3-0.6B/config.yaml"
+        vocab_path = model_dir / "multilingual.tiktoken"
+        added_tokens = model_dir / "Qwen3-0.6B/tokenizer_config.json"
+
+        if vocab_path.exists():
+
+            from funasr.models.sense_voice.whisper_lib.tokenizer import get_tokenizer
+
+            tokenizer = get_tokenizer(
+                multilingual=True,
+                num_languages=8479,
+                vocab_path=str(vocab_path)
+            )
+
+            tokens = [tokenizer.decode([i]) for i in range(tokenizer.encoding.n_vocab)]
+
+            with open(added_tokens, 'r', encoding='utf-8') as f:
+                add_vocab = json.load(f)
+
+            added_tokens_list = list(tokens)
+            writer.add_int32("tokenizer.vocab_size", len(added_tokens_list))
+            writer.add_token_list(added_tokens_list)
+            writer.add_string("tokenizer.unk_symbol", "<unk>")
+            writer.add_string("tokenizer.chat_template", add_vocab.get("chat_template", ""))
+
+        if config_path.exists() and not args.without_llm:
+            with open(config_path, "r") as f:
+                hparams = yaml.safe_load(f)
+            model_type = hparams.get("model_type", "qwen3")
+            writer.add_bool(f"{model_type}.attention_bias", hparams.get("attention_bias", False))
+            writer.add_int32(f"{model_type}.bos_token_id", hparams.get("bos_token_id"))
+            writer.add_int32(f"{model_type}.eos_token_id", hparams.get("eos_token_id"))
+            writer.add_int32(f"{model_type}.head_dim", hparams.get("head_dim"))
+            writer.add_string(f"{model_type}.hidden_act", hparams.get("hidden_act"))
+            writer.add_int32(f"{model_type}.hidden_size", hparams.get("hidden_size"))
+            writer.add_float32(f"{model_type}.initializer_range", hparams.get("initializer_range"))
+            writer.add_int32(f"{model_type}.intermediate_size", hparams.get("intermediate_size"))
+            writer.add_int32(f"{model_type}.max_position_embeddings", hparams.get("max_position_embeddings", 2048))
+            writer.add_int32(f"{model_type}.max_window_layers", hparams.get("max_window_layers"))
+            writer.add_int32(f"{model_type}.num_attention_heads", hparams.get("num_attention_heads"))
+            writer.add_int32(f"{model_type}.num_hidden_layers", hparams.get("num_hidden_layers"))
+            writer.add_int32(f"{model_type}.num_key_value_heads", hparams.get("num_key_value_heads"))
+            writer.add_float32(f"{model_type}.rms_norm_eps", hparams.get("rms_norm_eps", 1e-6))
+
+
 
     # 5. Write Tensors
     print("Writing tensors...")
     for name, data in get_tensors(model_dir):
         if not name.endswith(("Loss", "loss")):
+            if args.without_llm and (name.startswith("llm.") or name.startswith("audio_adaptor.")):
+                continue
+
+            if arch_name == "FunASRNano":
+                name = name.replace('audio_encoder', 'encoder')
             write_tensor(writer, name, data, ftype)
 
     writer.write_header_to_file()
