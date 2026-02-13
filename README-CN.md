@@ -48,6 +48,7 @@
 - [x] SenseVoice-small
 - [ ] FunASR-nano
 - [ ] Qwen3-ASR
+- [ ] FireRedASR2
 
 **Text-to-Speech (TTS)**
 - [ ] CosyVoice3

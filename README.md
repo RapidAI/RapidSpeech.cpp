@@ -49,6 +49,7 @@ While the open-source ecosystem already offers powerful cloud-side frameworks su
 - [x] SenseVoice-small
 - [ ] FunASR-nano
 - [ ] Qwen3-ASR
+- [ ] FireRedASR2
 
 **Text-to-Speech (TTS)**
 - [ ] CosyVoice3
