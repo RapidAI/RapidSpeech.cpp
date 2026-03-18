@@ -1,8 +1,6 @@
 #pragma once
 
 #include <vector>
-#include <cstdint>
-#include <string>
 
 // Configuration for SenseVoice/FunASR frontend pipeline
 struct STFTConfig {
@@ -16,8 +14,8 @@ struct STFTConfig {
 
   // --- SenseVoice Specific (LFR & CMVN) ---
   bool use_lfr = true;
-  int lfr_m = 7;        // Stack 7 frames
-  int lfr_n = 6;        // Stride 6 frames
+  int lfr_m = 7; // Stack 7 frames
+  int lfr_n = 6; // Stride 6 frames
 
   bool use_cmvn = true;
   int fbank_num_threads = 2;
@@ -31,15 +29,15 @@ struct CMVNData {
 
 class AudioProcessor {
 public:
-  AudioProcessor(const STFTConfig& config);
+  AudioProcessor(const STFTConfig &config);
   ~AudioProcessor();
 
   // Set CMVN parameters (extracted from model weights or external file)
-  void SetCMVN(const std::vector<float>& means, const std::vector<float>& vars);
+  void SetCMVN(const std::vector<float> &means, const std::vector<float> &vars);
 
   // Main pipeline: PCM -> Fbank -> LFR -> CMVN
-  void Compute(const std::vector<float>& input_pcm,
-               std::vector<float>& output_feats);
+  void Compute(const std::vector<float> &input_pcm,
+               std::vector<float> &output_feats);
 
 private:
   STFTConfig config_;
@@ -55,15 +53,17 @@ private:
   void InitMelFilters();
 
   // Core processing steps
-  void ComputeFbank(const std::vector<float>& samples, std::vector<float>& output_mel);
-  void ApplyLFR(const std::vector<float>& input_mel, int n_frames, std::vector<float>& output_lfr);
-  void ApplyCMVN(std::vector<float>& feats);
-  void ProcessFrame(int i, const std::vector<float>& samples,
-                                        std::vector<double>& window,
-                                        std::vector<double>& power_spec,
-                                        std::vector<float>& output_mel);
+  void ComputeFbank(const std::vector<float> &samples,
+                    std::vector<float> &output_mel);
+  void ApplyLFR(const std::vector<float> &input_mel, int n_frames,
+                std::vector<float> &output_lfr);
+  void ApplyCMVN(std::vector<float> &feats);
+  void ProcessFrame(int i, const std::vector<float> &samples,
+                    std::vector<double> &window,
+                    std::vector<double> &power_spec,
+                    std::vector<float> &output_mel);
 
   // Mathematical utilities
   int RoundToPowerOfTwo(int n);
-  void RealFFT(std::vector<double>& window);
+  void RealFFT(std::vector<double> &window);
 };
