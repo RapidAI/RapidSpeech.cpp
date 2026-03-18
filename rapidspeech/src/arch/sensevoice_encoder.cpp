@@ -2,12 +2,11 @@
 #include "core/rs_context.h"
 #include "ggml-backend.h"
 #include "ggml.h"
-#include "utils/rs_log.h"
-#include <functional>
-#include <cmath>
 #include "gguf.h"
 #include "utils/debug_utils.h"
+#include "utils/rs_log.h"
 #include "utils/rs_wav.h"
+#include <functional>
 
 // Increased node limit to handle deep SenseVoice graphs (50+ layers)
 #define SENSE_VOICE_model_MAX_NODES 6144
@@ -253,32 +252,34 @@ bool SenseVoiceEncoderModel::SetLayerWeights(
   return true;
 }
 
-void SenseVoiceEncoderModel::ensure_pos_encoding_size(int required_len, int dim) {
-    // If the cache is already large enough, do nothing
-    if (required_len <= max_pos_len_ && !cached_pos_encoding_.empty()) {
-        return;
+void SenseVoiceEncoderModel::ensure_pos_encoding_size(int required_len,
+                                                      int dim) {
+  // If the cache is already large enough, do nothing
+  if (required_len <= max_pos_len_ && !cached_pos_encoding_.empty()) {
+    return;
+  }
+
+  // Allocate slightly more than needed to prevent frequent resizing (e.g.,
+  // +1024 frames)
+  int target_len = std::max(required_len, max_pos_len_ + 1024);
+
+  // Resize the cache vector
+  // We store a single batch. If inference uses batch > 1, we reuse this data.
+  cached_pos_encoding_.resize(target_len * dim);
+
+  // Pre-compute sinusoidal positional encodings
+  // This logic replaces the O(N*D) math operations in the hot path
+  for (int k = 1; k <= target_len; k++) {
+    for (int i = 0; i < dim / 2; i++) {
+      float freq = pow(10000.0f, -2.0f * i / dim);
+
+      // Store interleaved sin/cos
+      cached_pos_encoding_[(k - 1) * dim + i] = sinf(k * freq);
+      cached_pos_encoding_[(k - 1) * dim + i + dim / 2] = cosf(k * freq);
     }
+  }
 
-    // Allocate slightly more than needed to prevent frequent resizing (e.g., +1024 frames)
-    int target_len = std::max(required_len, max_pos_len_ + 1024);
-
-    // Resize the cache vector
-    // We store a single batch. If inference uses batch > 1, we reuse this data.
-    cached_pos_encoding_.resize(target_len * dim);
-
-    // Pre-compute sinusoidal positional encodings
-    // This logic replaces the O(N*D) math operations in the hot path
-    for (int k = 1; k <= target_len; k++) {
-        for (int i = 0; i < dim / 2; i++) {
-            float freq = pow(10000.0f, -2.0f * i / dim);
-
-            // Store interleaved sin/cos
-            cached_pos_encoding_[(k - 1) * dim + i] = sinf(k * freq);
-            cached_pos_encoding_[(k - 1) * dim + i + dim / 2] = cosf(k * freq);
-        }
-    }
-
-    max_pos_len_ = target_len;
+  max_pos_len_ = target_len;
 }
 
 /**
@@ -314,8 +315,8 @@ bool SenseVoiceEncoderModel::Encode(const std::vector<float> &input_frames,
       ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 4, 1);
 
   // Note: 'required_pos_len' is used here for the dimension
-  struct ggml_tensor *position =
-      ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, hparams_.feats_dim, required_pos_len, 1);
+  struct ggml_tensor *position = ggml_new_tensor_3d(
+      ctx0, GGML_TYPE_F32, hparams_.feats_dim, required_pos_len, 1);
 
   ggml_set_name(feature, "feats");
   ggml_set_name(prompt_ids, "prompt_ids");
@@ -391,7 +392,8 @@ bool SenseVoiceEncoderModel::Encode(const std::vector<float> &input_frames,
   }
 
   // 3. Set Positional Encoding (Key Optimization)
-  // Instead of recalculating sin/cos in a triple loop, copy from pre-computed cache.
+  // Instead of recalculating sin/cos in a triple loop, copy from pre-computed
+  // cache.
   int p_dim = hparams_.feats_dim;
   size_t bytes_per_batch = (size_t)required_pos_len * p_dim * sizeof(float);
 
@@ -399,18 +401,20 @@ bool SenseVoiceEncoderModel::Encode(const std::vector<float> &input_frames,
   int n_batch = position->ne[2];
 
   if (n_batch == 1) {
-      // Single batch copy
-      ggml_backend_tensor_set(position, cached_pos_encoding_.data(), 0, bytes_per_batch);
+    // Single batch copy
+    ggml_backend_tensor_set(position, cached_pos_encoding_.data(), 0,
+                            bytes_per_batch);
   } else {
-      // If batch > 1, broadcast the same positional encoding to all batches
-      for (int b = 0; b < n_batch; ++b) {
-          ggml_backend_tensor_set(position, cached_pos_encoding_.data(),
-                                  b * bytes_per_batch, bytes_per_batch);
-      }
+    // If batch > 1, broadcast the same positional encoding to all batches
+    for (int b = 0; b < n_batch; ++b) {
+      ggml_backend_tensor_set(position, cached_pos_encoding_.data(),
+                              b * bytes_per_batch, bytes_per_batch);
+    }
   }
 
   // --- Compute ---
-  // ggml_backend_sched_set_eval_callback(sched, ggml_debug, new callback_data());
+  // ggml_backend_sched_set_eval_callback(sched, ggml_debug, new
+  // callback_data());
   if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
     ggml_free(ctx0);
     return false;

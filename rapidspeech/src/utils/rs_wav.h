@@ -1,7 +1,6 @@
 #pragma once
 
 #include <vector>
-#include <cstdint>
 
 /**
  * WAV header， 16bit PCM
@@ -20,7 +19,6 @@ struct WaveHeader {
   uint16_t bitsPerSample;
   char subchunk2Id[4];
   uint32_t subchunk2Size;
-
 };
 
 /**
@@ -30,6 +28,8 @@ struct WaveHeader {
  * @param sample_rate sample rate
  * @return true if success
  */
-bool load_wav_file(const char* filename, std::vector<float>& data, int* sample_rate);
+bool load_wav_file(const char *filename, std::vector<float> &data,
+                   int *sample_rate);
 
-void load_cmvn_params(struct gguf_context * ctx_gguf, std::vector<float>& means, std::vector<float>& vars);
+void load_cmvn_params(struct gguf_context *ctx_gguf, std::vector<float> &means,
+                      std::vector<float> &vars);

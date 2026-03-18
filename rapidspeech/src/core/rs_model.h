@@ -1,11 +1,10 @@
 #pragma once
 
-#include <vector>
-#include <string>
-#include <memory>
-#include "ggml.h"
-#include "gguf.h"
 #include "ggml-backend.h"
+#include "gguf.h"
+#include <memory>
+#include <string>
+#include <vector>
 
 // Internal State Base Class (Used for KV Cache or RNN States)
 struct RSState {
@@ -28,20 +27,22 @@ public:
   virtual ~ISpeechModel() = default;
 
   // 1. Loading Phase: Parse GGUF, load weights to ggml_backend
-  virtual bool Load(const std::unique_ptr<rs_context_t>& ctx, ggml_backend_t backend) = 0;
+  virtual bool Load(const std::unique_ptr<rs_context_t> &ctx,
+                    ggml_backend_t backend) = 0;
 
   // 2. State Creation: Create an independent state for each request
   virtual std::shared_ptr<RSState> CreateState() = 0;
 
   // 3. Encode/Preprocess: e.g., Audio -> Encoder Hidden States
   // Updated: Pass the backend scheduler to handle memory allocation and compute
-  virtual bool Encode(const std::vector<float>& input_frames, RSState& state, ggml_backend_sched_t sched) = 0;
+  virtual bool Encode(const std::vector<float> &input_frames, RSState &state,
+                      ggml_backend_sched_t sched) = 0;
 
   // 4. Decode/Generate: e.g., Hidden States -> Text Tokens
-  virtual bool Decode(RSState& state, ggml_backend_sched_t sched) = 0;
+  virtual bool Decode(RSState &state, ggml_backend_sched_t sched) = 0;
 
-  virtual std::string GetTranscription(RSState& state) = 0;
+  virtual std::string GetTranscription(RSState &state) = 0;
 
   // Get metadata
-  virtual const RSModelMeta& GetMeta() const = 0;
+  virtual const RSModelMeta &GetMeta() const = 0;
 };

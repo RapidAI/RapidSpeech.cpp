@@ -147,12 +147,10 @@ bool SenseVoiceModel::Encode(const std::vector<float> &input_frames,
   return encoder_->Encode(input_frames, state, sched);
 }
 
-
 /**
  * Enhanced Decode function supporting Greedy and Beam Search.
  */
-bool
-SenseVoiceModel::Decode(RSState &state, ggml_backend_sched_t sched) {
+bool SenseVoiceModel::Decode(RSState &state, ggml_backend_sched_t sched) {
   auto &sv_state = static_cast<SenseVoiceState &>(state);
   if (!sv_state.encoder_out)
     return false;

@@ -1,58 +1,81 @@
 #pragma once
 
-#include "rs_model.h"
 #include "frontend/audio_processor.h"
 #include "ggml-backend.h"
+#include "rs_model.h"
 #include <deque>
+#include <memory>
 #include <string>
 #include <vector>
-#include <memory>
 #define SENSE_VOICE_MAX_GRAPH_SIZE 8196
 /**
  * Simple thread-safe-ish circular buffer for raw PCM samples.
  */
 class CircularBuffer {
 public:
-  void Push(const float* data, size_t size);
+  void Push(const float *data, size_t size);
   std::vector<float> Pop(size_t size);
   size_t Size() const;
+
 private:
   std::deque<float> buffer_;
 };
 
 /**
  * RSProcessor orchestrates the entire speech processing pipeline:
- * Audio Buffer -> Feature Extraction -> Model Encoding -> Model Decoding -> Text/Audio Output
+ * Audio Buffer -> Feature Extraction -> Model Encoding -> Model Decoding ->
+ * Text/Audio Output
  */
 class RSProcessor {
 public:
   /**
-     * Constructor
-     * @param model Shared pointer to the architecture-specific model
-     * @param sched Backend scheduler used for inference
+   * Constructor
+   * @param model Shared pointer to the architecture-specific model
+   * @param sched Backend scheduler used for inference
    */
   RSProcessor(std::shared_ptr<ISpeechModel> model, ggml_backend_sched_t sched);
 
   /**
-     * Pushes raw PCM audio samples into the internal buffer.
+   * Pushes raw PCM audio samples into the internal buffer.
    */
-  void PushAudio(const float* data, size_t size);
+  void PushAudio(const float *data, size_t size);
 
   /**
-     * Updates the CMVN (Mean and Variance) parameters for the audio frontend.
+   * Updates the CMVN (Mean and Variance) parameters for the audio frontend.
    */
-  void SetCMVN(const std::vector<float>& means, const std::vector<float>& vars);
+  void SetCMVN(const std::vector<float> &means, const std::vector<float> &vars);
 
   /**
-     * Executes one iteration of the processing pipeline.
-     * @return 0: No new results, 1: New text/audio output available, -1: Error
+   * Executes one iteration of the processing pipeline.
+   * @return 0: No new results, 1: New text/audio output available, -1: Error
    */
   int Process();
 
   /**
-     * Returns the accumulated text result.
+   * Returns the accumulated text result.
    */
   std::string GetTextResult();
+
+  // --- Internal API for C Bindings ---
+
+  /**
+   * Get current audio buffer size in samples
+   */
+  size_t GetAudioBufferSize() const { return audio_buffer_.Size(); }
+
+  /**
+   * Get audio sample rate from model metadata
+   */
+  int GetAudioSampleRate() const {
+    return model_ ? model_->GetMeta().audio_sample_rate : 16000;
+  }
+
+  /**
+   * Check if processor has valid model and state
+   */
+  bool IsValid() const {
+    return model_ != nullptr && state_ != nullptr && sched_ != nullptr;
+  }
 
 private:
   std::shared_ptr<ISpeechModel> model_;

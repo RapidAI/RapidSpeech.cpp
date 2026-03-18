@@ -87,7 +87,8 @@ public:
 
 private:
   struct ggml_context *ctx_weights_;
-  // Optimization: Cache for positional encodings to avoid re-computing sin/cos every inference
+  // Optimization: Cache for positional encodings to avoid re-computing sin/cos
+  // every inference
   std::vector<float> cached_pos_encoding_;
   int max_pos_len_ = 0; // Tracks the current maximum length allocated
 
