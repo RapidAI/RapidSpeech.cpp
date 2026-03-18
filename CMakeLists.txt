@@ -62,6 +62,7 @@ add_subdirectory(${GGML_PATH} ggml)
 # --- Core Source Files ---
 include_directories(include rapidspeech/src)
 
+# Note: LLM-related files are now included for Qwen3 integration
 set(RS_SOURCES
         rapidspeech/src/core/rs_context.cpp
         rapidspeech/src/core/rs_processor.cpp
@@ -71,6 +72,15 @@ set(RS_SOURCES
         rapidspeech/src/arch/sensevoice.cpp
         rapidspeech/src/arch/sensevoice_encoder.cpp
         rapidspeech/src/arch/funasr-nano.cpp
+        rapidspeech/src/arch/llm_types.h
+        rapidspeech/src/arch/llm_model.h
+        rapidspeech/src/arch/llm_model.cpp
+        rapidspeech/src/arch/llm_graph.h
+        rapidspeech/src/arch/llm_graph.cpp
+        rapidspeech/src/arch/llm_kv_cache.h
+        rapidspeech/src/arch/llm_kv_cache.cpp
+        rapidspeech/src/arch/qwen3.h
+        rapidspeech/src/arch/qwen3.cpp
         rapidspeech/src/utils/rs_wav.cpp
 )
 
@@ -79,6 +89,17 @@ set(RS_SOURCES
 add_library(rapidspeech-core SHARED
         ${RS_SOURCES}
         rapidspeech/src/c_api/rapidspeech_c.cpp
+)
+
+# Define RAPIDSPEECH_BUILD for proper symbol export
+target_compile_definitions(rapidspeech-core PRIVATE RAPIDSPEECH_BUILD)
+
+# Set library version
+set_target_properties(rapidspeech-core PROPERTIES
+    VERSION ${PROJECT_VERSION}
+    SOVERSION 1
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
 )
 
 target_link_libraries(rapidspeech-core PRIVATE ggml)
@@ -160,8 +181,18 @@ if (RS_ENABLE_PYTHON)
 endif()
 
 # --- Example Executables ---
-add_executable(rs-asr-offline examples/rs-asr-offline.cpp)
-target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core)
+add_executable(rs-asr-offline
+    examples/rs-asr-offline.cpp
+    rapidspeech/src/utils/rs_wav.cpp
+)
+target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
+target_include_directories(rs-asr-offline PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
+    ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
+    ${GGML_PATH}/include
+    ${GGML_PATH}/src
+)
+
 install(TARGETS rs-asr-offline
         RUNTIME DESTINATION bin
 )
