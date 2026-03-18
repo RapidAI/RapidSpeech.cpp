@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import argparse
-import json
+import os
 import yaml
 import numpy as np
 import torch
@@ -112,7 +112,6 @@ def main():
             writer.add_int32("adaptor.n_layer", adaptor_conf.get("n_layer", 0))
 
 
-
     writer.add_int32("frontend.sample_rate", fconf.get("fs", 16000))
     writer.add_string("frontend.window", fconf.get("window", "hamming"))
     writer.add_int32("frontend.num_mels", fconf.get("n_mels", 80))
@@ -148,49 +147,178 @@ def main():
             writer.add_string("tokenizer.unk_symbol", "<unk>")
 
     elif arch_name == "FunASRNano":
-        config_path = model_dir / "Qwen3-0.6B/config.yaml"
+        config_path = model_dir / "Qwen3-0.6B/config.json"
         vocab_path = model_dir / "multilingual.tiktoken"
         added_tokens = model_dir / "Qwen3-0.6B/tokenizer_config.json"
 
         if vocab_path.exists():
 
-            from funasr.models.sense_voice.whisper_lib.tokenizer import get_tokenizer
+            # CTC token
+            if args.without_llm:
 
-            tokenizer = get_tokenizer(
-                multilingual=True,
-                num_languages=8479,
-                vocab_path=str(vocab_path)
-            )
+                from funasr.models.sense_voice.whisper_lib.tokenizer import get_tokenizer
 
-            tokens = [tokenizer.decode([i]) for i in range(tokenizer.encoding.n_vocab)]
+                tokenizer = get_tokenizer(
+                    multilingual=True,
+                    num_languages=8479,
+                    vocab_path=str(vocab_path)
+                )
 
-            with open(added_tokens, 'r', encoding='utf-8') as f:
-                add_vocab = json.load(f)
+                enc = tokenizer.encoding
 
-            added_tokens_list = list(tokens)
-            writer.add_int32("tokenizer.vocab_size", len(added_tokens_list))
-            writer.add_token_list(added_tokens_list)
+                id_to_token = [""] * enc.n_vocab
+
+                for token_bytes, token_id in enc._mergeable_ranks.items():
+                    # 用 latin-1 做 1:1 映射
+                    id_to_token[token_id] = token_bytes.decode("latin-1")
+
+                # special tokens
+                for token_str, token_id in enc._special_tokens.items():
+                    id_to_token[token_id] = token_str
+
+                # Write BPE merges from tiktoken
+                # tiktoken stores merges in _mergeable_ranks as a dict: {token_bytes: rank}
+                # The merges are implicitly defined by the rank order
+                # We need to reconstruct the merge rules from the ranks
+                # For tiktoken, merges are derived from the BPE training process
+                # The actual merge rules are stored in the vocab file, not as explicit pairs
+                # So we can't directly export merges for tiktoken tokenizers
+                # The C++ code will need to handle tiktoken-style tokenization differently
+
+            else:
+                try:
+                    from transformers import AutoTokenizer
+                except ImportError:
+                    print("ERROR: transformers not installed. Please run: pip install -U transformers")
+                    return
+                tokenizer = AutoTokenizer.from_pretrained(model_dir / "Qwen3-0.6B")
+
+                # Get vocabulary and byte mapping
+                # Qwen3 uses complex byte encoding that can't be derived mathematically
+                # We need to save the exact byte mapping from the tokenizer
+                vocab = tokenizer.get_vocab()
+                id_to_token = [""] * len(vocab)
+                for token_str, token_id in vocab.items():
+                    id_to_token[token_id] = token_str
+                print(f"Loaded {len(id_to_token)} tokens from get_vocab()")
+                
+                # Build byte mapping table for input conversion
+                # Maps each input byte (0x00-0xFF) to its vocab representation
+                byte_map = {}  # byte -> list of bytes in vocab format
+                
+                # First, find all single-byte tokens to determine raw vs mapped
+                single_byte_repr = {}  # orig_byte -> 'raw' or 'mapped'
+                for token, tid in vocab.items():
+                    if len(token) == 1:
+                        cp = ord(token)
+                        if cp < 0x100:
+                            single_byte_repr[cp] = 'raw'
+                        else:
+                            orig = cp - 0x100
+                            single_byte_repr[orig] = 'mapped'
+                
+                # Build byte map
+                for b in range(0x100):
+                    if b in single_byte_repr:
+                        if single_byte_repr[b] == 'raw':
+                            byte_map[b] = [b]
+                        else:
+                            # Mapped to U+0100 + b, which is 0xC4 (0x80 + b) in UTF-8
+                            byte_map[b] = [0xC4, 0x80 + b]
+                    else:
+                        # Not found as single byte - check multi-byte tokens
+                        # For high bytes (0x80-0xFF), they usually appear raw in multi-byte tokens
+                        if b >= 0x80:
+                            byte_map[b] = [b]  # Assume raw
+                        else:
+                            # For 0x00-0x7F not in single_byte_repr, use mapped form
+                            byte_map[b] = [0xC4, 0x80 + b]
+                
+                # Save byte map to GGUF
+                # Format: flat array where byte_map[b] is stored as [len, byte1, byte2, ...]
+                byte_map_flat = []
+                for b in range(0x100):
+                    mapping = byte_map[b]
+                    byte_map_flat.append(len(mapping))
+                    byte_map_flat.extend(mapping)
+                
+                # Pad to ensure each entry is 2 bytes (for alignment)
+                # Actually, let's save as a string array for simplicity
+                byte_map_strs = []
+                for b in range(0x100):
+                    mapping = byte_map[b]
+                    byte_map_strs.append(''.join(chr(c) for c in mapping))
+                
+                writer.add_token_list(byte_map_strs)  # Save as tokenizer.byte_map
+                print(f"Saved byte map with {len(byte_map_strs)} entries")
+
+                # Get merges from backend_tokenizer (tokenizer.json)
+                # Qwen3 uses BPE tokenizer with merges stored in tokenizer.json
+                # The merges are in [left, right] format where left/right are Unicode strings
+                # These strings represent byte sequences using a specific encoding:
+                # - ASCII chars (0-127) are stored as-is
+                # - Bytes (128-255) are mapped to Unicode codepoints (Ġ = U+0120 for space, etc.)
+                merges_written = False
+                if hasattr(tokenizer, 'backend_tokenizer'):
+                    import json
+                    backend = tokenizer.backend_tokenizer
+                    if hasattr(backend, 'to_str'):
+                        tokenizer_str = backend.to_str()
+                        tokenizer_json = json.loads(tokenizer_str)
+
+                        if 'model' in tokenizer_json and 'merges' in tokenizer_json['model']:
+                            merges = tokenizer_json['model']['merges']
+                            print(f"Found {len(merges)} merges in tokenizer.json")
+
+                            # Convert merges to GGUF format
+                            # The token strings in tokenizer.json are already in the correct format
+                            # for comparison with UTF-8 encoded text
+                            gguf_merges = []
+                            for merge in merges:
+                                if isinstance(merge, (list, tuple)) and len(merge) == 2:
+                                    left, right = merge
+                                    # Store as "left right" format
+                                    gguf_merges.append(f"{left} {right}")
+                                elif isinstance(merge, str):
+                                    gguf_merges.append(merge)
+
+                            if gguf_merges:
+                                writer.add_token_merges(gguf_merges)
+                                print(f"Wrote {len(gguf_merges)} merges to GGUF")
+                                merges_written = True
+
+                if not merges_written:
+                    print("WARNING: No BPE merges found or written!")
+
+                # writer.add_string("tokenizer.chat_template", "")
+
+            # added_tokens_list = list(tokens)
+            writer.add_int32("tokenizer.vocab_size", len(id_to_token))
+            writer.add_token_list(id_to_token)
             writer.add_string("tokenizer.unk_symbol", "<unk>")
-            writer.add_string("tokenizer.chat_template", add_vocab.get("chat_template", ""))
+
+
 
         if config_path.exists() and not args.without_llm:
             with open(config_path, "r") as f:
-                hparams = yaml.safe_load(f)
+                hparams = json.load(f)
             model_type = hparams.get("model_type", "qwen3")
             writer.add_bool(f"{model_type}.attention_bias", hparams.get("attention_bias", False))
             writer.add_int32(f"{model_type}.bos_token_id", hparams.get("bos_token_id"))
             writer.add_int32(f"{model_type}.eos_token_id", hparams.get("eos_token_id"))
-            writer.add_int32(f"{model_type}.head_dim", hparams.get("head_dim"))
+            writer.add_int32(f"{model_type}.attention.key_length", hparams.get("head_dim"))
+            writer.add_int32(f"{model_type}.attention.value_length", hparams.get("head_dim"))
             writer.add_string(f"{model_type}.hidden_act", hparams.get("hidden_act"))
-            writer.add_int32(f"{model_type}.hidden_size", hparams.get("hidden_size"))
+            writer.add_int32(f"{model_type}.embedding_length", hparams.get("hidden_size"))
             writer.add_float32(f"{model_type}.initializer_range", hparams.get("initializer_range"))
-            writer.add_int32(f"{model_type}.intermediate_size", hparams.get("intermediate_size"))
-            writer.add_int32(f"{model_type}.max_position_embeddings", hparams.get("max_position_embeddings", 2048))
+            writer.add_int32(f"{model_type}.feed_forward_length", hparams.get("intermediate_size"))
+            writer.add_int32(f"{model_type}.context_length", hparams.get("max_position_embeddings", 2048))
             writer.add_int32(f"{model_type}.max_window_layers", hparams.get("max_window_layers"))
-            writer.add_int32(f"{model_type}.num_attention_heads", hparams.get("num_attention_heads"))
-            writer.add_int32(f"{model_type}.num_hidden_layers", hparams.get("num_hidden_layers"))
-            writer.add_int32(f"{model_type}.num_key_value_heads", hparams.get("num_key_value_heads"))
-            writer.add_float32(f"{model_type}.rms_norm_eps", hparams.get("rms_norm_eps", 1e-6))
+            writer.add_int32(f"{model_type}.attention.head_count", hparams.get("num_attention_heads"))
+            writer.add_int32(f"{model_type}.block_count", hparams.get("num_hidden_layers"))
+            writer.add_int32(f"{model_type}.attention.head_count_kv", hparams.get("num_key_value_heads"))
+            writer.add_float32(f"{model_type}.attention.layer_norm_rms_epsilon", hparams.get("rms_norm_eps", 1e-6))
+            writer.add_int32(f"{model_type}.rope.freq_base", hparams.get("rope_theta", 10000))
 
 
 
@@ -213,4 +341,15 @@ def main():
     print(f"Successfully exported to {args.output}")
 
 if __name__ == "__main__":
+    if os.getenv("debug", None):
+        try:
+            import debugpy
+
+            debugpy.listen(("localhost", 13158))
+            print("waitting for vscode client")
+            debugpy.wait_for_client()
+            print("vscode client connected")
+        except ImportError:
+            print("pip install debugpy")
+            exit(1)
     main()

@@ -2,6 +2,10 @@
 
 #include "core/rs_context.h"
 #include "core/rs_model.h"
+#include "llm_graph.h"
+#include "llm_kv_cache.h"
+#include "llm_model.h"
+#include "qwen3.h"
 #include "sensevoice_encoder.h"
 #include <map>
 #include <string>
@@ -10,6 +14,7 @@
 
 struct SenseVoiceLayerEncoder;
 struct SenseVoiceEncoder;
+
 /**
  * FunASRNano hyperparameters structure
  */
@@ -23,15 +28,24 @@ struct FunASRNanoHParams {
   int32_t n_mels = 80;
   int32_t feats_dim = 560;
   int32_t n_ctc_layers = 5;
+  int32_t n_adaptor_layers = 2;
   int32_t ctc_downsample_rate = 1;
   int32_t ctc_encoder_dim = 512;
   int32_t ctc_llm_dim = 512;
   int32_t ctc_ffn_dim = 2048;
   int32_t ctc_attention_heads = 8;
 
+  // Qwen3 LLM parameters (optional)
+  bool use_llm = true;
+  int32_t n_llm_layer = 28;
+  int32_t n_llm_embd = 1024;
+  int32_t n_llm_head = 16;
+  int32_t head_dim = 128;
+  int32_t n_llm_vocab = 151936;
+  float f_llm_rope_freq_base = 10000.0f;
+
   int32_t fsmn_kernel_size = 11;
   float eps = 1e-5f;
-  bool use_llm = true;
 };
 
 /**
@@ -84,7 +98,14 @@ private:
   FunASRNanoHParams hparams_;
   FunASRNanoVocab vocab_;
   std::unique_ptr<SenseVoiceEncoderModel> encoder_;
-  std::unique_ptr<FunASRNanoTransformerDecoder> decoder_;
+  std::unique_ptr<FunASRNanoTransformerDecoder> ctc_decoder_;
+  std::unique_ptr<FunASRNanoTransformerDecoder> audio_adaptor_;
+
+  // Qwen3 LLM components (optional)
+  llm_model_ptr llm_model_;
+  std::unique_ptr<llm_kv_cache> llm_kv_cache_;
+  std::unique_ptr<llm_build_qwen3> llm_graph_builder_;
+
   struct ggml_context *ctx_weights_;
   std::vector<int32_t> raw_ids;
   std::vector<float> host_log_probs;
@@ -94,6 +115,9 @@ private:
   bool SetLayerWeights(std::vector<SenseVoiceLayerEncoder> &layers,
                        std::map<std::string, struct ggml_tensor *> &tensors,
                        int n_layers, const std::string &prefix);
+  bool LoadLLM(struct gguf_context *ctx_gguf,
+               std::map<std::string, struct ggml_tensor *> &tensors,
+               ggml_backend_t backend);
   bool DecodeWithLLM(RSState &state, ggml_backend_sched_t sched);
   bool DecodeWithoutLLM(RSState &state, ggml_backend_sched_t sched);
 };
