@@ -36,7 +36,7 @@ struct FunASRNanoHParams {
   int32_t ctc_attention_heads = 8;
 
   // Qwen3 LLM parameters (optional)
-  bool use_llm = true;
+  bool use_llm = false;
   int32_t n_llm_layer = 28;
   int32_t n_llm_embd = 1024;
   int32_t n_llm_head = 16;

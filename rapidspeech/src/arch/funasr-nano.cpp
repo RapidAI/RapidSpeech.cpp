@@ -93,15 +93,20 @@ bool FunASRNanoModel::Load(const std::unique_ptr<rs_context_t> &ctx,
   hparams_.n_mels =
       gguf_get_val_i32(ctx_gguf, gguf_find_key(ctx_gguf, "frontend.num_mels"));
 
-  // Check if LLM is enabled
-  int use_llm_idx = gguf_find_key(ctx_gguf, "llm.use");
-  if (use_llm_idx != -1) {
-    hparams_.use_llm = gguf_get_val_i32(ctx_gguf, use_llm_idx) != 0;
+  // Check if LLM is enabled - check for qwen3.block_count as indicator
+  int qwen3_block_count_idx = gguf_find_key(ctx_gguf, "qwen3.block_count");
+  if (qwen3_block_count_idx != -1) {
+    hparams_.use_llm = true;
+  }
+
+  // Load adaptor layers if available
+  int adaptor_n_layer_idx = gguf_find_key(ctx_gguf, "adaptor.n_layer");
+  if (adaptor_n_layer_idx != -1) {
+    hparams_.n_adaptor_layers = gguf_get_val_i32(ctx_gguf, adaptor_n_layer_idx);
   }
 
   if (hparams_.use_llm) {
-    hparams_.n_llm_layer = gguf_get_val_i32(
-        ctx_gguf, gguf_find_key(ctx_gguf, "qwen3.block_count"));
+    hparams_.n_llm_layer = gguf_get_val_i32(ctx_gguf, qwen3_block_count_idx);
     hparams_.n_llm_embd = gguf_get_val_i32(
         ctx_gguf, gguf_find_key(ctx_gguf, "qwen3.embedding_length"));
     hparams_.n_llm_head = gguf_get_val_i32(
@@ -581,8 +586,8 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   llm_build_opts opts;
   opts.output_mode = llm_output_mode::OUTPUT_LOGITS;
   opts.skip_embeddings = true;
-  opts.use_kv_cache = true;
-  opts.causal_mask = false;
+  opts.use_kv_cache = false;  // 禁用KV cache
+  opts.causal_mask = false;     // 对于ASR，可以看到所有位置
 
   auto result = llm_graph_builder_->build_graph_from_embeds(
       llm_input, total_T, llm_kv_cache_.get(), positions.data(), &opts);
@@ -626,7 +631,12 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
     return false;
   }
 
-  const int n_vocab = llm_model_->hparams().n_vocab;
+  // Logits tensor shape: [n_vocab, n_tokens] in ggml (column-major)
+  const int n_vocab = (int)logits->ne[0];  // Use actual size from tensor
+  printf("DEBUG: Logits shape: ne[0]=%d, ne[1]=%d, ne[2]=%d, ne[3]=%d\n",
+         (int)logits->ne[0], (int)logits->ne[1], (int)logits->ne[2], (int)logits->ne[3]);
+  printf("DEBUG: n_vocab=%d, total_T=%d\n", n_vocab, total_T);
+
   std::vector<float> logits_host(n_vocab * total_T);
   ggml_backend_tensor_get(logits, logits_host.data(), 0,
                           logits_host.size() * sizeof(float));
@@ -637,13 +647,14 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   token_ids.reserve(audio_T);
 
   for (int t = audio_insert_idx; t < total_T; ++t) {
-    const float *logits_t = logits_host.data() + t * n_vocab;
+    // GGML uses column-major format: logits[v, t] = logits_host[v + t * n_vocab]
     int32_t best_token = 0;
-    float best_prob = logits_t[0];
+    float best_prob = logits_host[0 + t * n_vocab];
 
     for (int v = 1; v < n_vocab; ++v) {
-      if (logits_t[v] > best_prob) {
-        best_prob = logits_t[v];
+      float logit = logits_host[v + t * n_vocab];
+      if (logit > best_prob) {
+        best_prob = logit;
         best_token = v;
       }
     }
