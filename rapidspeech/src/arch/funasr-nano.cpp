@@ -582,7 +582,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   opts.output_mode = llm_output_mode::OUTPUT_LOGITS;
   opts.skip_embeddings = true;
   opts.use_kv_cache = true;
-  opts.causal_mask = true;
+  opts.causal_mask = false;
 
   auto result = llm_graph_builder_->build_graph_from_embeds(
       llm_input, total_T, llm_kv_cache_.get(), positions.data(), &opts);

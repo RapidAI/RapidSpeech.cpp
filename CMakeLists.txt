@@ -72,7 +72,6 @@ set(RS_SOURCES
         rapidspeech/src/arch/sensevoice.cpp
         rapidspeech/src/arch/sensevoice_encoder.cpp
         rapidspeech/src/arch/funasr-nano.cpp
-        rapidspeech/src/arch/llm_types.h
         rapidspeech/src/arch/llm_model.h
         rapidspeech/src/arch/llm_model.cpp
         rapidspeech/src/arch/llm_graph.h

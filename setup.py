@@ -54,6 +54,16 @@ def get_binaries():
 
     return binaries
 
+def get_package_name():
+    backend = os.environ.get("RS_BACKEND", "cpu").lower()
+    if backend == "cuda":
+        return "rapidspeech-cuda"
+    elif backend == "metal":
+        return "rapidspeech-metal"
+    else:
+        return "rapidspeech"
+
+package_name = get_package_name()
 
 def cmake_extension(name, *args, **kwargs) -> setuptools.Extension:
     kwargs["language"] = "c++"
@@ -62,6 +72,7 @@ def cmake_extension(name, *args, **kwargs) -> setuptools.Extension:
 
 class BuildExtension(build_ext):
     def build_extension(self, ext: setuptools.extension.Extension):
+
         # build/temp.linux-x86_64-3.8
         os.makedirs(self.build_temp, exist_ok=True)
 
@@ -74,8 +85,15 @@ class BuildExtension(build_ext):
         rapidspeech_dir = Path(__file__).parent.resolve()
 
         cmake_args = os.environ.get("RAPIDSPEECH_CMAKE_ARGS", "")
+
+        backend = os.environ.get("RS_BACKEND", "cpu").lower()
+        if backend == "cuda":
+            cmake_args += " -DRS_USE_CUDA=ON"
+
         make_args = os.environ.get("RAPIDSPEECH_MAKE_ARGS", "")
         system_make_args = os.environ.get("MAKEFLAGS", "")
+
+
 
         if cmake_args == "":
             cmake_args = "-DCMAKE_BUILD_TYPE=Release"
@@ -208,9 +226,6 @@ try:
 except ImportError:
     bdist_wheel = None
 
-package_name = "rapidspeech"
-
-
 def get_binaries_to_install():
     if need_split_package():
         return None
@@ -234,7 +249,11 @@ def get_binaries_to_install():
 setuptools.setup(
     name=package_name,
     python_requires=">=3.7",
-    version="v1.0",
+    use_scm_version={
+        "root": ".",
+        "relative_to": __file__,
+    },
+    setup_requires=["setuptools_scm"],
     author="lovemefan",
     author_email="lovemefan@outlook.com",
     packages=["rapidspeech"],
