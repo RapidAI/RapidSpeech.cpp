@@ -70,14 +70,20 @@ static void ggml_print_tensor(uint8_t *data, ggml_type type, const int64_t *ne,
 static void print_tensor(struct ggml_tensor *t) {
   const struct ggml_tensor *src0 = t->src[0];
   const struct ggml_tensor *src1 = t->src[1];
+  const struct ggml_tensor *src2 = t->src[2];
   char src1_str[128] = {0};
+  char src2_str[128] = {0};
   if (src1) {
     snprintf(src1_str, sizeof(src1_str), "%s{%s}", src1->name,
              ggml_ne_string(src1).c_str());
   }
-  printf("%s: %24s = (%s) %10s(%s{%s}, %s}) \n", __func__, t->name,
+  if (src2) {
+    snprintf(src2_str, sizeof(src2_str), "%s{%s}", src2->name,
+             ggml_ne_string(src2).c_str());
+  }
+  printf("%s: %24s = (%s) %10s(%s,{%s},{%s}, %s}) \n", __func__, t->name,
          ggml_type_name(t->type), ggml_op_desc(t),
-         src0 ? ggml_ne_string(src0).c_str() : "", src1 ? src1_str : "",
+         src0 ? ggml_ne_string(src0).c_str() : "", src1 ? src1_str : "", src2 ? src2_str : "",
          ggml_ne_string(t).c_str());
 
   ggml_print_tensor((uint8_t *)t->data, t->type, t->ne, t->nb, 8);
@@ -89,20 +95,27 @@ static bool ggml_debug(struct ggml_tensor *t, bool ask, void *user_data) {
 
   const struct ggml_tensor *src0 = t->src[0];
   const struct ggml_tensor *src1 = t->src[1];
+  const struct ggml_tensor *src2 = t->src[2];
+
 
   if (ask) {
     return true; // Always retrieve data
   }
 
   char src1_str[128] = {0};
+  char src2_str[128] = {0};
   if (src1) {
     snprintf(src1_str, sizeof(src1_str), "%s{%s}", src1->name,
              ggml_ne_string(src1).c_str());
   }
+  if (src2) {
+    snprintf(src2_str, sizeof(src2_str), "%s{%s}", src2->name,
+             ggml_ne_string(src2).c_str());
+  }
 
-  printf("%s: %24s = (%s) %10s(%s{%s}, %s}) = {%s}\n", __func__, t->name,
+  printf("%s: %24s = (%s) %10s(%s{%s} %s %s}) = {%s}\n", __func__, t->name,
          ggml_type_name(t->type), ggml_op_desc(t), src0->name,
-         ggml_ne_string(src0).c_str(), src1 ? src1_str : "",
+         ggml_ne_string(src0).c_str(), src1 ? src1_str : "", src2 ? src2_str : "",
          ggml_ne_string(t).c_str());
 
   // copy the data from the GPU memory if needed
