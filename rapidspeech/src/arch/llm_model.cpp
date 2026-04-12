@@ -624,11 +624,10 @@ bool llm_model::load_hparams(struct gguf_context *ctx_gguf) {
   hparams_.n_layer = get_i32("%s.block_count", 0);
   hparams_.n_head = get_i32("%s.attention.head_count", 0);
   hparams_.n_head_kv = get_i32("%s.attention.head_count_kv", hparams_.n_head);
-  hparams_.n_rot =
-      get_i32("%s.rope.dimension_count", hparams_.n_embd / hparams_.n_head);
   hparams_.n_ff = get_i32("%s.feed_forward_length", 0);
   hparams_.n_ctx_train = get_i32("%s.context_length", 4096);
   hparams_.head_dim = get_i32("%s.attention.key_length", 1024);
+  hparams_.n_rot = get_i32("%s.rope.dimension_count", hparams_.head_dim);
   hparams_.f_norm_eps = get_f32("%s.attention.layer_norm_epsilon", 1e-5f);
   hparams_.f_norm_rms_eps =
       get_f32("%s.attention.layer_norm_rms_epsilon", hparams_.f_norm_eps);

@@ -46,7 +46,7 @@ struct llm_hparams {
   // Attention
   float f_attn_logit_softcapping = 0.0f;
   bool causal_attn = true;
-  bool use_kq_norm = false;
+  bool use_kq_norm = true;
 
   // Expert/MoE (optional)
   uint32_t n_expert = 0;
@@ -440,7 +440,7 @@ protected:
   std::pair<ggml_tensor *, ggml_tensor *>
   build_kv_cache_lookup(ggml_context *ctx, ggml_tensor *k_cur,
                         ggml_tensor *v_cur, llm_kv_cache *kv_cache,
-                        const llm_pos *pos, uint32_t n_tokens, int32_t il);
+                        uint32_t n_tokens, int32_t il);
 
   /**
    * Build multi-head attention

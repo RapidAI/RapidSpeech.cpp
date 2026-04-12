@@ -64,10 +64,14 @@ private:
                                      uint32_t n_tokens);
   ggml_tensor *build_transformer_layer(ggml_context *ctx, ggml_tensor *cur,
                                        int32_t il, llm_kv_cache *kv_cache,
-                                       const llm_pos *pos, uint32_t n_tokens);
+                                       ggml_tensor *positions,
+                                       ggml_tensor *causal_mask,
+                                       uint32_t n_tokens);
   ggml_tensor *build_attention_layer(ggml_context *ctx, ggml_tensor *cur,
                                      int32_t il, llm_kv_cache *kv_cache,
-                                     const llm_pos *pos, uint32_t n_tokens);
+                                     ggml_tensor *positions,
+                                     ggml_tensor *causal_mask,
+                                     uint32_t n_tokens);
   ggml_tensor *build_ffn_layer(ggml_context *ctx, ggml_tensor *cur, int32_t il);
 
   // Position management

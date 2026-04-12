@@ -93,8 +93,18 @@ llm_graph_result_ptr llm_build_qwen3::build_graph(const int32_t *tokens,
                                    ? static_cast<int32_t>(hparams.n_layer)
                                    : current_opts_.n_layers_end;
 
+  // Build position tensor once for all layers
+  ggml_tensor *positions = build_position_tensor(ctx_, pos, n_tokens);
+
+  // Build causal mask once for all layers
+  ggml_tensor *causal_mask = nullptr;
+  if (current_opts_.causal_mask) {
+    const uint32_t n_kv_cache = kv_cache ? kv_cache->size() : 0;
+    causal_mask = build_causal_mask_tensor(ctx_, n_tokens, n_kv_cache);
+  }
+
   for (int32_t il = n_layers_start; il < n_layers_end; ++il) {
-    cur = build_transformer_layer(ctx_, cur, il, kv_cache, pos, n_tokens);
+    cur = build_transformer_layer(ctx_, cur, il, kv_cache, positions, causal_mask, n_tokens);
     if (should_extract_layer(il)) {
       result->add_intermediate_output(cur);
     }
@@ -159,8 +169,18 @@ llm_graph_result_ptr llm_build_qwen3::build_graph_from_embeds(
                                    ? static_cast<int32_t>(hparams.n_layer)
                                    : current_opts_.n_layers_end;
 
+  // Build position tensor once for all layers
+  ggml_tensor *positions = build_position_tensor(ctx_, pos, n_tokens);
+
+  // Build causal mask once for all layers
+  ggml_tensor *causal_mask = nullptr;
+  if (current_opts_.causal_mask) {
+    const uint32_t n_kv_cache = kv_cache ? kv_cache->size() : 0;
+    causal_mask = build_causal_mask_tensor(ctx_, n_tokens, n_kv_cache);
+  }
+
   for (int32_t il = n_layers_start; il < n_layers_end; ++il) {
-    cur = build_transformer_layer(ctx_, cur, il, kv_cache, pos, n_tokens);
+    cur = build_transformer_layer(ctx_, cur, il, kv_cache, positions, causal_mask, n_tokens);
     if (should_extract_layer(il)) {
       result->add_intermediate_output(cur);
     }
@@ -217,14 +237,14 @@ ggml_tensor *llm_build_qwen3::build_embedding_layer(ggml_context *ctx,
 
 ggml_tensor *llm_build_qwen3::build_transformer_layer(
     ggml_context *ctx, ggml_tensor *cur, int32_t il, llm_kv_cache *kv_cache,
-    const llm_pos *pos, uint32_t n_tokens) {
+    ggml_tensor *positions, ggml_tensor *causal_mask, uint32_t n_tokens) {
   const auto &layer = model_.layer(il);
   const auto &hparams = model_.hparams();
 
   ggml_tensor *residual = cur;
   cur = build_norm(ctx, cur, layer.attn_norm, nullptr, llm_norm_type::RMS_NORM,
                    hparams.f_norm_rms_eps);
-  cur = build_attention_layer(ctx, cur, il, kv_cache, pos, n_tokens);
+  cur = build_attention_layer(ctx, cur, il, kv_cache, positions, causal_mask, n_tokens);
   cur = build_residual(ctx, cur, residual);
 
   residual = cur;
@@ -239,11 +259,12 @@ ggml_tensor *llm_build_qwen3::build_transformer_layer(
 ggml_tensor *
 llm_build_qwen3::build_attention_layer(ggml_context *ctx, ggml_tensor *cur,
                                        int32_t il, llm_kv_cache *kv_cache,
-                                       const llm_pos *pos, uint32_t n_tokens) {
+                                       ggml_tensor *positions,
+                                       ggml_tensor *causal_mask,
+                                       uint32_t n_tokens) {
   const auto &layer = model_.layer(il);
   const auto &hparams = model_.hparams();
 
-  const int32_t n_embd = hparams.n_embd;
   const int32_t n_head = hparams.n_head;
   const int32_t n_head_kv = hparams.n_head_kv;
   const int32_t n_embd_head = hparams.head_dim;
@@ -264,25 +285,18 @@ llm_build_qwen3::build_attention_layer(ggml_context *ctx, ggml_tensor *cur,
     k = ggml_mul(ctx, k, layer.attn_k_norm);
   }
 
-  ggml_tensor *positions = build_position_tensor(ctx, pos, n_tokens);
-  q = build_rope_embeds(ctx, q, positions, n_rot, n_head);
-  k = build_rope_embeds(ctx, k, positions, n_rot, n_head);
+  q = build_rope_embeds(ctx, q, positions, n_rot, n_head, GGML_ROPE_TYPE_NEOX);
+  k = build_rope_embeds(ctx, k, positions, n_rot, n_head, GGML_ROPE_TYPE_NEOX);
 
   auto [k_final, v_final] =
-      build_kv_cache_lookup(ctx, k, v, kv_cache, pos, n_tokens, il);
+      build_kv_cache_lookup(ctx, k, v, kv_cache, n_tokens, il);
 
   const float scale = 1.0f / sqrtf(static_cast<float>(n_embd_head));
-  ggml_tensor *kq_mask = nullptr;
-
-  if (current_opts_.causal_mask) {
-    const uint32_t n_kv_cache = kv_cache ? kv_cache->size() : 0;
-    kq_mask = build_causal_mask_tensor(ctx, n_tokens, n_kv_cache);
-  }
 
   if (current_opts_.use_flash_attn) {
-    cur = build_flash_attn(ctx, q, k_final, v_final, kq_mask, scale);
+    cur = build_flash_attn(ctx, q, k_final, v_final, causal_mask, scale);
   } else {
-    cur = build_multi_head_attn(ctx, q, k_final, v_final, kq_mask, scale,
+    cur = build_multi_head_attn(ctx, q, k_final, v_final, causal_mask, scale,
                                 n_head, n_head_kv);
   }
 

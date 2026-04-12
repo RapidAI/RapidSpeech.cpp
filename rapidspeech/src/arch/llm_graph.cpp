@@ -105,16 +105,7 @@ ggml_tensor *llm_graph_result::get_input_tensor(const char *name) const {
   if (!gf_ || !name) {
     return nullptr;
   }
-
-  // Use ggml API to access graph nodes
-  int n_nodes = ggml_graph_n_nodes(gf_);
-  for (int i = 0; i < n_nodes; ++i) {
-    ggml_tensor *node = ggml_graph_node(gf_, i);
-    if (node && node->name[0] != '\0' && strcmp(node->name, name) == 0) {
-      return node;
-    }
-  }
-  return nullptr;
+  return ggml_get_tensor(ctx_, name);
 }
 
 void llm_graph_result::set_input_tokens(ggml_tensor *inp_tokens,
@@ -302,8 +293,7 @@ std::pair<ggml_tensor *, ggml_tensor *>
 llm_graph_builder::build_kv_cache_lookup(ggml_context *ctx, ggml_tensor *k_cur,
                                          ggml_tensor *v_cur,
                                          llm_kv_cache *kv_cache,
-                                         const llm_pos *pos, uint32_t n_tokens,
-                                         int32_t il) {
+                                         uint32_t n_tokens, int32_t il) {
   if (!kv_cache || !current_opts_.use_kv_cache) {
     return {k_cur, v_cur};
   }
@@ -318,7 +308,6 @@ llm_graph_builder::build_kv_cache_lookup(ggml_context *ctx, ggml_tensor *k_cur,
   // 3. Use kv_cache->get_k/get_v to retrieve cached K/V
   // 4. Call kv_cache->commit() after graph execution
 
-  (void)pos; // Position tracking for cache
   (void)n_tokens;
   (void)il;
 
@@ -326,88 +315,57 @@ llm_graph_builder::build_kv_cache_lookup(ggml_context *ctx, ggml_tensor *k_cur,
 }
 
 ggml_tensor *llm_graph_builder::build_multi_head_attn(
-    ggml_context *ctx, ggml_tensor *q, ggml_tensor *k, ggml_tensor *v,
-    ggml_tensor *mask, float scale, int32_t n_head, int32_t n_head_kv) {
-  if (n_head_kv == 0) {
-    n_head_kv = n_head;
-  }
+    ggml_context *ctx,
+    ggml_tensor *q,     // [d_k, n_head, n_tokens]
+    ggml_tensor *k,     // [d_k, n_head_kv, n_tokens_kv]
+    ggml_tensor *v,     // [d_k, n_head_kv, n_tokens_kv]
+    ggml_tensor *mask,
+    float scale,
+    int32_t n_head,
+    int32_t n_head_kv) {
 
-  const int32_t d_k = q->ne[0]; // Head dimension
-  const int32_t n_tokens = q->ne[2];
+    const int32_t d_k = q->ne[0];
+    const int32_t n_tokens = q->ne[2];
+    const int32_t n_tokens_kv = k->ne[2];
 
-  // Handle GQA (Grouped Query Attention)
-  // Repeat K/V if n_head_kv < n_head
-  ggml_tensor *k_repeated = k;
-  ggml_tensor *v_repeated = v;
-
-  if (n_head_kv < n_head) {
-    const int32_t n_rep = n_head / n_head_kv;
-
-    // Reshape and repeat K/V for GQA
-    // K/V shape: [d_k, n_head_kv, n_tokens]
-    // Need to repeat to: [d_k, n_head, n_tokens]
-    if (n_rep > 1) {
-      // Use ggml_repeat to expand K/V along the head dimension
-      // k_target shape: [d_k, n_head, n_tokens]
-      ggml_tensor *k_target =
-          ggml_new_tensor_3d(ctx, k->type, d_k, n_head, n_tokens);
-      ggml_tensor *v_target =
-          ggml_new_tensor_3d(ctx, v->type, d_k, n_head, n_tokens);
-
-      // ggml_repeat: repeat k to k_target's shape
-      // k: [d_k, n_head_kv, n_tokens] -> k_repeated: [d_k, n_head, n_tokens]
-      k_repeated = ggml_repeat(ctx, k, k_target);
-      v_repeated = ggml_repeat(ctx, v, v_target);
+    // 1. Handle GQA: Repeat K and V to match Q's head count (e.g., 8 -> 16)
+    ggml_tensor * k_repeated = k;
+    ggml_tensor * v_repeated = v;
+    if (n_head != n_head_kv) {
+        k_repeated = ggml_repeat(ctx, k, ggml_new_tensor_3d(ctx, k->type, d_k, n_head, n_tokens_kv));
+        v_repeated = ggml_repeat(ctx, v, ggml_new_tensor_3d(ctx, v->type, d_k, n_head, n_tokens_kv));
     }
-  }
 
-  // Q * K^T with proper dimension handling
-  // Input q/k shape: [d_k, n_head, n_tokens]
-  // Need to permute to: [d_k, n_tokens, n_head, 1] for proper matrix
-  // multiplication This allows ggml_mul_mat to compute attention for each head
-  // separately
+    // 2. Permute for Attention calculation [d_k, n_tokens, n_head]
+    ggml_tensor * q_perm = ggml_permute(ctx, q,          0, 2, 1, 3);
+    ggml_tensor * k_perm = ggml_permute(ctx, k_repeated, 0, 2, 1, 3);
+    ggml_tensor * v_perm = ggml_permute(ctx, v_repeated, 0, 2, 1, 3);
 
-  // Permute q: [d_k, n_head, n_tokens] -> [d_k, n_tokens, n_head, 1]
-  ggml_tensor *q_perm = ggml_permute(ctx, q, 0, 2, 1, 3);
+    // 3. QK^T: Result kq shape [n_tokens_kv, n_tokens, n_head]
+    // A=k_perm (ne0=d_k), B=q_perm (ne0=d_k). ne0 match!
+    ggml_tensor * kq = ggml_mul_mat(ctx, k_perm, q_perm);
 
-  // Permute k: [d_k, n_head, n_tokens] -> [d_k, n_tokens, n_head, 1]
-  ggml_tensor *k_perm = ggml_permute(ctx, k_repeated, 0, 2, 1, 3);
+    kq = ggml_scale_inplace(ctx, kq, scale);
+    if (mask) {
+        kq = ggml_add_inplace(ctx, kq, mask);
+    }
+    ggml_tensor * probs = ggml_soft_max_inplace(ctx, kq);
 
-  // Permute v: [d_k, n_head, n_tokens] -> [d_k, n_tokens, n_head, 1]
-  ggml_tensor *v_perm = ggml_permute(ctx, v_repeated, 0, 2, 1, 3);
+    // 4. Important: Transpose V to align for (Probs * V)
+    // v_perm is [d_k, n_kv, n_head] -> [128, 52, 16]
+    // v_tr is [n_kv, d_k, n_head]   -> [52, 128, 16]
+    ggml_tensor * v_tr = ggml_cont(ctx, ggml_transpose(ctx, v_perm));
 
-  // Q * K^T: ggml_mul_mat computes K^T * Q
-  // k_perm: [d_k, n_tokens, n_head, 1]
-  // q_perm: [d_k, n_tokens, n_head, 1]
-  // Result kq: [n_tokens, n_tokens, n_head, 1] - attention scores per head
-  ggml_tensor *kq = ggml_mul_mat(ctx, k_perm, q_perm);
+    // 5. Final Matrix Multiply: Softmax * V
+    // ggml_mul_mat(A, B) calculates B * A^T
+    // A = v_tr (ne0=52, ne1=128, ne2=16)
+    // B = probs (ne0=52, ne1=52, ne2=16)
+    // ne0(A) == ne0(B) (52 == 52) -> Match!
+    // Result kqv shape: [ne1(A), ne1(B), ne2] -> [128, 52, 16]
+    ggml_tensor * kqv = ggml_mul_mat(ctx, v_tr, probs);
 
-  // Scale
-  kq = ggml_scale_inplace(ctx, kq, scale);
-
-  // Mask (optional)
-  // mask shape: [n_tokens, n_kv] broadcasts to [n_tokens, n_kv, n_head, 1]
-  if (mask) {
-    kq = ggml_add(ctx, kq, mask);
-  }
-
-  // Softmax
-  ggml_tensor *probs = ggml_soft_max_inplace(ctx, kq);
-
-  // V^T * probs
-  // v_perm: [d_k, n_tokens, n_head, 1]
-  // Need to transpose v for multiplication: [n_tokens, d_k, n_head, 1]
-  ggml_tensor *v_transposed = ggml_cont(ctx, ggml_transpose(ctx, v_perm));
-
-  // kqv: [n_tokens, d_k, n_head, 1]
-  ggml_tensor *kqv = ggml_mul_mat(ctx, v_transposed, probs);
-
-  // Transpose back to [d_k, n_head, n_tokens, 1]
-  // kqv: [n_tokens, d_k, n_head, 1] -> permute(1, 2, 0, 3) -> [d_k, n_head,
-  // n_tokens, 1]
-  kqv = ggml_cont(ctx, ggml_permute(ctx, kqv, 1, 2, 0, 3));
-
-  return kqv;
+    // 6. Return to original layout [d_k, n_head, n_tokens]
+    return ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3));
 }
 
 ggml_tensor *llm_graph_builder::build_flash_attn(ggml_context *ctx,

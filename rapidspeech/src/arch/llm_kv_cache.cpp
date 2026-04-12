@@ -15,6 +15,7 @@
 
 llm_kv_cache::llm_kv_cache(const config &cfg, uint32_t n_embd_k_gqa,
                            uint32_t n_embd_v_gqa, uint32_t n_head_kv,
+                           uint32_t n_layers,
                            ggml_backend_t backend)
     : config_(cfg), backend_(backend) {
 
@@ -23,9 +24,7 @@ llm_kv_cache::llm_kv_cache(const config &cfg, uint32_t n_embd_k_gqa,
   cell_positions_.resize(config_.n_ctx, 0);
 
   // Allocate KV tensors per layer
-  // For now, we allocate a single layer; actual models will have multiple
-  // layers
-  layers_.resize(1); // Will be expanded based on model
+  layers_.resize(n_layers);
 
   for (auto &layer : layers_) {
     // Create context for KV tensors

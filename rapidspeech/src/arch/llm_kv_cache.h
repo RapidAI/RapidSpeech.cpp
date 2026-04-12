@@ -59,6 +59,7 @@ public:
                uint32_t n_embd_k_gqa, // K dimension per head * n_head_kv
                uint32_t n_embd_v_gqa, // V dimension per head * n_head_kv
                uint32_t n_head_kv,    // Number of KV heads
+               uint32_t n_layers,      // Number of model layers
                ggml_backend_t backend // Backend for allocation
   );
 
