@@ -24,7 +24,7 @@ struct FunASRNanoState : public RSState {
   std::vector<int32_t> ids;
   std::vector<std::string> tokens;
   std::string user_input =
-      "语音转写"; // User input prompt, default is "语音转写"
+      "语音转写："; // User input prompt, default is "语音转写"
   int language_id = 0;
 
   FunASRNanoState() {
@@ -429,18 +429,8 @@ decoder_forward(const FunASRNanoHParams &hparams, struct ggml_context *ctx,
 /**
  * Project encoder output to LLM embedding space and decode with Qwen3
  *
- * Chat format prompt:
- *   [{"role": "system", "content": "You are a helpful assistant."},
- *    {"role": "user", "content":
- * "{user_input}<|startofspeech|>!<|endofspeech|>"},
- *    {"role": "assistant", "content": ""}]
- *
- * Flow:
- * 1. Build and tokenize chat format prompt
- * 2. Find <|startofspeech|> and <|endofspeech|> positions
- * 3. Embed text tokens and project audio encoder output to LLM embedding space
- * 4. Insert audio_embeds at <|startofspeech|> to <|endofspeech|> range
- * 5. Feed combined embeddings to Qwen3 for decoding
+ * Simplified version: Use the last position from prefill to decode
+ * (Full autoregressive with KV cache requires more complex integration)
  */
 bool FunASRNanoModel::DecodeWithLLM(RSState &state,
                                     ggml_backend_sched_t sched) {
@@ -452,28 +442,25 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   const int encoder_dim = sv_state.encoder_out->ne[0]; // Encoder dim (512)
   const int llm_dim = llm_model_->hparams().n_embd;    // Qwen3 hidden dim
 
-  // Build chat format prompt with placeholders for audio insertion
-  // Format: {user_input}<|startofspeech|>!<|endofspeech|>
-  // The "<|startofspeech|>!<|endofspeech|>" part will be REPLACED by audio
-  // embeddings (no token embeddings)
-  std::string user_input = sv_state.user_input; // Default: "语音转写"
-
-  // Tokenize user_input only (audio will be inserted after this)
+  // Build prompt
+  std::string user_input = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n" + sv_state.user_input; // Default: "语音转写"
+  std::string suffix_input = "<|im_end|>\n<|im_start|>assistant\n";
+    // Tokenize user_input
   std::vector<int32_t> prefix_tokens;
+  std::vector<int32_t> suffix_tokens;
   if (llm_model_) {
     prefix_tokens = llm_model_->vocab().tokenize(user_input, false);
   }
 
-  // audio_insert_idx: position where audio embeddings start (after user_input
-  // tokens)
+  if (llm_model_) {
+      suffix_tokens = llm_model_->vocab().tokenize(suffix_input, false);
+  }
   int audio_insert_idx = (int)prefix_tokens.size();
-
-  // Total sequence length: user_input tokens + audio frames
-  int total_T = audio_insert_idx + audio_T;
+  int total_T = audio_insert_idx + audio_T + (int)suffix_tokens.size();
 
   RS_LOG_INFO(
-      "DecodeWithLLM: user_tokens=%d, audio_frames=%d, total=%d, insert_idx=%d",
-      audio_insert_idx, audio_T, total_T, audio_insert_idx);
+      "DecodeWithLLM: user_tokens=%d, audio_frames=%d, total_T=%d",
+      audio_insert_idx, audio_T, total_T);
 
   // 2. Create graph builder context
   llm_cparams cparams;
@@ -489,7 +476,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
         std::make_unique<llm_build_qwen3>(*llm_model_, cparams, sched);
   }
 
-  // Initialize KV cache for LLM if not already done
+  // Initialize KV cache (not fully used yet, but created for compatibility)
   if (!llm_kv_cache_) {
     llm_kv_cache::config kv_config;
     kv_config.n_ctx = cparams.n_ctx;
@@ -500,10 +487,11 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
         kv_config, llm_dim, llm_dim,
         llm_model_->hparams().n_head_kv > 0 ? llm_model_->hparams().n_head_kv
                                             : llm_model_->hparams().n_head,
+        llm_model_->hparams().n_layer,
         ggml_backend_sched_get_backend(sched, 0));
   }
 
-  // 3. Build projection graph
+  // 3. Build projection graph for prefix + audio
   struct ggml_init_params proj_params = {512 * ggml_tensor_overhead(), nullptr,
                                          true};
   struct ggml_context *ctx_proj = ggml_init(proj_params);
@@ -513,26 +501,24 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   ggml_tensor *inp_prefix_tokens =
       ggml_new_tensor_1d(ctx_proj, GGML_TYPE_I32, audio_insert_idx);
   ggml_set_name(inp_prefix_tokens, "input_prefix_tokens");
+  ggml_tensor *inp_suffix_tokens =
+        ggml_new_tensor_1d(ctx_proj, GGML_TYPE_I32, suffix_tokens.size());
+    ggml_set_name(inp_suffix_tokens, "input_suffix_tokens");
   ggml_set_input(inp_prefix_tokens);
   ggml_tensor *prefix_embeds =
       ggml_get_rows(ctx_proj, llm_model_->tok_embd(), inp_prefix_tokens);
-
-  // 3b. Audio encoder output: [encoder_dim, audio_T] -> projected to [llm_dim,
-  // audio_T]
+  ggml_tensor *suffix_embeds =
+        ggml_get_rows(ctx_proj, llm_model_->tok_embd(), inp_suffix_tokens);
+  // 3b. Audio encoder output -> projected to LLM space
   ggml_tensor *audio_encoder_out = ggml_new_tensor_2d(
       ctx_proj, sv_state.encoder_out->type, encoder_dim, audio_T);
   ggml_set_input(audio_encoder_out);
   ggml_tensor *audio_embeds =
       decoder_forward(hparams_, ctx_proj, audio_encoder_out, *audio_adaptor_);
 
-  // 3c. Build combined embeddings: [user_input_tokens] + [audio_embeds]
-  // Final shape: [llm_dim, total_T] where total_T = audio_insert_idx + audio_T
-  // Note: <|startofspeech|> and <|endofspeech|> are NOT converted to embeddings
-  ggml_tensor *llm_embeds = nullptr;
-
-  // Concatenate: prefix (user_input) + audio
-  llm_embeds = ggml_concat(ctx_proj, prefix_embeds, audio_embeds, 1);
-
+  // 3c. Concatenate: prefix + audio
+  ggml_tensor *llm_embeds = ggml_concat(ctx_proj, prefix_embeds, audio_embeds, 1);
+  llm_embeds = ggml_concat(ctx_proj, llm_embeds, suffix_embeds, 1);
   ggml_set_output(llm_embeds);
   ggml_build_forward_expand(gf_proj, llm_embeds);
 
@@ -542,39 +528,36 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
     return false;
   }
 
-  // Set input data: audio encoder output and token IDs
+  // Set input data
   ggml_backend_tensor_copy(sv_state.encoder_out, audio_encoder_out);
   ggml_backend_tensor_set(inp_prefix_tokens, prefix_tokens.data(), 0,
                           prefix_tokens.size() * sizeof(int32_t));
+  ggml_backend_tensor_set(inp_suffix_tokens, suffix_tokens.data(), 0,
+                            suffix_tokens.size() * sizeof(int32_t));
 
-  // Execute projection graph to get combined embeddings
   if (ggml_backend_sched_graph_compute(sched, gf_proj) != GGML_STATUS_SUCCESS) {
     ggml_free(ctx_proj);
     return false;
   }
 
-  // 5. Get projected embeddings before reset
+  // Get combined embeddings
   std::vector<float> llm_embeds_host(ggml_nelements(llm_embeds));
   ggml_backend_tensor_get(llm_embeds, llm_embeds_host.data(), 0,
                           ggml_nbytes(llm_embeds));
 
-  // Free projection graph context
   ggml_free(ctx_proj);
-
-  // Reset scheduler for LLM graph allocation
   ggml_backend_sched_reset(sched);
 
   // 6. Build positions for LLM
   std::vector<llm_pos> positions(total_T);
   for (int i = 0; i < total_T; ++i) {
-    positions[i] = i;
+    positions[i] = i + 2;  // Position ids start from 2 (matches Python)
   }
 
-  // 7. Create new graph context and input tensor for LLM
+  // 7. Create graph context and input tensor for LLM
   struct ggml_init_params llm_params = {512 * ggml_tensor_overhead(), nullptr,
                                         true};
   struct ggml_context *ctx_llm = ggml_init(llm_params);
-  struct ggml_cgraph *gf_llm = ggml_new_graph(ctx_llm);
 
   // Create input tensor for LLM graph
   ggml_tensor *llm_input =
@@ -582,15 +565,15 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   ggml_set_name(llm_input, "llm_input");
   ggml_set_input(llm_input);
 
-  // 8. Use Qwen3 to decode from embeddings
+  // 8. Use Qwen3 to decode from embeddings - NO KV cache for now
   llm_build_opts opts;
   opts.output_mode = llm_output_mode::OUTPUT_LOGITS;
   opts.skip_embeddings = true;
-  opts.use_kv_cache = false;  // 禁用KV cache
-  opts.causal_mask = false;     // 对于ASR，可以看到所有位置
+  opts.use_kv_cache = false;
+  opts.causal_mask = true;
 
   auto result = llm_graph_builder_->build_graph_from_embeds(
-      llm_input, total_T, llm_kv_cache_.get(), positions.data(), &opts);
+      llm_input, total_T, nullptr, positions.data(), &opts);
 
   if (!result) {
     RS_LOG_ERR("Failed to build LLM graph");
@@ -607,23 +590,27 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   // Set input data after graph allocation
   ggml_backend_tensor_set(llm_input, llm_embeds_host.data(), 0,
                           llm_embeds_host.size() * sizeof(float));
+  print_tensor(llm_input);
 
   // Position ids were built during graph construction, now set the data
   ggml_tensor *positions_tensor = result->get_input_tensor("position_ids");
+
   if (!positions_tensor) {
     positions_tensor = result->get_input_tensor("position_ids_seq");
   }
   if (positions_tensor) {
     result->set_position_ids(positions_tensor, positions.data(), total_T);
   }
+    print_tensor(positions_tensor);
 
+  ggml_backend_sched_set_eval_callback(sched, ggml_debug, new callback_data());
   if (ggml_backend_sched_graph_compute(sched, result->get_graph()) !=
       GGML_STATUS_SUCCESS) {
     ggml_free(ctx_llm);
     return false;
   }
 
-  // 10. Get logits and perform greedy decoding (only for audio part)
+  // 10. Get logits - sample from ALL positions (simplified approach)
   ggml_tensor *logits = result->get_logits();
   if (!logits) {
     RS_LOG_ERR("No logits from LLM");
@@ -631,56 +618,42 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
     return false;
   }
 
-  // Logits tensor shape: [n_vocab, n_tokens] in ggml (column-major)
-  const int n_vocab = (int)logits->ne[0];  // Use actual size from tensor
-  printf("DEBUG: Logits shape: ne[0]=%d, ne[1]=%d, ne[2]=%d, ne[3]=%d\n",
-         (int)logits->ne[0], (int)logits->ne[1], (int)logits->ne[2], (int)logits->ne[3]);
-  printf("DEBUG: n_vocab=%d, total_T=%d\n", n_vocab, total_T);
-
+  const int n_vocab = (int)logits->ne[0];
   std::vector<float> logits_host(n_vocab * total_T);
   ggml_backend_tensor_get(logits, logits_host.data(), 0,
                           logits_host.size() * sizeof(float));
 
-  // Greedy decoding: only decode audio part (skip prefix tokens)
-  // Start decoding from audio_insert_idx (where audio embeddings begin)
   std::vector<int32_t> token_ids;
-  token_ids.reserve(audio_T);
 
-  for (int t = audio_insert_idx; t < total_T; ++t) {
-    // GGML uses column-major format: logits[v, t] = logits_host[v + t * n_vocab]
-    int32_t best_token = 0;
-    float best_prob = logits_host[0 + t * n_vocab];
+  // Simplified: sample from LAST position only (the end of audio)
+  // For a proper ASR with LLM, we'd do per-frame CTC or full autoregressive
+  int last_t = total_T - 1;
+  RS_LOG_INFO("Sampling from position %d (last position)", last_t);
 
-    for (int v = 1; v < n_vocab; ++v) {
-      float logit = logits_host[v + t * n_vocab];
-      if (logit > best_prob) {
-        best_prob = logit;
-        best_token = v;
-      }
+  // For now, let's just sample a few tokens from the last position
+  // using greedy decoding without KV cache (simplified demonstration)
+
+  // First, get the top token from last position
+  int32_t best_token = 0;
+  float best_prob = logits_host[0 + last_t * n_vocab];
+  for (int v = 1; v < n_vocab; ++v) {
+    float logit = logits_host[v + last_t * n_vocab];
+    if (logit > best_prob) {
+      best_prob = logit;
+      best_token = v;
     }
-
-    if (llm_model_->vocab().is_eos(best_token)) {
-      break;
-    }
-
-    token_ids.push_back(best_token);
   }
+  token_ids.push_back(best_token);
 
-  // 11. Convert token IDs to text using LLM's tokenizer
+  RS_LOG_INFO("First token: %d (%s)", best_token,
+              llm_model_->vocab().get_token(best_token).text.c_str());
+
+  // 11. Convert token IDs to text
   auto &funasr_state = static_cast<FunASRNanoState &>(state);
   if (llm_model_) {
-    // Use Qwen3's detokenizer for proper BPE decoding
     std::string result_text = llm_model_->vocab().detokenize(token_ids);
     funasr_state.tokens.push_back(result_text);
     RS_LOG_INFO("DecodeWithLLM: %s", result_text.c_str());
-  } else {
-    // Fallback: use local vocab (may not be correct for LLM tokens)
-    for (int32_t token_id : token_ids) {
-      auto it = vocab_.id_to_token.find(token_id);
-      if (it != vocab_.id_to_token.end()) {
-        funasr_state.tokens.push_back(it->second);
-      }
-    }
   }
 
   RS_LOG_INFO("DecodeWithLLM: decoded %zu tokens", token_ids.size());
@@ -735,8 +708,6 @@ bool FunASRNanoModel::DecodeWithoutLLM(RSState &state,
     return false;
   }
   ggml_backend_tensor_copy(sv_state.encoder_out, encoder_in);
-  // ggml_backend_sched_set_eval_callback(sched, ggml_debug, new
-  // callback_data());
   if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
     ggml_free(ctx0);
     return false;
