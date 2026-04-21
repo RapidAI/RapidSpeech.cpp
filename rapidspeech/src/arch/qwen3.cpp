@@ -4,6 +4,61 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <vector>
+
+/**
+ * Mimics torch.repeat_interleave(repeats, dim=-3) specifically for GQA.
+ * Goal: Transform [H0, H1] into [H0, H0, H1, H1]
+ */
+struct ggml_tensor * ggml_repeat_interleave_gqa(
+    struct ggml_context * ctx,
+    struct ggml_tensor * kv_tensor,
+    int repeats
+) {
+  if (repeats <= 1) {
+    return kv_tensor;
+  }
+
+  // Original tensor dims: {d_k, n_h, n_s, n_b} -> e.g., {128, 8, 52, 1}
+  const int64_t d_k = kv_tensor->ne[0];
+  const int64_t n_h = kv_tensor->ne[1];
+  const int64_t n_s = kv_tensor->ne[2];
+  const int64_t n_b = kv_tensor->ne[3];
+
+  // 1. Reshape to split the head dimension into its own repeating axis.
+  // Move heads (n_h) and sequences (n_s) to higher dims to isolate the repeating axis.
+  // Logic: {d_k, 1, n_h, n_s * n_b}
+  struct ggml_tensor * view_src = ggml_reshape_4d(ctx, kv_tensor,
+      d_k,
+      1,
+      n_h,
+      n_s * n_b
+  );
+
+  // 2. Set target shape to expand the '1' dimension.
+  // This forces an interleaved repeat pattern in memory.
+  struct ggml_tensor * target_shape = ggml_new_tensor_4d(ctx, kv_tensor->type,
+      d_k,
+      repeats,
+      n_h,
+      n_s * n_b
+  );
+
+  // 3. Repeat operation.
+  // This creates the [H0_data, H0_copy, H1_data, H1_copy...] pattern.
+  struct ggml_tensor * repeated = ggml_repeat(ctx, view_src, target_shape);
+
+  // 4. Reshape back to standard multi-head attention format.
+  // Final shape: {128, 16, 52, 1}
+  struct ggml_tensor * result = ggml_reshape_4d(ctx, repeated,
+      d_k,
+      n_h * repeats,
+      n_s,
+      n_b
+  );
+
+  return result;
+}
 
 // ============================================
 // Qwen3 Special Tokens
@@ -293,6 +348,40 @@ llm_build_qwen3::build_attention_layer(ggml_context *ctx, ggml_tensor *cur,
 
   const float scale = 1.0f / sqrtf(static_cast<float>(n_embd_head));
 
+  // DEBUG: Print Q, K, V shapes
+  printf("[DEBUG Layer %d] Q shape: [%lld, %lld, %lld]\n", il, (long long)q->ne[0], (long long)q->ne[1], (long long)q->ne[2]);
+  printf("[DEBUG Layer %d] K shape: [%lld, %lld, %lld]\n", il, (long long)k->ne[0], (long long)k->ne[1], (long long)k->ne[2]);
+  printf("[DEBUG Layer %d] V shape: [%lld, %lld, %lld]\n", il, (long long)v->ne[0], (long long)v->ne[1], (long long)v->ne[2]);
+  printf("[DEBUG Layer %d] K_final shape: [%lld, %lld, %lld]\n", il, (long long)k_final->ne[0], (long long)k_final->ne[1], (long long)k_final->ne[2]);
+  printf("[DEBUG Layer %d] V_final shape: [%lld, %lld, %lld]\n", il, (long long)v_final->ne[0], (long long)v_final->ne[1], (long long)v_final->ne[2]);
+  printf("[DEBUG Layer %d] scale: %f\n", il, scale);
+  if (causal_mask) {
+    printf("[DEBUG Layer %d] causal_mask shape: [%lld, %lld]\n", il, (long long)causal_mask->ne[0], (long long)causal_mask->ne[1]);
+  }
+
+  int n_heads_q = q->ne[2]; // 16
+  int n_heads_kv = k->ne[2]; // 8
+  int group_size = n_heads_q / n_heads_kv; // 2
+
+  // if (group_size > 1) {
+  //   // 1. Generate interleaved view
+  //   struct ggml_tensor * k_inter = ggml_repeat_interleave_gqa(ctx, k_final, group_size);
+  //
+  //   // 2. CRITICAL: Force memory synchronization.
+  //   // After this line, your 'sum' should double (e.g., ~ -50.91).
+  //   k_final = ggml_cont(ctx, k_inter);
+  //
+  //   // 3. Permute to get {d_k, n_s, n_h_total, n_b}
+  //   k_final = ggml_permute(ctx, k_final, 0, 2, 1, 3);
+  //   ggml_set_name(k_final, "k_final");
+  //
+  //   // Repeat for Value tensor
+  //   struct ggml_tensor * v_inter = ggml_repeat_interleave_gqa(ctx, v_final, group_size);
+  //   v_final = ggml_cont(ctx, v_inter);
+  //   v_final = ggml_permute(ctx, v_final, 0, 2, 1, 3);
+  //   ggml_set_name(v_final, "v_final");
+  // }
+
   if (current_opts_.use_flash_attn) {
     cur = build_flash_attn(ctx, q, k_final, v_final, causal_mask, scale);
   } else {
@@ -300,11 +389,17 @@ llm_build_qwen3::build_attention_layer(ggml_context *ctx, ggml_tensor *cur,
                                 n_head, n_head_kv);
   }
 
+  // DEBUG: Print attention output shape
+  printf("[DEBUG Layer %d] Attention output shape (before reshape): [%lld, %lld, %lld]\n", il, (long long)cur->ne[0], (long long)cur->ne[1], (long long)cur->ne[2]);
+
   // Reshape from [head_dim, n_head, n_tokens] to [head_dim * n_head, n_tokens]
   // Note: head_dim * n_head may differ from n_embd in some architectures
   cur =
       ggml_reshape_2d(ctx, ggml_cont(ctx, cur), n_embd_head * n_head, n_tokens);
   cur = ggml_mul_mat(ctx, layer.wo, cur);
+
+  // Set name for debugging so we can find it later
+  ggml_set_name(cur, "attention_output_wo");
 
   return cur;
 }

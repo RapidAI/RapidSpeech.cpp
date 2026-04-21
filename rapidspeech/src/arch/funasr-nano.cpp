@@ -601,7 +601,13 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   if (positions_tensor) {
     result->set_position_ids(positions_tensor, positions.data(), total_T);
   }
-    print_tensor(positions_tensor);
+  print_tensor(positions_tensor);
+
+  // Set causal mask data if needed
+  ggml_tensor *causal_mask_tensor = result->get_input_tensor("causal_mask");
+  if (causal_mask_tensor) {
+    result->set_causal_mask(causal_mask_tensor, total_T, 0);
+  }
 
   ggml_backend_sched_set_eval_callback(sched, ggml_debug, new callback_data());
   if (ggml_backend_sched_graph_compute(sched, result->get_graph()) !=
