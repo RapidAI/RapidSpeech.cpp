@@ -188,7 +188,9 @@ bool llm_vocab::load_from_gguf(struct gguf_context *ctx_gguf) {
   if (token_bos_ == -1)
     token_bos_ = 1;
 
-  token_eos_ = find_special_token("</s>");
+  token_eos_ = find_special_token("<|im_end|>");
+  if (token_eos_ == -1)
+    token_eos_ = find_special_token("</s>");
   if (token_eos_ == -1)
     token_eos_ = find_special_token("<eos>");
   if (token_eos_ == -1)

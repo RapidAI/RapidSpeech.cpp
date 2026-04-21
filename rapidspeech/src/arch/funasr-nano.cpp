@@ -565,11 +565,11 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   ggml_set_name(llm_input, "llm_input");
   ggml_set_input(llm_input);
 
-  // 8. Use Qwen3 to decode from embeddings - NO KV cache for now
+  // 8. Use Qwen3 to decode from embeddings
   llm_build_opts opts;
   opts.output_mode = llm_output_mode::OUTPUT_LOGITS;
   opts.skip_embeddings = true;
-  opts.use_kv_cache = false;
+  opts.use_kv_cache = true;   // Enable KV extraction for decode loop
   opts.causal_mask = true;
 
   auto result = llm_graph_builder_->build_graph_from_embeds(
@@ -590,7 +590,6 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   // Set input data after graph allocation
   ggml_backend_tensor_set(llm_input, llm_embeds_host.data(), 0,
                           llm_embeds_host.size() * sizeof(float));
-  print_tensor(llm_input);
 
   // Position ids were built during graph construction, now set the data
   ggml_tensor *positions_tensor = result->get_input_tensor("position_ids");
@@ -601,7 +600,6 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   if (positions_tensor) {
     result->set_position_ids(positions_tensor, positions.data(), total_T);
   }
-  print_tensor(positions_tensor);
 
   // Set causal mask data if needed
   ggml_tensor *causal_mask_tensor = result->get_input_tensor("causal_mask");
@@ -609,7 +607,6 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
     result->set_causal_mask(causal_mask_tensor, total_T, 0);
   }
 
-  ggml_backend_sched_set_eval_callback(sched, ggml_debug, new callback_data());
   if (ggml_backend_sched_graph_compute(sched, result->get_graph()) !=
       GGML_STATUS_SUCCESS) {
     ggml_free(ctx_llm);
@@ -654,7 +651,196 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   RS_LOG_INFO("First token: %d (%s)", best_token,
               llm_model_->vocab().get_token(best_token).text.c_str());
 
-  // 11. Convert token IDs to text
+  // Extract K/V per layer from output tensors and store in host cache
+  const auto &lp = llm_model_->hparams();
+  const int n_layer = lp.n_layer;
+  const int n_head_kv = lp.n_head_kv > 0 ? lp.n_head_kv : lp.n_head;
+  const int head_dim = lp.head_dim;
+  const int kv_dim = head_dim * n_head_kv;
+
+  host_kv_cache_k_.assign(n_layer, std::vector<float>());
+  host_kv_cache_v_.assign(n_layer, std::vector<float>());
+  n_cached_tokens_ = total_T;
+
+  for (int il = 0; il < n_layer; ++il) {
+    ggml_tensor *k_out = result->get_kv_output_k(il);
+    ggml_tensor *v_out = result->get_kv_output_v(il);
+    if (k_out && v_out) {
+      size_t kv_size = (size_t)kv_dim * total_T;
+      host_kv_cache_k_[il].resize(kv_size);
+      host_kv_cache_v_[il].resize(kv_size);
+      ggml_backend_tensor_get(k_out, host_kv_cache_k_[il].data(), 0, kv_size * sizeof(float));
+      ggml_backend_tensor_get(v_out, host_kv_cache_v_[il].data(), 0, kv_size * sizeof(float));
+    }
+  }
+
+  ggml_free(ctx_llm);
+  ggml_backend_sched_reset(sched);
+
+  // ==========================================
+  // Autoregressive decode loop
+  // ==========================================
+  const int32_t eos_token_id = llm_model_->vocab().token_eos();
+
+  for (int step = 0; step < MAX_DECODE_TOKENS; ++step) {
+    // Get embedding for current token
+    ggml_tensor *tok_embd = llm_model_->tok_embd();
+    std::vector<float> token_embed_host(llm_dim);
+    {
+      const int64_t emb_max_nodes = 16;
+      struct ggml_init_params emb_params = {
+          emb_max_nodes * ggml_tensor_overhead() + emb_max_nodes * sizeof(ggml_tensor *) * 2 + (1 << 16),
+          nullptr, true};
+      struct ggml_context *ctx_emb = ggml_init(emb_params);
+      struct ggml_cgraph *gf_emb = ggml_new_graph_custom(ctx_emb, emb_max_nodes, false);
+      ggml_tensor *inp_tok = ggml_new_tensor_1d(ctx_emb, GGML_TYPE_I32, 1);
+      ggml_set_input(inp_tok);
+      ggml_tensor *emb_out = ggml_get_rows(ctx_emb, tok_embd, inp_tok);
+      ggml_set_output(emb_out);
+      ggml_build_forward_expand(gf_emb, emb_out);
+
+      if (!ggml_backend_sched_alloc_graph(sched, gf_emb)) {
+        ggml_free(ctx_emb);
+        break;
+      }
+      ggml_backend_tensor_set(inp_tok, &best_token, 0, sizeof(int32_t));
+      if (ggml_backend_sched_graph_compute(sched, gf_emb) != GGML_STATUS_SUCCESS) {
+        ggml_free(ctx_emb);
+        break;
+      }
+      ggml_backend_tensor_get(emb_out, token_embed_host.data(), 0, llm_dim * sizeof(float));
+      ggml_free(ctx_emb);
+      ggml_backend_sched_reset(sched);
+    }
+
+    // Build decode graph with K/V cache concat
+    llm_pos decode_pos = (llm_pos)(n_cached_tokens_ + 2);  // +2 to match prefill position offset
+
+    struct ggml_init_params dec_input_params = {64 * ggml_tensor_overhead(), nullptr, true};
+    struct ggml_context *ctx_dec_input = ggml_init(dec_input_params);
+
+    ggml_tensor *dec_embeds =
+        ggml_new_tensor_2d(ctx_dec_input, GGML_TYPE_F32, llm_dim, 1);
+    ggml_set_name(dec_embeds, "dec_input_embeds");
+    ggml_set_input(dec_embeds);
+
+    llm_build_opts dec_opts;
+    dec_opts.output_mode = llm_output_mode::OUTPUT_LOGITS;
+    dec_opts.skip_embeddings = true;
+    dec_opts.use_kv_cache = true;
+    dec_opts.is_decode_step = true;
+    dec_opts.n_kv_cache = n_cached_tokens_;
+    dec_opts.causal_mask = true;
+
+    auto dec_result = llm_graph_builder_->build_graph_from_embeds(
+        dec_embeds, 1, nullptr, &decode_pos, &dec_opts);
+
+    if (!dec_result) {
+      RS_LOG_ERR("Failed to build decode graph at step %d", step);
+      ggml_free(ctx_dec_input);
+      break;
+    }
+
+    if (!ggml_backend_sched_alloc_graph(sched, dec_result->get_graph())) {
+      RS_LOG_ERR("Failed to allocate decode graph at step %d", step);
+      ggml_free(ctx_dec_input);
+      break;
+    }
+
+    ggml_backend_tensor_set(dec_embeds, token_embed_host.data(), 0,
+                            llm_dim * sizeof(float));
+
+    // Set position IDs
+    ggml_tensor *dec_pos_tensor = dec_result->get_input_tensor("position_ids");
+    if (!dec_pos_tensor) dec_pos_tensor = dec_result->get_input_tensor("position_ids_seq");
+    if (dec_pos_tensor) {
+      dec_result->set_position_ids(dec_pos_tensor, &decode_pos, 1);
+    }
+
+    // Set causal mask: decode token can attend to all cached + itself
+    ggml_tensor *dec_mask_tensor = dec_result->get_input_tensor("causal_mask");
+    if (dec_mask_tensor) {
+      dec_result->set_causal_mask(dec_mask_tensor, 1, n_cached_tokens_);
+    }
+
+    // Set cached K/V input data per layer
+    for (int il = 0; il < n_layer; ++il) {
+      char k_name[64], v_name[64];
+      snprintf(k_name, sizeof(k_name), "kv_cached_k_layer_%d", il);
+      snprintf(v_name, sizeof(v_name), "kv_cached_v_layer_%d", il);
+
+      ggml_tensor *k_input = dec_result->get_input_tensor(k_name);
+      ggml_tensor *v_input = dec_result->get_input_tensor(v_name);
+
+      if (k_input && v_input) {
+        size_t kv_bytes = (size_t)kv_dim * n_cached_tokens_ * sizeof(float);
+        ggml_backend_tensor_set(k_input, host_kv_cache_k_[il].data(), 0, kv_bytes);
+        ggml_backend_tensor_set(v_input, host_kv_cache_v_[il].data(), 0, kv_bytes);
+      }
+    }
+
+    // Execute decode step
+    if (ggml_backend_sched_graph_compute(sched, dec_result->get_graph()) != GGML_STATUS_SUCCESS) {
+      RS_LOG_ERR("Decode graph compute failed at step %d", step);
+      ggml_free(ctx_dec_input);
+      break;
+    }
+
+    // Extract logits and sample next token
+    ggml_tensor *dec_logits = dec_result->get_logits();
+    if (!dec_logits) {
+      RS_LOG_ERR("No logits from decode step %d", step);
+      ggml_free(ctx_dec_input);
+      break;
+    }
+
+    std::vector<float> dec_logits_host(n_vocab);
+    ggml_backend_tensor_get(dec_logits, dec_logits_host.data(), 0, n_vocab * sizeof(float));
+
+    int32_t next_token = 0;
+    float next_prob = dec_logits_host[0];
+    for (int v = 1; v < n_vocab; ++v) {
+      if (dec_logits_host[v] > next_prob) {
+        next_prob = dec_logits_host[v];
+        next_token = v;
+      }
+    }
+
+    RS_LOG_INFO("Decode step %d: token=%d (%s)", step, next_token,
+                llm_model_->vocab().get_token(next_token).text.c_str());
+
+    // Update host KV cache from output
+    for (int il = 0; il < n_layer; ++il) {
+      ggml_tensor *k_out = dec_result->get_kv_output_k(il);
+      ggml_tensor *v_out = dec_result->get_kv_output_v(il);
+      if (k_out && v_out) {
+        int n_total = n_cached_tokens_ + 1;
+        host_kv_cache_k_[il].resize((size_t)kv_dim * n_total);
+        host_kv_cache_v_[il].resize((size_t)kv_dim * n_total);
+        ggml_backend_tensor_get(k_out, host_kv_cache_k_[il].data(), 0,
+                                (size_t)kv_dim * n_total * sizeof(float));
+        ggml_backend_tensor_get(v_out, host_kv_cache_v_[il].data(), 0,
+                                (size_t)kv_dim * n_total * sizeof(float));
+      }
+    }
+
+    n_cached_tokens_++;
+
+    if (next_token == eos_token_id) {
+      RS_LOG_INFO("EOS token reached at step %d", step);
+      ggml_free(ctx_dec_input);
+      ggml_backend_sched_reset(sched);
+      break;
+    }
+
+    token_ids.push_back(next_token);
+    best_token = next_token;
+
+    ggml_free(ctx_dec_input);
+    ggml_backend_sched_reset(sched);
+  }
+
+  // Convert token IDs to text
   auto &funasr_state = static_cast<FunASRNanoState &>(state);
   if (llm_model_) {
     std::string result_text = llm_model_->vocab().detokenize(token_ids);
@@ -663,7 +849,6 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   }
 
   RS_LOG_INFO("DecodeWithLLM: decoded %zu tokens", token_ids.size());
-  ggml_free(ctx_llm);
   return true;
 }
 

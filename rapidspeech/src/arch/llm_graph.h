@@ -163,6 +163,10 @@ struct llm_build_opts {
   bool update_kv_cache = true; // Update KV cache with new keys/values
   bool causal_mask = true;     // Use causal attention mask
 
+  // Decode mode control
+  bool is_decode_step = false; // true = decode step (n_tokens=1, concat cached K/V)
+  uint32_t n_kv_cache = 0;    // Number of cached KV pairs for decode step
+
   // Input control
   bool input_is_embeds = false; // Input is embeddings, not token IDs
   bool add_position_ids = true; // Add position IDs to input
@@ -224,6 +228,19 @@ public:
   void add_intermediate_output(ggml_tensor *tensor);
   size_t get_intermediate_count() const { return intermediate_outputs_.size(); }
 
+  // KV cache output tensors (per layer, for host-side KV cache extraction)
+  void add_kv_output(ggml_tensor *k, ggml_tensor *v) {
+    kv_outputs_k_.push_back(k);
+    kv_outputs_v_.push_back(v);
+  }
+  ggml_tensor *get_kv_output_k(size_t layer) const {
+    return layer < kv_outputs_k_.size() ? kv_outputs_k_[layer] : nullptr;
+  }
+  ggml_tensor *get_kv_output_v(size_t layer) const {
+    return layer < kv_outputs_v_.size() ? kv_outputs_v_[layer] : nullptr;
+  }
+  size_t get_kv_output_count() const { return kv_outputs_k_.size(); }
+
   // Get graph
   ggml_cgraph *get_graph() const { return gf_; }
   ggml_context *get_ctx() const { return ctx_; }
@@ -278,6 +295,10 @@ private:
 
   // Intermediate outputs (for TTS/ASR)
   std::vector<ggml_tensor *> intermediate_outputs_;
+
+  // KV cache output tensors per layer (for host-side extraction)
+  std::vector<ggml_tensor *> kv_outputs_k_;
+  std::vector<ggml_tensor *> kv_outputs_v_;
 
   // Parameters for reuse check
   llm_graph_params params_;
@@ -352,6 +373,11 @@ protected:
 
   // Current build options
   llm_build_opts current_opts_;
+
+  // Temporary storage for KV outputs during graph building
+  // Populated by build_kv_cache_lookup, transferred to result at end
+  std::vector<ggml_tensor *> tmp_kv_outputs_k_;
+  std::vector<ggml_tensor *> tmp_kv_outputs_v_;
 
   // Helper: Create new graph context
   void init_graph(int64_t max_nodes = 8192);
@@ -441,6 +467,22 @@ protected:
   build_kv_cache_lookup(ggml_context *ctx, ggml_tensor *k_cur,
                         ggml_tensor *v_cur, llm_kv_cache *kv_cache,
                         uint32_t n_tokens, int32_t il);
+
+  /**
+   * Build KV cache concat for decode step
+   *
+   * Concatenates cached K/V (from host) with current K/V.
+   *
+   * @param ctx Graph context
+   * @param k_cur Current K tensor [head_dim, n_head_kv, 1]
+   * @param v_cur Current V tensor [head_dim, n_head_kv, 1]
+   * @param n_cached Number of cached KV pairs
+   * @param il Layer index (for naming)
+   * @return Pair of {K_final, V_final} tensors
+   */
+  std::pair<ggml_tensor *, ggml_tensor *>
+  build_kv_cache_concat(ggml_context *ctx, ggml_tensor *k_cur,
+                        ggml_tensor *v_cur, uint32_t n_cached, int32_t il);
 
   /**
    * Build multi-head attention

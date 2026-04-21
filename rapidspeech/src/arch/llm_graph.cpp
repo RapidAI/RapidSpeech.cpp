@@ -123,35 +123,25 @@ void llm_graph_result::set_causal_mask(ggml_tensor *mask, uint32_t n_tokens,
     return;
   }
 
-  // Total sequence length including the current batch and the KV cache
+  // Mask shape: [n_kv, n_tokens], ne[0]=n_kv, ne[1]=n_tokens
+  // Memory: data[row * ne[0] + col] = data[i_q * n_kv + j_kv]
+  // i_q ∈ [0, n_tokens), j_kv ∈ [0, n_kv)
   const uint32_t n_kv = n_kv_cache + n_tokens;
   std::vector<float> mask_data(n_tokens * n_kv);
 
-  // Iterate through each row (corresponds to each Query token in the current batch)
   for (uint32_t i = 0; i < n_tokens; ++i) {
-    // Calculate the absolute position of the current query in the sequence
     const uint32_t cur_pos = n_kv_cache + i;
-
-    // Iterate through each column (corresponds to each Key token)
     for (uint32_t j = 0; j < n_kv; ++j) {
-      // In GGML, for a 2D tensor with dimensions {n_kv, n_tokens}:
-      // ne[0] (width) is n_kv, ne[1] (height) is n_tokens.
-      // The flat index follows the formula: index = row_idx * width + col_idx
       const size_t index = (size_t)i * n_kv + j;
-
-      // Causal logic: A query at 'cur_pos' cannot see keys at positions 'j > cur_pos'
-      const bool is_future = j > cur_pos;
-
-      // Set future positions to -INFINITY to effectively zero out attention weights after softmax
-      mask_data[index] = is_future ? -INFINITY : 0.0f;
+      mask_data[index] = (j > cur_pos) ? -INFINITY : 0.0f;
     }
   }
 
-  // Copy the prepared mask data from CPU host memory to the backend buffer (e.g., GPU/NPU)
   ggml_backend_tensor_set(mask, mask_data.data(), 0,
                           mask_data.size() * sizeof(float));
 }
 
+// Set position ids
 void llm_graph_result::set_llm_inputs(const int32_t *tokens, const llm_pos *pos,
                                       uint32_t n_tokens, uint32_t n_kv_cache) {
   // Set input tokens if provided
@@ -193,6 +183,10 @@ void llm_graph_builder::init_graph(int64_t max_nodes) {
 
   ctx_ = ggml_init(params);
   gf_ = ggml_new_graph_custom(ctx_, max_nodes, false);
+
+  // Clear temporary KV output tracking from previous build
+  tmp_kv_outputs_k_.clear();
+  tmp_kv_outputs_v_.clear();
 }
 
 void llm_graph_builder::free_graph() {
@@ -264,12 +258,10 @@ ggml_tensor *llm_graph_builder::build_causal_mask(ggml_context *ctx,
                                                   uint32_t n_kv_cache) {
   const uint32_t n_kv = n_kv_cache + n_tokens;
 
-  // Create causal mask: -inf for future positions
-  ggml_tensor *mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_tokens, n_kv);
+  // Mask shape: [n_kv, n_tokens] to broadcast with kq [n_tokens_kv, n_tokens, n_head]
+  // ne[0]=n_kv matches kq ne[0]=n_tokens_kv, ne[1]=n_tokens matches kq ne[1]=n_tokens
+  ggml_tensor *mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv, n_tokens);
   ggml_set_input(mask);
-
-  // Note: Mask data is set after graph allocation via ggml_backend_tensor_set
-  // Mask pattern is static and can be computed once
   ggml_set_name(mask, "causal_mask");
 
   return mask;
@@ -311,24 +303,86 @@ llm_graph_builder::build_kv_cache_lookup(ggml_context *ctx, ggml_tensor *k_cur,
                                          ggml_tensor *v_cur,
                                          llm_kv_cache *kv_cache,
                                          uint32_t n_tokens, int32_t il) {
-  if (!kv_cache || !current_opts_.use_kv_cache) {
-    return {k_cur, v_cur};
+  (void)kv_cache;
+
+  if (current_opts_.is_decode_step && current_opts_.n_kv_cache > 0) {
+    // Decode step: concatenate cached K/V with current K/V
+    return build_kv_cache_concat(ctx, k_cur, v_cur, current_opts_.n_kv_cache, il);
   }
 
-  // Note: Full KV cache integration requires slot management
-  // This is a simplified version for basic cache usage
-
-  // For now, just return current K/V without cache integration
-  // Full implementation would:
-  // 1. Call kv_cache->prepare() to get slot info
-  // 2. Use kv_cache->cpy_k/cpy_v to store K/V
-  // 3. Use kv_cache->get_k/get_v to retrieve cached K/V
-  // 4. Call kv_cache->commit() after graph execution
-
+  // Prefill step: optionally mark K/V as output for host-side extraction
   (void)n_tokens;
   (void)il;
 
+  if (current_opts_.use_kv_cache) {
+    // Make contiguous and mark as output so we can extract after compute
+    ggml_tensor *k_out = ggml_cont(ctx, k_cur);
+    ggml_tensor *v_out = ggml_cont(ctx, v_cur);
+
+    char k_name[64], v_name[64];
+    snprintf(k_name, sizeof(k_name), "kv_k_layer_%d", il);
+    snprintf(v_name, sizeof(v_name), "kv_v_layer_%d", il);
+    ggml_set_name(k_out, k_name);
+    ggml_set_name(v_out, v_name);
+
+    ggml_set_output(k_out);
+    ggml_set_output(v_out);
+    tmp_kv_outputs_k_.push_back(k_out);
+    tmp_kv_outputs_v_.push_back(v_out);
+
+    return {k_out, v_out};
+  }
+
   return {k_cur, v_cur};
+}
+
+std::pair<ggml_tensor *, ggml_tensor *>
+llm_graph_builder::build_kv_cache_concat(ggml_context *ctx, ggml_tensor *k_cur,
+                                         ggml_tensor *v_cur, uint32_t n_cached,
+                                         int32_t il) {
+  const int64_t head_dim = k_cur->ne[0];
+  const int64_t n_head_kv = k_cur->ne[1];
+
+  // Create input tensors for cached K/V (will be filled from host)
+  ggml_tensor *k_cached = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+                                              head_dim * n_head_kv, n_cached);
+  ggml_tensor *v_cached = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+                                              head_dim * n_head_kv, n_cached);
+  ggml_set_input(k_cached);
+  ggml_set_input(v_cached);
+
+  char k_cache_name[64], v_cache_name[64];
+  snprintf(k_cache_name, sizeof(k_cache_name), "kv_cached_k_layer_%d", il);
+  snprintf(v_cache_name, sizeof(v_cache_name), "kv_cached_v_layer_%d", il);
+  ggml_set_name(k_cached, k_cache_name);
+  ggml_set_name(v_cached, v_cache_name);
+
+  // Reshape current K/V to 2D: [head_dim * n_head_kv, n_tokens]
+  ggml_tensor *k_cur_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, k_cur),
+                                           head_dim * n_head_kv, k_cur->ne[2]);
+  ggml_tensor *v_cur_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, v_cur),
+                                           head_dim * n_head_kv, v_cur->ne[2]);
+
+  // Concat along dim[1]: [head_dim*n_head_kv, n_cached + n_tokens]
+  ggml_tensor *k_final_2d = ggml_concat(ctx, k_cached, k_cur_2d, 1);
+  ggml_tensor *v_final_2d = ggml_concat(ctx, v_cached, v_cur_2d, 1);
+
+  // Reshape back to 3D: [head_dim, n_head_kv, n_cached + n_tokens]
+  const int64_t n_total = n_cached + (int64_t)k_cur->ne[2];
+  ggml_tensor *k_final = ggml_reshape_3d(ctx, ggml_cont(ctx, k_final_2d),
+                                          head_dim, n_head_kv, n_total);
+  ggml_tensor *v_final = ggml_reshape_3d(ctx, ggml_cont(ctx, v_final_2d),
+                                          head_dim, n_head_kv, n_total);
+
+  // Mark as output for host-side extraction
+  if (current_opts_.use_kv_cache) {
+    ggml_set_output(k_final);
+    ggml_set_output(v_final);
+    tmp_kv_outputs_k_.push_back(k_final);
+    tmp_kv_outputs_v_.push_back(v_final);
+  }
+
+  return {k_final, v_final};
 }
 
 ggml_tensor *llm_graph_builder::build_multi_head_attn(
@@ -386,7 +440,7 @@ ggml_tensor *llm_graph_builder::build_multi_head_attn(
     kq = ggml_scale_inplace(ctx, kq, scale);
 
     if (mask) {
-        // mask should be [n_tokens_kv, n_tokens, 1, 1] or compatible
+        // mask is [n_kv, n_tokens], broadcast to kq [n_tokens_kv, n_tokens, n_head]
         kq = ggml_add_inplace(ctx, kq, mask);
     }
 

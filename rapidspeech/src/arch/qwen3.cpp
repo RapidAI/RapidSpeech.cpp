@@ -154,7 +154,7 @@ llm_graph_result_ptr llm_build_qwen3::build_graph(const int32_t *tokens,
   // Build causal mask once for all layers
   ggml_tensor *causal_mask = nullptr;
   if (current_opts_.causal_mask) {
-    const uint32_t n_kv_cache = kv_cache ? kv_cache->size() : 0;
+    uint32_t n_kv_cache = kv_cache ? kv_cache->size() : current_opts_.n_kv_cache;
     causal_mask = build_causal_mask_tensor(ctx_, n_tokens, n_kv_cache);
   }
 
@@ -197,6 +197,11 @@ llm_graph_result_ptr llm_build_qwen3::build_graph(const int32_t *tokens,
   ggml_build_forward_expand(gf_, cur);
   result->set_graph(gf_);
   result->set_ctx(ctx_);
+
+  // Transfer KV output tensors to result for host-side extraction
+  for (size_t i = 0; i < tmp_kv_outputs_k_.size(); ++i) {
+    result->add_kv_output(tmp_kv_outputs_k_[i], tmp_kv_outputs_v_[i]);
+  }
   result->update_params(
       {hparams.arch, hparams, cparams_, sched_, 0,
        current_opts_.output_mode == llm_output_mode::OUTPUT_LOGITS},
@@ -230,7 +235,7 @@ llm_graph_result_ptr llm_build_qwen3::build_graph_from_embeds(
   // Build causal mask once for all layers
   ggml_tensor *causal_mask = nullptr;
   if (current_opts_.causal_mask) {
-    const uint32_t n_kv_cache = kv_cache ? kv_cache->size() : 0;
+    uint32_t n_kv_cache = kv_cache ? kv_cache->size() : current_opts_.n_kv_cache;
     causal_mask = build_causal_mask_tensor(ctx_, n_tokens, n_kv_cache);
   }
 
@@ -273,6 +278,11 @@ llm_graph_result_ptr llm_build_qwen3::build_graph_from_embeds(
   ggml_build_forward_expand(gf_, cur);
   result->set_graph(gf_);
   result->set_ctx(ctx_);
+
+  // Transfer KV output tensors to result for host-side extraction
+  for (size_t i = 0; i < tmp_kv_outputs_k_.size(); ++i) {
+    result->add_kv_output(tmp_kv_outputs_k_[i], tmp_kv_outputs_v_[i]);
+  }
   result->update_params(
       {hparams.arch, hparams, cparams_, sched_, 0,
        current_opts_.output_mode == llm_output_mode::OUTPUT_LOGITS},
