@@ -599,12 +599,21 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   }
   if (positions_tensor) {
     result->set_position_ids(positions_tensor, positions.data(), total_T);
+    RS_LOG_INFO("Prefill: set position_ids, first=%d last=%d, n_tokens=%d",
+                (int)positions[0], (int)positions[total_T-1], total_T);
+  } else {
+    RS_LOG_ERR("Prefill: position_ids tensor not found!");
   }
 
   // Set causal mask data if needed
   ggml_tensor *causal_mask_tensor = result->get_input_tensor("causal_mask");
   if (causal_mask_tensor) {
     result->set_causal_mask(causal_mask_tensor, total_T, 0);
+    RS_LOG_INFO("Prefill: set causal_mask, shape [%lld,%lld] type=%s",
+                (long long)causal_mask_tensor->ne[0], (long long)causal_mask_tensor->ne[1],
+                ggml_type_name(causal_mask_tensor->type));
+  } else {
+    RS_LOG_ERR("Prefill: causal_mask tensor not found!");
   }
 
   if (ggml_backend_sched_graph_compute(sched, result->get_graph()) !=
@@ -625,6 +634,23 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   std::vector<float> logits_host(n_vocab * total_T);
   ggml_backend_tensor_get(logits, logits_host.data(), 0,
                           logits_host.size() * sizeof(float));
+
+  // Diagnostics: check logits range at last position
+  {
+    int last_t = total_T - 1;
+    float max_logit = -1e30f, min_logit = 1e30f;
+    int max_idx = 0;
+    int nan_count = 0, inf_count = 0;
+    for (int v = 0; v < n_vocab; ++v) {
+      float val = logits_host[v + last_t * n_vocab];
+      if (std::isnan(val)) { nan_count++; continue; }
+      if (std::isinf(val)) { inf_count++; continue; }
+      if (val > max_logit) { max_logit = val; max_idx = v; }
+      if (val < min_logit) min_logit = val;
+    }
+    RS_LOG_INFO("Prefill logits at last pos: min=%.4f max=%.4f max_idx=%d nan=%d inf=%d (n_vocab=%d)",
+                min_logit, max_logit, max_idx, nan_count, inf_count, n_vocab);
+  }
 
   std::vector<int32_t> token_ids;
 
@@ -780,6 +806,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
       dec_result->set_position_ids(dec_pos_tensor, &decode_pos, 1);
     }
 
+    // Set causal mask: decode token can attend to all cached + itself
     // Set causal mask: decode token can attend to all cached + itself
     ggml_tensor *dec_mask_tensor = dec_result->get_input_tensor("causal_mask");
     if (dec_mask_tensor) {

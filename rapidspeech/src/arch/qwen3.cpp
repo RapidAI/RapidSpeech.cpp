@@ -358,44 +358,18 @@ llm_build_qwen3::build_attention_layer(ggml_context *ctx, ggml_tensor *cur,
 
   const float scale = 1.0f / sqrtf(static_cast<float>(n_embd_head));
 
-
-
-  int n_heads_q = q->ne[2]; // 16
-  int n_heads_kv = k->ne[2]; // 8
-  int group_size = n_heads_q / n_heads_kv; // 2
-
-  // if (group_size > 1) {
-  //   // 1. Generate interleaved view
-  //   struct ggml_tensor * k_inter = ggml_repeat_interleave_gqa(ctx, k_final, group_size);
+  // Use manual attention (QK^T + mask + softmax + V) instead of ggml_flash_attn_ext.
+  // ggml_flash_attn_ext has a numerical stability bug on CPU backend when using
+  // mask with -INFINITY values in the online softmax algorithm.
   //
-  //   // 2. CRITICAL: Force memory synchronization.
-  //   // After this line, your 'sum' should double (e.g., ~ -50.91).
-  //   k_final = ggml_cont(ctx, k_inter);
-  //
-  //   // 3. Permute to get {d_k, n_s, n_h_total, n_b}
-  //   k_final = ggml_permute(ctx, k_final, 0, 2, 1, 3);
-  //   ggml_set_name(k_final, "k_final");
-  //
-  //   // Repeat for Value tensor
-  //   struct ggml_tensor * v_inter = ggml_repeat_interleave_gqa(ctx, v_final, group_size);
-  //   v_final = ggml_cont(ctx, v_inter);
-  //   v_final = ggml_permute(ctx, v_final, 0, 2, 1, 3);
-  //   ggml_set_name(v_final, "v_final");
-  // }
+  // Manual attention using build_multi_head_attn which handles:
+  // - GQA (grouped-query attention) via repeat
+  // - Causal mask via ggml_add
+  // - Standard QK^T + softmax + V computation
+  cur = build_multi_head_attn(ctx, q, k_final, v_final, causal_mask, scale, n_head, n_head_kv);
 
-  if (current_opts_.use_flash_attn) {
-    cur = build_flash_attn(ctx, q, k_final, v_final, causal_mask, scale);
-  } else {
-    cur = build_multi_head_attn(ctx, q, k_final, v_final, causal_mask, scale,
-                                n_head, n_head_kv);
-  }
-
-
-
-  // Reshape from [head_dim, n_head, n_tokens] to [head_dim * n_head, n_tokens]
-  // Note: head_dim * n_head may differ from n_embd in some architectures
-  cur =
-      ggml_reshape_2d(ctx, ggml_cont(ctx, cur), n_embd_head * n_head, n_tokens);
+  // Reshape from [d_k, n_head, n_tokens] to [n_embd, n_tokens]
+  cur = ggml_reshape_2d(ctx, cur, n_embd_head * n_head, n_tokens);
   cur = ggml_mul_mat(ctx, layer.wo, cur);
 
   // Set name for debugging so we can find it later

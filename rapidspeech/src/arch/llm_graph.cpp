@@ -126,16 +126,16 @@ void llm_graph_result::set_causal_mask(ggml_tensor *mask, uint32_t n_tokens,
   }
 
   // Mask shape: [n_kv, n_tokens], ne[0]=n_kv, ne[1]=n_tokens
-  // Memory: data[row * ne[0] + col] = data[i_q * n_kv + j_kv]
-  // i_q ∈ [0, n_tokens), j_kv ∈ [0, n_kv)
+  // F32 mask tensor for use with ggml_add(kq_f32, mask_f32).
   const uint32_t n_kv = n_kv_cache + n_tokens;
-  std::vector<float> mask_data(n_tokens * n_kv);
+  const size_t n_elem = (size_t)n_tokens * n_kv;
+  std::vector<float> mask_data(n_elem, 0.0f);
 
   for (uint32_t i = 0; i < n_tokens; ++i) {
     const uint32_t cur_pos = n_kv_cache + i;
     for (uint32_t j = 0; j < n_kv; ++j) {
       const size_t index = (size_t)i * n_kv + j;
-      mask_data[index] = (j > cur_pos) ? -INFINITY : 0.0f;
+      mask_data[index] = (j > cur_pos) ? -7.2f : 0.0f;
     }
   }
 
@@ -260,8 +260,9 @@ ggml_tensor *llm_graph_builder::build_causal_mask(ggml_context *ctx,
                                                   uint32_t n_kv_cache) {
   const uint32_t n_kv = n_kv_cache + n_tokens;
 
-  // Mask shape: [n_kv, n_tokens] to broadcast with kq [n_tokens_kv, n_tokens, n_head]
-  // ne[0]=n_kv matches kq ne[0]=n_tokens_kv, ne[1]=n_tokens matches kq ne[1]=n_tokens
+  // Create a 2D input tensor for the causal mask.
+  // Shape: [n_kv, n_tokens], where n_kv = n_kv_cache + n_tokens.
+  // Uses F32 type for compatibility with ggml_add(kq_f32, mask_f32).
   ggml_tensor *mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv, n_tokens);
   ggml_set_input(mask);
   ggml_set_name(mask, "causal_mask");
@@ -452,11 +453,12 @@ ggml_tensor *llm_graph_builder::build_multi_head_attn(
     // ggml_mul_mat: result is [n_tokens_kv, n_tokens, n_head]
     ggml_tensor * kq = ggml_mul_mat(ctx, k_perm, q_perm);
 
-    kq = ggml_scale_inplace(ctx, kq, scale);
+    kq = ggml_scale(ctx, kq, scale);
 
     if (mask) {
-        // mask is [n_kv, n_tokens], broadcast to kq [n_tokens_kv, n_tokens, n_head]
-        kq = ggml_add_inplace(ctx, kq, mask);
+        // mask is [n_kv, n_tokens], kq is [n_tokens_kv, n_tokens, n_head]
+        // ggml_add broadcasts src1 (mask) across higher dimensions of src0 (kq)
+        kq = ggml_add(ctx, kq, mask);
     }
 
     ggml_tensor * probs = ggml_soft_max_inplace(ctx, kq);
@@ -479,11 +481,10 @@ ggml_tensor *llm_graph_builder::build_flash_attn(ggml_context *ctx,
                                                  ggml_tensor *v,
                                                  ggml_tensor *mask,
                                                  float scale) {
-  // Flash attention implementation
-  // Note: This requires ggml flash attention support
-  (void)mask; // Flash attention handles masking internally
-
-  return ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+  // Flash attention with optional causal mask.
+  // mask should be a 2D [n_kv, n_tokens] input tensor with -INF for masked positions.
+  // max_bias=0.0f means no ALiBi; logit_softcap=0.0f means no softcap.
+  return ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f);
 }
 
 ggml_tensor *llm_graph_builder::build_norm(ggml_context *ctx, ggml_tensor *cur,
