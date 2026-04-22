@@ -10,11 +10,9 @@
  * Mimics torch.repeat_interleave(repeats, dim=-3) specifically for GQA.
  * Goal: Transform [H0, H1] into [H0, H0, H1, H1]
  */
-struct ggml_tensor * ggml_repeat_interleave_gqa(
-    struct ggml_context * ctx,
-    struct ggml_tensor * kv_tensor,
-    int repeats
-) {
+struct ggml_tensor *ggml_repeat_interleave_gqa(struct ggml_context *ctx,
+                                               struct ggml_tensor *kv_tensor,
+                                               int repeats) {
   if (repeats <= 1) {
     return kv_tensor;
   }
@@ -26,36 +24,24 @@ struct ggml_tensor * ggml_repeat_interleave_gqa(
   const int64_t n_b = kv_tensor->ne[3];
 
   // 1. Reshape to split the head dimension into its own repeating axis.
-  // Move heads (n_h) and sequences (n_s) to higher dims to isolate the repeating axis.
-  // Logic: {d_k, 1, n_h, n_s * n_b}
-  struct ggml_tensor * view_src = ggml_reshape_4d(ctx, kv_tensor,
-      d_k,
-      1,
-      n_h,
-      n_s * n_b
-  );
+  // Move heads (n_h) and sequences (n_s) to higher dims to isolate the
+  // repeating axis. Logic: {d_k, 1, n_h, n_s * n_b}
+  struct ggml_tensor *view_src =
+      ggml_reshape_4d(ctx, kv_tensor, d_k, 1, n_h, n_s * n_b);
 
   // 2. Set target shape to expand the '1' dimension.
   // This forces an interleaved repeat pattern in memory.
-  struct ggml_tensor * target_shape = ggml_new_tensor_4d(ctx, kv_tensor->type,
-      d_k,
-      repeats,
-      n_h,
-      n_s * n_b
-  );
+  struct ggml_tensor *target_shape =
+      ggml_new_tensor_4d(ctx, kv_tensor->type, d_k, repeats, n_h, n_s * n_b);
 
   // 3. Repeat operation.
   // This creates the [H0_data, H0_copy, H1_data, H1_copy...] pattern.
-  struct ggml_tensor * repeated = ggml_repeat(ctx, view_src, target_shape);
+  struct ggml_tensor *repeated = ggml_repeat(ctx, view_src, target_shape);
 
   // 4. Reshape back to standard multi-head attention format.
   // Final shape: {128, 16, 52, 1}
-  struct ggml_tensor * result = ggml_reshape_4d(ctx, repeated,
-      d_k,
-      n_h * repeats,
-      n_s,
-      n_b
-  );
+  struct ggml_tensor *result =
+      ggml_reshape_4d(ctx, repeated, d_k, n_h * repeats, n_s, n_b);
 
   return result;
 }
@@ -154,12 +140,14 @@ llm_graph_result_ptr llm_build_qwen3::build_graph(const int32_t *tokens,
   // Build causal mask once for all layers
   ggml_tensor *causal_mask = nullptr;
   if (current_opts_.causal_mask) {
-    uint32_t n_kv_cache = kv_cache ? kv_cache->size() : current_opts_.n_kv_cache;
+    uint32_t n_kv_cache =
+        kv_cache ? kv_cache->size() : current_opts_.n_kv_cache;
     causal_mask = build_causal_mask_tensor(ctx_, n_tokens, n_kv_cache);
   }
 
   for (int32_t il = n_layers_start; il < n_layers_end; ++il) {
-    cur = build_transformer_layer(ctx_, cur, il, kv_cache, positions, causal_mask, n_tokens);
+    cur = build_transformer_layer(ctx_, cur, il, kv_cache, positions,
+                                  causal_mask, n_tokens);
     if (should_extract_layer(il)) {
       result->add_intermediate_output(cur);
     }
@@ -235,12 +223,14 @@ llm_graph_result_ptr llm_build_qwen3::build_graph_from_embeds(
   // Build causal mask once for all layers
   ggml_tensor *causal_mask = nullptr;
   if (current_opts_.causal_mask) {
-    uint32_t n_kv_cache = kv_cache ? kv_cache->size() : current_opts_.n_kv_cache;
+    uint32_t n_kv_cache =
+        kv_cache ? kv_cache->size() : current_opts_.n_kv_cache;
     causal_mask = build_causal_mask_tensor(ctx_, n_tokens, n_kv_cache);
   }
 
   for (int32_t il = n_layers_start; il < n_layers_end; ++il) {
-    cur = build_transformer_layer(ctx_, cur, il, kv_cache, positions, causal_mask, n_tokens);
+    cur = build_transformer_layer(ctx_, cur, il, kv_cache, positions,
+                                  causal_mask, n_tokens);
     if (should_extract_layer(il)) {
       result->add_intermediate_output(cur);
     }
@@ -309,7 +299,8 @@ ggml_tensor *llm_build_qwen3::build_transformer_layer(
   ggml_tensor *residual = cur;
   cur = build_norm(ctx, cur, layer.attn_norm, nullptr, llm_norm_type::RMS_NORM,
                    hparams.f_norm_rms_eps);
-  cur = build_attention_layer(ctx, cur, il, kv_cache, positions, causal_mask, n_tokens);
+  cur = build_attention_layer(ctx, cur, il, kv_cache, positions, causal_mask,
+                              n_tokens);
   cur = build_residual(ctx, cur, residual);
 
   residual = cur;
@@ -321,12 +312,9 @@ ggml_tensor *llm_build_qwen3::build_transformer_layer(
   return cur;
 }
 
-ggml_tensor *
-llm_build_qwen3::build_attention_layer(ggml_context *ctx, ggml_tensor *cur,
-                                       int32_t il, llm_kv_cache *kv_cache,
-                                       ggml_tensor *positions,
-                                       ggml_tensor *causal_mask,
-                                       uint32_t n_tokens) {
+ggml_tensor *llm_build_qwen3::build_attention_layer(
+    ggml_context *ctx, ggml_tensor *cur, int32_t il, llm_kv_cache *kv_cache,
+    ggml_tensor *positions, ggml_tensor *causal_mask, uint32_t n_tokens) {
   const auto &layer = model_.layer(il);
   const auto &hparams = model_.hparams();
 
@@ -358,15 +346,17 @@ llm_build_qwen3::build_attention_layer(ggml_context *ctx, ggml_tensor *cur,
 
   const float scale = 1.0f / sqrtf(static_cast<float>(n_embd_head));
 
-  // Use manual attention (QK^T + mask + softmax + V) instead of ggml_flash_attn_ext.
-  // ggml_flash_attn_ext has a numerical stability bug on CPU backend when using
-  // mask with -INFINITY values in the online softmax algorithm.
+  // Use manual attention (QK^T + mask + softmax + V) instead of
+  // ggml_flash_attn_ext. ggml_flash_attn_ext has a numerical stability bug on
+  // CPU backend when using mask with -INFINITY values in the online softmax
+  // algorithm.
   //
   // Manual attention using build_multi_head_attn which handles:
   // - GQA (grouped-query attention) via repeat
   // - Causal mask via ggml_add
   // - Standard QK^T + softmax + V computation
-  cur = build_multi_head_attn(ctx, q, k_final, v_final, causal_mask, scale, n_head, n_head_kv);
+  cur = build_multi_head_attn(ctx, q, k_final, v_final, causal_mask, scale,
+                              n_head, n_head_kv);
 
   // Reshape from [d_k, n_head, n_tokens] to [n_embd, n_tokens]
   cur = ggml_reshape_2d(ctx, cur, n_embd_head * n_head, n_tokens);
