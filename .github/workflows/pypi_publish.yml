@@ -1,0 +1,94 @@
+name: Build and Publish Python Wheels
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:  # Allows manual triggering for debugging
+    inputs:
+      debug_mode:
+        description: 'Debug mode (builds only one Python version to save time)'
+        required: false
+        default: 'false'
+
+jobs:
+  build_wheels:
+    name: Build ${{ matrix.backend }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 1. Linux CPU
+          - os: ubuntu-latest
+            backend: cpu
+          # 2. Linux CUDA
+          - os: ubuntu-latest
+            backend: cuda
+          # 3. Windows CUDA
+          - os: windows-latest
+            backend: cuda
+          # 4. macOS Metal (macOS supports Metal by default)
+          - os: macos-latest
+            backend: metal
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0  # Required by setuptools_scm to retrieve git history for versioning
+
+      # Specific setup for Windows CUDA
+      - name: Install CUDA (Windows)
+        if: matrix.os == 'windows-latest' && matrix.backend == 'cuda'
+        uses: jimmy-huang/setup-cuda@v2
+        with:
+          cuda: '11.8'
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.22.0
+        env:
+          # 1. Pass the backend type to setup.py
+          # 2. Pass the version: use git tag if available, otherwise fallback to dev version
+          CIBW_ENVIRONMENT: >
+            RS_BACKEND=${{ matrix.backend }}
+            RAPIDSPEECH_IS_FOR_PYPI=1
+            SETUPTOOLS_SCM_PRETEND_VERSION=${{ github.ref_name || '0.0.0.dev0' }}
+
+          # Use NVIDIA's devel image for Linux CUDA to ensure nvcc is available
+          CIBW_MANYLINUX_X86_64_IMAGE: ${{ matrix.backend == 'cuda' && 'nvidia/cuda:11.8.0-devel-centos7' || 'manylinux2014' }}
+
+          # Debug tip: build only for Python 3.9 in debug mode to save time
+          CIBW_BUILD: ${{ github.event.inputs.debug_mode == 'true' && 'cp39-*' || '*' }}
+
+          # Install build dependencies
+          CIBW_BEFORE_BUILD: pip install pybind11 numpy cmake
+
+          # Skip legacy Python versions and PyPy
+          CIBW_SKIP: cp36-* cp37-* pp*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.backend }}-${{ matrix.os }}
+          path: ./wheelhouse/*.whl
+
+  publish:
+    name: Publish to PyPI
+    # Trigger publishing only on actual tag pushes, not manual workflow runs
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [build_wheels]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # Mandatory for OIDC (Trusted Publishers) authentication
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: List wheels
+        run: ls -la dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # No password/token needed here; authentication is handled via OIDC
