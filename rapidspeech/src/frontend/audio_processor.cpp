@@ -1,5 +1,7 @@
 #include "frontend/audio_processor.h"
 #include <algorithm>
+#include <cmath>
+#include <chrono>
 #include <cassert>
 #include <cstring>
 #include <future>

@@ -3,7 +3,7 @@
 #include "ggml.h"
 #include "llm_model.h"
 #include <algorithm>
-#include <cmath>
+#include <stdexcept>
 #include <cstring>
 
 // ============================================

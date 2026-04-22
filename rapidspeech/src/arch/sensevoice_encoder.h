@@ -3,6 +3,7 @@
 #include "core/rs_context.h"
 #include "core/rs_model.h"
 #include <map>
+#include <cmath>
 #include <string>
 #include <vector>
 

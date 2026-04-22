@@ -1,6 +1,7 @@
 #include "llm_model.h"
 #include "ggml-backend.h"
 #include "gguf.h"
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <iostream>
