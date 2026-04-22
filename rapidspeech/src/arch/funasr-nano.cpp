@@ -666,12 +666,32 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
     ggml_tensor *k_out = result->get_kv_output_k(il);
     ggml_tensor *v_out = result->get_kv_output_v(il);
     if (k_out && v_out) {
-      size_t kv_size = (size_t)kv_dim * total_T;
+      // KV output tensors are 3D [head_dim, n_head_kv, n_tokens] (contiguous)
+      // Memory layout is equivalent to 2D [kv_dim, n_tokens] for contiguous tensors
+      size_t kv_bytes = ggml_nbytes(k_out);
+      size_t kv_size = kv_bytes / sizeof(float);
       host_kv_cache_k_[il].resize(kv_size);
       host_kv_cache_v_[il].resize(kv_size);
-      ggml_backend_tensor_get(k_out, host_kv_cache_k_[il].data(), 0, kv_size * sizeof(float));
-      ggml_backend_tensor_get(v_out, host_kv_cache_v_[il].data(), 0, kv_size * sizeof(float));
+      ggml_backend_tensor_get(k_out, host_kv_cache_k_[il].data(), 0, kv_bytes);
+      ggml_backend_tensor_get(v_out, host_kv_cache_v_[il].data(), 0, kv_bytes);
+    } else {
+      RS_LOG_ERR("Prefill KV output null for layer %d! k=%p v=%p", il, k_out, v_out);
     }
+  }
+
+  // Verify KV cache data integrity after prefill
+  {
+    float k_sum = 0.0f, v_sum = 0.0f;
+    if (!host_kv_cache_k_.empty() && !host_kv_cache_k_[0].empty()) {
+      size_t check_n = 16;
+      if (check_n > host_kv_cache_k_[0].size()) check_n = host_kv_cache_k_[0].size();
+      for (size_t i = 0; i < check_n; ++i) {
+        k_sum += host_kv_cache_k_[0][i];
+        v_sum += host_kv_cache_v_[0][i];
+      }
+    }
+    RS_LOG_INFO("Prefill KV cache: layer0 K_sum(16)=%.4f V_sum(16)=%.4f, n_cached=%d",
+                k_sum, v_sum, n_cached_tokens_);
   }
 
   ggml_free(ctx_llm);
@@ -715,6 +735,9 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
 
     // Build decode graph with K/V cache concat
     llm_pos decode_pos = (llm_pos)(n_cached_tokens_ + 2);  // +2 to match prefill position offset
+    RS_LOG_INFO("Decode step %d: pos=%d, n_cached=%d, input_token=%d (%s)",
+                step, (int)decode_pos, n_cached_tokens_, best_token,
+                llm_model_->vocab().get_token(best_token).text.c_str());
 
     struct ggml_init_params dec_input_params = {64 * ggml_tensor_overhead(), nullptr, true};
     struct ggml_context *ctx_dec_input = ggml_init(dec_input_params);
@@ -776,6 +799,9 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
         size_t kv_bytes = (size_t)kv_dim * n_cached_tokens_ * sizeof(float);
         ggml_backend_tensor_set(k_input, host_kv_cache_k_[il].data(), 0, kv_bytes);
         ggml_backend_tensor_set(v_input, host_kv_cache_v_[il].data(), 0, kv_bytes);
+      } else {
+        RS_LOG_ERR("Decode step %d: KV cache input tensors not found for layer %d! k=%p v=%p",
+                   step, il, k_input, v_input);
       }
     }
 
@@ -815,12 +841,20 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
       ggml_tensor *v_out = dec_result->get_kv_output_v(il);
       if (k_out && v_out) {
         int n_total = n_cached_tokens_ + 1;
-        host_kv_cache_k_[il].resize((size_t)kv_dim * n_total);
-        host_kv_cache_v_[il].resize((size_t)kv_dim * n_total);
-        ggml_backend_tensor_get(k_out, host_kv_cache_k_[il].data(), 0,
-                                (size_t)kv_dim * n_total * sizeof(float));
-        ggml_backend_tensor_get(v_out, host_kv_cache_v_[il].data(), 0,
-                                (size_t)kv_dim * n_total * sizeof(float));
+        if (il == 0) {
+          RS_LOG_INFO("Decode step %d: KV output K shape [%lld,%lld,%lld] n_total=%d",
+                      step, (long long)k_out->ne[0], (long long)k_out->ne[1],
+                      (long long)k_out->ne[2], n_total);
+        }
+        size_t kv_bytes = ggml_nbytes(k_out);
+        size_t kv_size = kv_bytes / sizeof(float);
+        host_kv_cache_k_[il].resize(kv_size);
+        host_kv_cache_v_[il].resize(kv_size);
+        ggml_backend_tensor_get(k_out, host_kv_cache_k_[il].data(), 0, kv_bytes);
+        ggml_backend_tensor_get(v_out, host_kv_cache_v_[il].data(), 0, kv_bytes);
+      } else {
+        RS_LOG_ERR("Decode step %d: KV output null for layer %d! k=%p v=%p",
+                   step, il, k_out, v_out);
       }
     }
 

@@ -263,7 +263,12 @@ public:
   void set_logits(ggml_tensor *logits) { t_logits_ = logits; }
   void set_embd(ggml_tensor *embd) { t_embd_ = embd; }
   void set_graph(ggml_cgraph *gf) { gf_ = gf; }
-  void set_ctx(ggml_context *ctx) { ctx_ = ctx; }
+  void set_ctx(ggml_context *ctx) {
+    if (ctx_ && ctx_ != ctx) {
+      ggml_free(ctx_);
+    }
+    ctx_ = ctx;
+  }
 
   // Set input data after graph allocation
   void set_input_data(ggml_tensor *tensor, const void *data, size_t size);

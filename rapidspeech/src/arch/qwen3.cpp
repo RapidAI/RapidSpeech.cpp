@@ -358,16 +358,7 @@ llm_build_qwen3::build_attention_layer(ggml_context *ctx, ggml_tensor *cur,
 
   const float scale = 1.0f / sqrtf(static_cast<float>(n_embd_head));
 
-  // DEBUG: Print Q, K, V shapes
-  printf("[DEBUG Layer %d] Q shape: [%lld, %lld, %lld]\n", il, (long long)q->ne[0], (long long)q->ne[1], (long long)q->ne[2]);
-  printf("[DEBUG Layer %d] K shape: [%lld, %lld, %lld]\n", il, (long long)k->ne[0], (long long)k->ne[1], (long long)k->ne[2]);
-  printf("[DEBUG Layer %d] V shape: [%lld, %lld, %lld]\n", il, (long long)v->ne[0], (long long)v->ne[1], (long long)v->ne[2]);
-  printf("[DEBUG Layer %d] K_final shape: [%lld, %lld, %lld]\n", il, (long long)k_final->ne[0], (long long)k_final->ne[1], (long long)k_final->ne[2]);
-  printf("[DEBUG Layer %d] V_final shape: [%lld, %lld, %lld]\n", il, (long long)v_final->ne[0], (long long)v_final->ne[1], (long long)v_final->ne[2]);
-  printf("[DEBUG Layer %d] scale: %f\n", il, scale);
-  if (causal_mask) {
-    printf("[DEBUG Layer %d] causal_mask shape: [%lld, %lld]\n", il, (long long)causal_mask->ne[0], (long long)causal_mask->ne[1]);
-  }
+
 
   int n_heads_q = q->ne[2]; // 16
   int n_heads_kv = k->ne[2]; // 8
@@ -399,8 +390,7 @@ llm_build_qwen3::build_attention_layer(ggml_context *ctx, ggml_tensor *cur,
                                 n_head, n_head_kv);
   }
 
-  // DEBUG: Print attention output shape
-  printf("[DEBUG Layer %d] Attention output shape (before reshape): [%lld, %lld, %lld]\n", il, (long long)cur->ne[0], (long long)cur->ne[1], (long long)cur->ne[2]);
+
 
   // Reshape from [head_dim, n_head, n_tokens] to [head_dim * n_head, n_tokens]
   // Note: head_dim * n_head may differ from n_embd in some architectures

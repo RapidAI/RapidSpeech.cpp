@@ -79,25 +79,27 @@ void llm_graph_result::add_intermediate_output(ggml_tensor *tensor) {
 
 void llm_graph_result::set_input_data(ggml_tensor *tensor, const void *data,
                                       size_t size) {
-  if (tensor && tensor->data && data) {
-    memcpy(tensor->data, data, size);
+  if (tensor && data && size > 0) {
+    ggml_backend_tensor_set(tensor, data, 0, size);
   }
 }
 
 void llm_graph_result::set_position_ids(ggml_tensor *positions,
                                         const llm_pos *pos, uint32_t n_tokens) {
-  if (!positions || !positions->data) {
+  if (!positions) {
     return;
   }
 
   if (pos) {
-    memcpy(positions->data, pos, n_tokens * sizeof(llm_pos));
+    ggml_backend_tensor_set(positions, pos, 0, n_tokens * sizeof(llm_pos));
   } else {
     // Default: sequential positions 0, 1, 2, ..., n_tokens-1
-    int32_t *pos_data = static_cast<int32_t *>(positions->data);
+    std::vector<llm_pos> default_pos(n_tokens);
     for (uint32_t i = 0; i < n_tokens; ++i) {
-      pos_data[i] = static_cast<int32_t>(i);
+      default_pos[i] = static_cast<llm_pos>(i);
     }
+    ggml_backend_tensor_set(positions, default_pos.data(), 0,
+                            n_tokens * sizeof(llm_pos));
   }
 }
 
@@ -315,22 +317,27 @@ llm_graph_builder::build_kv_cache_lookup(ggml_context *ctx, ggml_tensor *k_cur,
   (void)il;
 
   if (current_opts_.use_kv_cache) {
-    // Make contiguous and mark as output so we can extract after compute
-    ggml_tensor *k_out = ggml_cont(ctx, k_cur);
-    ggml_tensor *v_out = ggml_cont(ctx, v_cur);
+    // Create contiguous 3D copies for both attention computation and output extraction
+    // For contiguous tensors, 3D [head_dim, n_head_kv, n_tokens] and
+    // 2D [kv_dim, n_tokens] have identical memory layout, so we can extract
+    // data directly from the 3D tensor without creating a separate 2D output.
+    ggml_tensor *k_3d = ggml_cont(ctx, k_cur);
+    ggml_tensor *v_3d = ggml_cont(ctx, v_cur);
 
     char k_name[64], v_name[64];
     snprintf(k_name, sizeof(k_name), "kv_k_layer_%d", il);
     snprintf(v_name, sizeof(v_name), "kv_v_layer_%d", il);
-    ggml_set_name(k_out, k_name);
-    ggml_set_name(v_out, v_name);
+    ggml_set_name(k_3d, k_name);
+    ggml_set_name(v_3d, v_name);
 
-    ggml_set_output(k_out);
-    ggml_set_output(v_out);
-    tmp_kv_outputs_k_.push_back(k_out);
-    tmp_kv_outputs_v_.push_back(v_out);
+    // Mark the 3D contiguous tensors as output for host-side extraction
+    ggml_set_output(k_3d);
+    ggml_set_output(v_3d);
+    tmp_kv_outputs_k_.push_back(k_3d);
+    tmp_kv_outputs_v_.push_back(v_3d);
 
-    return {k_out, v_out};
+    // Return 3D tensors for attention computation
+    return {k_3d, v_3d};
   }
 
   return {k_cur, v_cur};
@@ -367,19 +374,27 @@ llm_graph_builder::build_kv_cache_concat(ggml_context *ctx, ggml_tensor *k_cur,
   ggml_tensor *k_final_2d = ggml_concat(ctx, k_cached, k_cur_2d, 1);
   ggml_tensor *v_final_2d = ggml_concat(ctx, v_cached, v_cur_2d, 1);
 
-  // Reshape back to 3D: [head_dim, n_head_kv, n_cached + n_tokens]
-  const int64_t n_total = n_cached + (int64_t)k_cur->ne[2];
-  ggml_tensor *k_final = ggml_reshape_3d(ctx, ggml_cont(ctx, k_final_2d),
-                                          head_dim, n_head_kv, n_total);
-  ggml_tensor *v_final = ggml_reshape_3d(ctx, ggml_cont(ctx, v_final_2d),
-                                          head_dim, n_head_kv, n_total);
+  // Make contiguous copies of 2D concat results
+  ggml_tensor *k_cont_2d = ggml_cont(ctx, k_final_2d);
+  ggml_tensor *v_cont_2d = ggml_cont(ctx, v_final_2d);
 
-  // Mark as output for host-side extraction
+  // Reshape to 3D for attention: [head_dim, n_head_kv, n_cached + n_tokens]
+  const int64_t n_total = n_cached + (int64_t)k_cur->ne[2];
+  ggml_tensor *k_final = ggml_reshape_3d(ctx, k_cont_2d, head_dim, n_head_kv, n_total);
+  ggml_tensor *v_final = ggml_reshape_3d(ctx, v_cont_2d, head_dim, n_head_kv, n_total);
+
+  // Mark 2D outputs for consistent host-side extraction
   if (current_opts_.use_kv_cache) {
-    ggml_set_output(k_final);
-    ggml_set_output(v_final);
-    tmp_kv_outputs_k_.push_back(k_final);
-    tmp_kv_outputs_v_.push_back(v_final);
+    char k_name[64], v_name[64];
+    snprintf(k_name, sizeof(k_name), "kv_k_layer_%d", il);
+    snprintf(v_name, sizeof(v_name), "kv_v_layer_%d", il);
+    ggml_set_name(k_cont_2d, k_name);
+    ggml_set_name(v_cont_2d, v_name);
+
+    ggml_set_output(k_cont_2d);
+    ggml_set_output(v_cont_2d);
+    tmp_kv_outputs_k_.push_back(k_cont_2d);
+    tmp_kv_outputs_v_.push_back(v_cont_2d);
   }
 
   return {k_final, v_final};
