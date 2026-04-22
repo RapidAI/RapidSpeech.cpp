@@ -443,9 +443,11 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   const int llm_dim = llm_model_->hparams().n_embd;    // Qwen3 hidden dim
 
   // Build prompt
-  std::string user_input = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n" + sv_state.user_input; // Default: "语音转写"
+  std::string user_input = "<|im_start|>system\nYou are a helpful "
+                           "assistant.<|im_end|>\n<|im_start|>user\n" +
+                           sv_state.user_input; // Default: "语音转写"
   std::string suffix_input = "<|im_end|>\n<|im_start|>assistant\n";
-    // Tokenize user_input
+  // Tokenize user_input
   std::vector<int32_t> prefix_tokens;
   std::vector<int32_t> suffix_tokens;
   if (llm_model_) {
@@ -453,14 +455,13 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   }
 
   if (llm_model_) {
-      suffix_tokens = llm_model_->vocab().tokenize(suffix_input, false);
+    suffix_tokens = llm_model_->vocab().tokenize(suffix_input, false);
   }
   int audio_insert_idx = (int)prefix_tokens.size();
   int total_T = audio_insert_idx + audio_T + (int)suffix_tokens.size();
 
-  RS_LOG_INFO(
-      "DecodeWithLLM: user_tokens=%d, audio_frames=%d, total_T=%d",
-      audio_insert_idx, audio_T, total_T);
+  RS_LOG_INFO("DecodeWithLLM: user_tokens=%d, audio_frames=%d, total_T=%d",
+              audio_insert_idx, audio_T, total_T);
 
   // 2. Create graph builder context
   llm_cparams cparams;
@@ -502,13 +503,13 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
       ggml_new_tensor_1d(ctx_proj, GGML_TYPE_I32, audio_insert_idx);
   ggml_set_name(inp_prefix_tokens, "input_prefix_tokens");
   ggml_tensor *inp_suffix_tokens =
-        ggml_new_tensor_1d(ctx_proj, GGML_TYPE_I32, suffix_tokens.size());
-    ggml_set_name(inp_suffix_tokens, "input_suffix_tokens");
+      ggml_new_tensor_1d(ctx_proj, GGML_TYPE_I32, suffix_tokens.size());
+  ggml_set_name(inp_suffix_tokens, "input_suffix_tokens");
   ggml_set_input(inp_prefix_tokens);
   ggml_tensor *prefix_embeds =
       ggml_get_rows(ctx_proj, llm_model_->tok_embd(), inp_prefix_tokens);
   ggml_tensor *suffix_embeds =
-        ggml_get_rows(ctx_proj, llm_model_->tok_embd(), inp_suffix_tokens);
+      ggml_get_rows(ctx_proj, llm_model_->tok_embd(), inp_suffix_tokens);
   // 3b. Audio encoder output -> projected to LLM space
   ggml_tensor *audio_encoder_out = ggml_new_tensor_2d(
       ctx_proj, sv_state.encoder_out->type, encoder_dim, audio_T);
@@ -517,7 +518,8 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
       decoder_forward(hparams_, ctx_proj, audio_encoder_out, *audio_adaptor_);
 
   // 3c. Concatenate: prefix + audio
-  ggml_tensor *llm_embeds = ggml_concat(ctx_proj, prefix_embeds, audio_embeds, 1);
+  ggml_tensor *llm_embeds =
+      ggml_concat(ctx_proj, prefix_embeds, audio_embeds, 1);
   llm_embeds = ggml_concat(ctx_proj, llm_embeds, suffix_embeds, 1);
   ggml_set_output(llm_embeds);
   ggml_build_forward_expand(gf_proj, llm_embeds);
@@ -533,7 +535,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   ggml_backend_tensor_set(inp_prefix_tokens, prefix_tokens.data(), 0,
                           prefix_tokens.size() * sizeof(int32_t));
   ggml_backend_tensor_set(inp_suffix_tokens, suffix_tokens.data(), 0,
-                            suffix_tokens.size() * sizeof(int32_t));
+                          suffix_tokens.size() * sizeof(int32_t));
 
   if (ggml_backend_sched_graph_compute(sched, gf_proj) != GGML_STATUS_SUCCESS) {
     ggml_free(ctx_proj);
@@ -551,7 +553,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   // 6. Build positions for LLM
   std::vector<llm_pos> positions(total_T);
   for (int i = 0; i < total_T; ++i) {
-    positions[i] = i + 2;  // Position ids start from 2 (matches Python)
+    positions[i] = i + 2; // Position ids start from 2 (matches Python)
   }
 
   // 7. Create graph context and input tensor for LLM
@@ -569,7 +571,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   llm_build_opts opts;
   opts.output_mode = llm_output_mode::OUTPUT_LOGITS;
   opts.skip_embeddings = true;
-  opts.use_kv_cache = true;   // Enable KV extraction for decode loop
+  opts.use_kv_cache = true; // Enable KV extraction for decode loop
   opts.causal_mask = true;
 
   auto result = llm_graph_builder_->build_graph_from_embeds(
@@ -600,7 +602,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   if (positions_tensor) {
     result->set_position_ids(positions_tensor, positions.data(), total_T);
     RS_LOG_INFO("Prefill: set position_ids, first=%d last=%d, n_tokens=%d",
-                (int)positions[0], (int)positions[total_T-1], total_T);
+                (int)positions[0], (int)positions[total_T - 1], total_T);
   } else {
     RS_LOG_ERR("Prefill: position_ids tensor not found!");
   }
@@ -610,7 +612,8 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   if (causal_mask_tensor) {
     result->set_causal_mask(causal_mask_tensor, total_T, 0);
     RS_LOG_INFO("Prefill: set causal_mask, shape [%lld,%lld] type=%s",
-                (long long)causal_mask_tensor->ne[0], (long long)causal_mask_tensor->ne[1],
+                (long long)causal_mask_tensor->ne[0],
+                (long long)causal_mask_tensor->ne[1],
                 ggml_type_name(causal_mask_tensor->type));
   } else {
     RS_LOG_ERR("Prefill: causal_mask tensor not found!");
@@ -643,12 +646,23 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
     int nan_count = 0, inf_count = 0;
     for (int v = 0; v < n_vocab; ++v) {
       float val = logits_host[v + last_t * n_vocab];
-      if (std::isnan(val)) { nan_count++; continue; }
-      if (std::isinf(val)) { inf_count++; continue; }
-      if (val > max_logit) { max_logit = val; max_idx = v; }
-      if (val < min_logit) min_logit = val;
+      if (std::isnan(val)) {
+        nan_count++;
+        continue;
+      }
+      if (std::isinf(val)) {
+        inf_count++;
+        continue;
+      }
+      if (val > max_logit) {
+        max_logit = val;
+        max_idx = v;
+      }
+      if (val < min_logit)
+        min_logit = val;
     }
-    RS_LOG_INFO("Prefill logits at last pos: min=%.4f max=%.4f max_idx=%d nan=%d inf=%d (n_vocab=%d)",
+    RS_LOG_INFO("Prefill logits at last pos: min=%.4f max=%.4f max_idx=%d "
+                "nan=%d inf=%d (n_vocab=%d)",
                 min_logit, max_logit, max_idx, nan_count, inf_count, n_vocab);
   }
 
@@ -693,7 +707,8 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
     ggml_tensor *v_out = result->get_kv_output_v(il);
     if (k_out && v_out) {
       // KV output tensors are 3D [head_dim, n_head_kv, n_tokens] (contiguous)
-      // Memory layout is equivalent to 2D [kv_dim, n_tokens] for contiguous tensors
+      // Memory layout is equivalent to 2D [kv_dim, n_tokens] for contiguous
+      // tensors
       size_t kv_bytes = ggml_nbytes(k_out);
       size_t kv_size = kv_bytes / sizeof(float);
       host_kv_cache_k_[il].resize(kv_size);
@@ -701,7 +716,8 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
       ggml_backend_tensor_get(k_out, host_kv_cache_k_[il].data(), 0, kv_bytes);
       ggml_backend_tensor_get(v_out, host_kv_cache_v_[il].data(), 0, kv_bytes);
     } else {
-      RS_LOG_ERR("Prefill KV output null for layer %d! k=%p v=%p", il, k_out, v_out);
+      RS_LOG_ERR("Prefill KV output null for layer %d! k=%p v=%p", il, k_out,
+                 v_out);
     }
   }
 
@@ -710,14 +726,16 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
     float k_sum = 0.0f, v_sum = 0.0f;
     if (!host_kv_cache_k_.empty() && !host_kv_cache_k_[0].empty()) {
       size_t check_n = 16;
-      if (check_n > host_kv_cache_k_[0].size()) check_n = host_kv_cache_k_[0].size();
+      if (check_n > host_kv_cache_k_[0].size())
+        check_n = host_kv_cache_k_[0].size();
       for (size_t i = 0; i < check_n; ++i) {
         k_sum += host_kv_cache_k_[0][i];
         v_sum += host_kv_cache_v_[0][i];
       }
     }
-    RS_LOG_INFO("Prefill KV cache: layer0 K_sum(16)=%.4f V_sum(16)=%.4f, n_cached=%d",
-                k_sum, v_sum, n_cached_tokens_);
+    RS_LOG_INFO(
+        "Prefill KV cache: layer0 K_sum(16)=%.4f V_sum(16)=%.4f, n_cached=%d",
+        k_sum, v_sum, n_cached_tokens_);
   }
 
   ggml_free(ctx_llm);
@@ -735,10 +753,12 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
     {
       const int64_t emb_max_nodes = 16;
       struct ggml_init_params emb_params = {
-          emb_max_nodes * ggml_tensor_overhead() + emb_max_nodes * sizeof(ggml_tensor *) * 2 + (1 << 16),
+          emb_max_nodes * ggml_tensor_overhead() +
+              emb_max_nodes * sizeof(ggml_tensor *) * 2 + (1 << 16),
           nullptr, true};
       struct ggml_context *ctx_emb = ggml_init(emb_params);
-      struct ggml_cgraph *gf_emb = ggml_new_graph_custom(ctx_emb, emb_max_nodes, false);
+      struct ggml_cgraph *gf_emb =
+          ggml_new_graph_custom(ctx_emb, emb_max_nodes, false);
       ggml_tensor *inp_tok = ggml_new_tensor_1d(ctx_emb, GGML_TYPE_I32, 1);
       ggml_set_input(inp_tok);
       ggml_tensor *emb_out = ggml_get_rows(ctx_emb, tok_embd, inp_tok);
@@ -750,22 +770,26 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
         break;
       }
       ggml_backend_tensor_set(inp_tok, &best_token, 0, sizeof(int32_t));
-      if (ggml_backend_sched_graph_compute(sched, gf_emb) != GGML_STATUS_SUCCESS) {
+      if (ggml_backend_sched_graph_compute(sched, gf_emb) !=
+          GGML_STATUS_SUCCESS) {
         ggml_free(ctx_emb);
         break;
       }
-      ggml_backend_tensor_get(emb_out, token_embed_host.data(), 0, llm_dim * sizeof(float));
+      ggml_backend_tensor_get(emb_out, token_embed_host.data(), 0,
+                              llm_dim * sizeof(float));
       ggml_free(ctx_emb);
       ggml_backend_sched_reset(sched);
     }
 
     // Build decode graph with K/V cache concat
-    llm_pos decode_pos = (llm_pos)(n_cached_tokens_ + 2);  // +2 to match prefill position offset
+    llm_pos decode_pos =
+        (llm_pos)(n_cached_tokens_ + 2); // +2 to match prefill position offset
     RS_LOG_INFO("Decode step %d: pos=%d, n_cached=%d, input_token=%d (%s)",
                 step, (int)decode_pos, n_cached_tokens_, best_token,
                 llm_model_->vocab().get_token(best_token).text.c_str());
 
-    struct ggml_init_params dec_input_params = {64 * ggml_tensor_overhead(), nullptr, true};
+    struct ggml_init_params dec_input_params = {64 * ggml_tensor_overhead(),
+                                                nullptr, true};
     struct ggml_context *ctx_dec_input = ggml_init(dec_input_params);
 
     ggml_tensor *dec_embeds =
@@ -801,7 +825,8 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
 
     // Set position IDs
     ggml_tensor *dec_pos_tensor = dec_result->get_input_tensor("position_ids");
-    if (!dec_pos_tensor) dec_pos_tensor = dec_result->get_input_tensor("position_ids_seq");
+    if (!dec_pos_tensor)
+      dec_pos_tensor = dec_result->get_input_tensor("position_ids_seq");
     if (dec_pos_tensor) {
       dec_result->set_position_ids(dec_pos_tensor, &decode_pos, 1);
     }
@@ -824,16 +849,20 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
 
       if (k_input && v_input) {
         size_t kv_bytes = (size_t)kv_dim * n_cached_tokens_ * sizeof(float);
-        ggml_backend_tensor_set(k_input, host_kv_cache_k_[il].data(), 0, kv_bytes);
-        ggml_backend_tensor_set(v_input, host_kv_cache_v_[il].data(), 0, kv_bytes);
+        ggml_backend_tensor_set(k_input, host_kv_cache_k_[il].data(), 0,
+                                kv_bytes);
+        ggml_backend_tensor_set(v_input, host_kv_cache_v_[il].data(), 0,
+                                kv_bytes);
       } else {
-        RS_LOG_ERR("Decode step %d: KV cache input tensors not found for layer %d! k=%p v=%p",
+        RS_LOG_ERR("Decode step %d: KV cache input tensors not found for layer "
+                   "%d! k=%p v=%p",
                    step, il, k_input, v_input);
       }
     }
 
     // Execute decode step
-    if (ggml_backend_sched_graph_compute(sched, dec_result->get_graph()) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_sched_graph_compute(sched, dec_result->get_graph()) !=
+        GGML_STATUS_SUCCESS) {
       RS_LOG_ERR("Decode graph compute failed at step %d", step);
       ggml_free(ctx_dec_input);
       break;
@@ -848,7 +877,8 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
     }
 
     std::vector<float> dec_logits_host(n_vocab);
-    ggml_backend_tensor_get(dec_logits, dec_logits_host.data(), 0, n_vocab * sizeof(float));
+    ggml_backend_tensor_get(dec_logits, dec_logits_host.data(), 0,
+                            n_vocab * sizeof(float));
 
     int32_t next_token = 0;
     float next_prob = dec_logits_host[0];
@@ -869,16 +899,19 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
       if (k_out && v_out) {
         int n_total = n_cached_tokens_ + 1;
         if (il == 0) {
-          RS_LOG_INFO("Decode step %d: KV output K shape [%lld,%lld,%lld] n_total=%d",
-                      step, (long long)k_out->ne[0], (long long)k_out->ne[1],
-                      (long long)k_out->ne[2], n_total);
+          RS_LOG_INFO(
+              "Decode step %d: KV output K shape [%lld,%lld,%lld] n_total=%d",
+              step, (long long)k_out->ne[0], (long long)k_out->ne[1],
+              (long long)k_out->ne[2], n_total);
         }
         size_t kv_bytes = ggml_nbytes(k_out);
         size_t kv_size = kv_bytes / sizeof(float);
         host_kv_cache_k_[il].resize(kv_size);
         host_kv_cache_v_[il].resize(kv_size);
-        ggml_backend_tensor_get(k_out, host_kv_cache_k_[il].data(), 0, kv_bytes);
-        ggml_backend_tensor_get(v_out, host_kv_cache_v_[il].data(), 0, kv_bytes);
+        ggml_backend_tensor_get(k_out, host_kv_cache_k_[il].data(), 0,
+                                kv_bytes);
+        ggml_backend_tensor_get(v_out, host_kv_cache_v_[il].data(), 0,
+                                kv_bytes);
       } else {
         RS_LOG_ERR("Decode step %d: KV output null for layer %d! k=%p v=%p",
                    step, il, k_out, v_out);

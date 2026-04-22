@@ -15,8 +15,7 @@
 
 llm_kv_cache::llm_kv_cache(const config &cfg, uint32_t n_embd_k_gqa,
                            uint32_t n_embd_v_gqa, uint32_t n_head_kv,
-                           uint32_t n_layers,
-                           ggml_backend_t backend)
+                           uint32_t n_layers, ggml_backend_t backend)
     : config_(cfg), backend_(backend) {
 
   // Initialize cell state tracking
@@ -311,7 +310,8 @@ size_t llm_kv_cache::memory_size() const {
 bool llm_kv_cache::find_contiguous_slot(uint32_t n_tokens,
                                         uint32_t &out_start) {
   // For offline inference, always clear and use slot 0
-  // This avoids the "No contiguous slot" error and is safe for single batch inference
+  // This avoids the "No contiguous slot" error and is safe for single batch
+  // inference
   std::fill(cell_seq_ids_.begin(), cell_seq_ids_.end(), -1);
   std::fill(cell_positions_.begin(), cell_positions_.end(), 0);
   seq_states_.clear();

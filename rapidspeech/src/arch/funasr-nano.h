@@ -107,7 +107,8 @@ private:
   std::unique_ptr<llm_build_qwen3> llm_graph_builder_;
 
   // Host-side KV cache for autoregressive decode
-  // Per-layer K/V cache: [head_dim * n_head_kv * n_cached] in 2D layout [head_dim * n_head_kv, n_cached]
+  // Per-layer K/V cache: [head_dim * n_head_kv * n_cached] in 2D layout
+  // [head_dim * n_head_kv, n_cached]
   std::vector<std::vector<float>> host_kv_cache_k_;
   std::vector<std::vector<float>> host_kv_cache_v_;
   uint32_t n_cached_tokens_ = 0;

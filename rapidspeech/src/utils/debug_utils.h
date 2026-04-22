@@ -83,8 +83,8 @@ static void print_tensor(struct ggml_tensor *t) {
   }
   printf("%s: %24s = (%s) %10s(%s,{%s},{%s}, %s}) \n", __func__, t->name,
          ggml_type_name(t->type), ggml_op_desc(t),
-         src0 ? ggml_ne_string(src0).c_str() : "", src1 ? src1_str : "", src2 ? src2_str : "",
-         ggml_ne_string(t).c_str());
+         src0 ? ggml_ne_string(src0).c_str() : "", src1 ? src1_str : "",
+         src2 ? src2_str : "", ggml_ne_string(t).c_str());
 
   ggml_print_tensor((uint8_t *)t->data, t->type, t->ne, t->nb, 8);
   printf("\n");
@@ -96,7 +96,6 @@ static bool ggml_debug(struct ggml_tensor *t, bool ask, void *user_data) {
   const struct ggml_tensor *src0 = t->src[0];
   const struct ggml_tensor *src1 = t->src[1];
   const struct ggml_tensor *src2 = t->src[2];
-
 
   if (ask) {
     return true; // Always retrieve data
@@ -115,8 +114,8 @@ static bool ggml_debug(struct ggml_tensor *t, bool ask, void *user_data) {
 
   printf("%s: %24s = (%s) %10s(%s{%s} %s %s}) = {%s}\n", __func__, t->name,
          ggml_type_name(t->type), ggml_op_desc(t), src0->name,
-         ggml_ne_string(src0).c_str(), src1 ? src1_str : "", src2 ? src2_str : "",
-         ggml_ne_string(t).c_str());
+         ggml_ne_string(src0).c_str(), src1 ? src1_str : "",
+         src2 ? src2_str : "", ggml_ne_string(t).c_str());
 
   // copy the data from the GPU memory if needed
   const bool is_host = ggml_backend_buffer_is_host(t->buffer);

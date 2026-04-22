@@ -164,8 +164,9 @@ struct llm_build_opts {
   bool causal_mask = true;     // Use causal attention mask
 
   // Decode mode control
-  bool is_decode_step = false; // true = decode step (n_tokens=1, concat cached K/V)
-  uint32_t n_kv_cache = 0;    // Number of cached KV pairs for decode step
+  bool is_decode_step =
+      false;               // true = decode step (n_tokens=1, concat cached K/V)
+  uint32_t n_kv_cache = 0; // Number of cached KV pairs for decode step
 
   // Input control
   bool input_is_embeds = false; // Input is embeddings, not token IDs

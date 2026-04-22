@@ -1,7 +1,7 @@
 #pragma once
 
-#include <vector>
 #include <cstdint>
+#include <vector>
 /**
  * WAV header， 16bit PCM
  */
