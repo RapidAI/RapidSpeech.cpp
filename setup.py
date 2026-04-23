@@ -42,17 +42,10 @@ def need_split_package():
     return ans is not None
 
 def get_binaries():
-    binaries = [
-        "rs-asr-offline",
-        "rapidspeech"
-    ]
-
-    if is_windows():
-        binaries += [
-            "librapidspeech.dll",
-        ]
-
-    return binaries
+    # No binaries needed for Python wheel — all shared libraries and the
+    # pybind11 module are installed by cmake into the package directory.
+    # rs-asr-offline is a CLI tool, not needed for Python bindings.
+    return []
 
 def get_package_name():
     backend = os.environ.get("RS_BACKEND", "cpu").lower()
@@ -230,20 +223,9 @@ def get_binaries_to_install():
     if need_split_package():
         return None
 
-    cmake_args = os.environ.get("RAPIDSPEECH_CMAKE_ARGS", "")
-
-    bin_dir = Path("build")
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    suffix = ".exe" if is_windows() else ""
-
-    binaries = get_binaries()
-
-    exe = []
-    for f in binaries:
-        suffix = "" if (".dll" in f or ".lib" in f) else suffix
-        t = bin_dir / (f + suffix)
-        exe.append(str(t))
-    return exe
+    # No binaries to install via data_files for Python wheel.
+    # All shared libs are installed by cmake into the package directory.
+    return []
 
 
 setuptools.setup(
