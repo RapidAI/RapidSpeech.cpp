@@ -157,10 +157,32 @@ if (RS_ENABLE_PYTHON)
             rapidspeech/python/pybind_rapidspeech.cpp
     )
 
-
+    # Install the pybind11 module directly into the package root
+    # so that `import rapidspeech` finds it without path tricks.
     install(TARGETS rapidspeech
-            LIBRARY DESTINATION lib
+            LIBRARY DESTINATION .     # Linux/macOS: rapidspeech/*.so
+            RUNTIME DESTINATION .     # Windows:     rapidspeech/*.pyd
     )
+
+    # Install rapidspeech-core shared library next to the pybind module
+    # so that the OS loader can find it at runtime.
+    install(TARGETS rapidspeech-core
+            LIBRARY DESTINATION .     # Linux/macOS
+            RUNTIME DESTINATION .     # Windows (.dll)
+    )
+
+    # Install ggml shared libraries next to the pybind module
+    # so that the OS loader finds all transitive dependencies.
+    install(TARGETS ggml ggml-base
+            LIBRARY DESTINATION .
+            RUNTIME DESTINATION .
+    )
+    if (TARGET ggml-cpu)
+        install(TARGETS ggml-cpu
+                LIBRARY DESTINATION .
+                RUNTIME DESTINATION .
+        )
+    endif()
 
     target_link_libraries(rapidspeech
             PRIVATE rapidspeech-core

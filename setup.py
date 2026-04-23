@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
-import glob
 import os
 import platform
-import re
-import shutil
 import sys
 from pathlib import Path
 from setuptools.command.build_ext import build_ext
@@ -184,20 +181,9 @@ class BuildExtension(build_ext):
                 )
 
 
-        dst = os.path.join(f"{self.build_lib}")
-        os.system(f"mkdir {dst}")
-        os.system(f"dir {dst}")
-
-        ext = "pyd" if sys.platform.startswith("win") else "so"
-        pattern = os.path.join(self.build_temp, "**", f"rapidspeech.*.{ext}")
-        matches = glob.glob(pattern, recursive=True)
-        print("matches", list(matches))
-
-        for f in matches:
-            print('@'*100)
-            print(f, os.path.join(f"{self.build_temp}"))
-            shutil.copy(f"{f}", dst)
-            os.system(f"dir {dst}")
+        # cmake install already places all files (pybind module, shared libs,
+        # headers) into build_lib/rapidspeech/ which is the correct location
+        # for the Python package.  No manual copy needed.
 
 
 
