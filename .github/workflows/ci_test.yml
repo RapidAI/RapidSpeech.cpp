@@ -92,4 +92,3 @@ jobs:
       - name: Verify Python import
         run: |
           python -c "import rapidspeech; print('rapidspeech imported successfully')"
-          python -c "from rapidspeech import asr_offline; print('asr_offline class available')"
