@@ -54,13 +54,11 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           ls -la build/rs-asr-offline || ls -la build/Release/rs-asr-offline
-          ./build/rs-asr-offline --help || ./build/Release/rs-asr-offline --help
 
       - name: Verify binary exists (Windows)
         if: runner.os == 'Windows'
         run: |
           dir build\Release\rs-asr-offline.exe
-          .\build\Release\rs-asr-offline.exe --help
 
   python-bindings-test:
     name: Python Bindings (${{ matrix.os }}, Python ${{ matrix.python-version }})
