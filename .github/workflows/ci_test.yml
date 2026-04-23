@@ -38,8 +38,13 @@ jobs:
         run: |
           cmake -B build -G "${{ matrix.cmake_generator }}" -DRS_BUILD_TESTS=ON
 
-      - name: Build
-        run: cmake --build build --config Release -- -j4 2>/dev/null || cmake --build build --config Release
+      - name: Build (Unix)
+        if: runner.os != 'Windows'
+        run: cmake --build build --config Release
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: cmake --build build --config Release
 
       - name: Run CTest
         working-directory: build
@@ -63,7 +68,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.9", "3.10", "3.11", "3.12"]
 
     steps:
