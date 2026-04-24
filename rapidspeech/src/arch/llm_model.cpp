@@ -26,6 +26,119 @@ static std::map<std::string, model_loader_fn> &get_model_registry() {
   return registry;
 }
 
+
+// GPT-2 style byte-to-unicode mapping table
+// Maps each byte (0x00-0xFF) to its Unicode representation
+// This ensures all tokens are valid printable Unicode strings
+static const char *BYTE_ENCODER[256] = {
+    "\xc4\x80", "\xc4\x81", "\xc4\x82", "\xc4\x83", "\xc4\x84", "\xc4\x85",
+    "\xc4\x86", "\xc4\x87", "\xc4\x88", "\xc4\x89", "\xc4\x8a", "\xc4\x8b",
+    "\xc4\x8c", "\xc4\x8d", "\xc4\x8e", "\xc4\x8f", "\xc4\x90", "\xc4\x91",
+    "\xc4\x92", "\xc4\x93", "\xc4\x94", "\xc4\x95", "\xc4\x96", "\xc4\x97",
+    "\xc4\x98", "\xc4\x99", "\xc4\x9a", "\xc4\x9b", "\xc4\x9c", "\xc4\x9d",
+    "\xc4\x9e", "\xc4\x9f", "\xc4\xa0", "\x21",     "\x22",     "\x23",
+    "\x24",     "\x25",     "\x26",     "\x27",     "\x28",     "\x29",
+    "\x2a",     "\x2b",     "\x2c",     "\x2d",     "\x2e",     "\x2f",
+    "\x30",     "\x31",     "\x32",     "\x33",     "\x34",     "\x35",
+    "\x36",     "\x37",     "\x38",     "\x39",     "\x3a",     "\x3b",
+    "\x3c",     "\x3d",     "\x3e",     "\x3f",     "\x40",     "\x41",
+    "\x42",     "\x43",     "\x44",     "\x45",     "\x46",     "\x47",
+    "\x48",     "\x49",     "\x4a",     "\x4b",     "\x4c",     "\x4d",
+    "\x4e",     "\x4f",     "\x50",     "\x51",     "\x52",     "\x53",
+    "\x54",     "\x55",     "\x56",     "\x57",     "\x58",     "\x59",
+    "\x5a",     "\x5b",     "\x5c",     "\x5d",     "\x5e",     "\x5f",
+    "\x60",     "\x61",     "\x62",     "\x63",     "\x64",     "\x65",
+    "\x66",     "\x67",     "\x68",     "\x69",     "\x6a",     "\x6b",
+    "\x6c",     "\x6d",     "\x6e",     "\x6f",     "\x70",     "\x71",
+    "\x72",     "\x73",     "\x74",     "\x75",     "\x76",     "\x77",
+    "\x78",     "\x79",     "\x7a",     "\x7b",     "\x7c",     "\x7d",
+    "\x7e",     "\xc4\xa1", "\xc4\xa2", "\xc4\xa3", "\xc4\xa4", "\xc4\xa5",
+    "\xc4\xa6", "\xc4\xa7", "\xc4\xa8", "\xc4\xa9", "\xc4\xaa", "\xc4\xab",
+    "\xc4\xac", "\xc4\xad", "\xc4\xae", "\xc4\xaf", "\xc4\xb0", "\xc4\xb1",
+    "\xc4\xb2", "\xc4\xb3", "\xc4\xb4", "\xc4\xb5", "\xc4\xb6", "\xc4\xb7",
+    "\xc4\xb8", "\xc4\xb9", "\xc4\xba", "\xc4\xbb", "\xc4\xbc", "\xc4\xbd",
+    "\xc4\xbe", "\xc4\xbf", "\xc5\x80", "\xc5\x81", "\xc5\x82", "\xc2\xa1",
+    "\xc2\xa2", "\xc2\xa3", "\xc2\xa4", "\xc2\xa5", "\xc2\xa6", "\xc2\xa7",
+    "\xc2\xa8", "\xc2\xa9", "\xc2\xaa", "\xc2\xab", "\xc2\xac", "\xc5\x83",
+    "\xc2\xae", "\xc2\xaf", "\xc2\xb0", "\xc2\xb1", "\xc2\xb2", "\xc2\xb3",
+    "\xc2\xb4", "\xc2\xb5", "\xc2\xb6", "\xc2\xb7", "\xc2\xb8", "\xc2\xb9",
+    "\xc2\xba", "\xc2\xbb", "\xc2\xbc", "\xc2\xbd", "\xc2\xbe", "\xc2\xbf",
+    "\xc3\x80", "\xc3\x81", "\xc3\x82", "\xc3\x83", "\xc3\x84", "\xc3\x85",
+    "\xc3\x86", "\xc3\x87", "\xc3\x88", "\xc3\x89", "\xc3\x8a", "\xc3\x8b",
+    "\xc3\x8c", "\xc3\x8d", "\xc3\x8e", "\xc3\x8f", "\xc3\x90", "\xc3\x91",
+    "\xc3\x92", "\xc3\x93", "\xc3\x94", "\xc3\x95", "\xc3\x96", "\xc3\x97",
+    "\xc3\x98", "\xc3\x99", "\xc3\x9a", "\xc3\x9b", "\xc3\x9c", "\xc3\x9d",
+    "\xc3\x9e", "\xc3\x9f", "\xc3\xa0", "\xc3\xa1", "\xc3\xa2", "\xc3\xa3",
+    "\xc3\xa4", "\xc3\xa5", "\xc3\xa6", "\xc3\xa7", "\xc3\xa8", "\xc3\xa9",
+    "\xc3\xaa", "\xc3\xab", "\xc3\xac", "\xc3\xad", "\xc3\xae", "\xc3\xaf",
+    "\xc3\xb0", "\xc3\xb1", "\xc3\xb2", "\xc3\xb3", "\xc3\xb4", "\xc3\xb5",
+    "\xc3\xb6", "\xc3\xb7", "\xc3\xb8", "\xc3\xb9", "\xc3\xba", "\xc3\xbb",
+    "\xc3\xbc", "\xc3\xbd", "\xc3\xbe", "\xc3\xbf",
+};
+
+/**
+ * Pre-process input bytes using GPT-2 byte-to-unicode mapping
+ * This converts raw bytes to the format used in the vocabulary
+ */
+static std::string encode_bytes(const std::string &text) {
+  std::string encoded;
+  for (unsigned char c : text) {
+    encoded += BYTE_ENCODER[c];
+  }
+  return encoded;
+}
+
+/**
+ * Decode byte-level BPE tokens back to original bytes
+ * Inverse of encode_bytes()
+ */
+static std::string decode_bytes(const std::string &text) {
+  std::string decoded;
+  size_t pos = 0;
+  while (pos < text.size()) {
+    unsigned char c = static_cast<unsigned char>(text[pos]);
+    size_t char_len = 1;
+
+    // Determine UTF-8 character length
+    if ((c & 0x80) == 0x00) {
+      char_len = 1;
+    } else if ((c & 0xE0) == 0xC0) {
+      char_len = 2;
+    } else if ((c & 0xF0) == 0xE0) {
+      char_len = 3;
+    } else if ((c & 0xF8) == 0xF0) {
+      char_len = 4;
+    }
+
+    if (pos + char_len > text.size()) {
+      // Invalid UTF-8, skip
+      pos++;
+      continue;
+    }
+
+    // Look up the byte value
+    bool found = false;
+    for (int byte_val = 0; byte_val < 256; byte_val++) {
+      const char *encoded = BYTE_ENCODER[byte_val];
+      size_t enc_len = strlen(encoded);
+      if (enc_len == char_len &&
+          text.compare(pos, char_len, encoded, enc_len) == 0) {
+        decoded += static_cast<char>(byte_val);
+        pos += char_len;
+        found = true;
+        break;
+      }
+    }
+
+    if (!found) {
+      // Not a byte encoding, keep as-is (for normal ASCII/Unicode)
+      decoded += text.substr(pos, char_len);
+      pos += char_len;
+    }
+  }
+  return decoded;
+}
+
 void llm_register_model(const std::string &arch_name, model_loader_fn loader) {
   get_model_registry()[arch_name] = loader;
 }
@@ -61,6 +174,11 @@ const llm_vocab::token &llm_vocab::get_token(int32_t id) const {
     return it->second;
   }
   return empty_token;
+}
+
+std::string llm_vocab::decode(int32_t id) const {
+  std::string token = get_token(id).text;
+  return decode_bytes(token);
 }
 
 void llm_vocab::add_special_token(const std::string &text, int32_t id) {
@@ -226,117 +344,6 @@ void llm_vocab::build_token_map() const {
   token_map_built_ = true;
 }
 
-// GPT-2 style byte-to-unicode mapping table
-// Maps each byte (0x00-0xFF) to its Unicode representation
-// This ensures all tokens are valid printable Unicode strings
-static const char *BYTE_ENCODER[256] = {
-    "\xc4\x80", "\xc4\x81", "\xc4\x82", "\xc4\x83", "\xc4\x84", "\xc4\x85",
-    "\xc4\x86", "\xc4\x87", "\xc4\x88", "\xc4\x89", "\xc4\x8a", "\xc4\x8b",
-    "\xc4\x8c", "\xc4\x8d", "\xc4\x8e", "\xc4\x8f", "\xc4\x90", "\xc4\x91",
-    "\xc4\x92", "\xc4\x93", "\xc4\x94", "\xc4\x95", "\xc4\x96", "\xc4\x97",
-    "\xc4\x98", "\xc4\x99", "\xc4\x9a", "\xc4\x9b", "\xc4\x9c", "\xc4\x9d",
-    "\xc4\x9e", "\xc4\x9f", "\xc4\xa0", "\x21",     "\x22",     "\x23",
-    "\x24",     "\x25",     "\x26",     "\x27",     "\x28",     "\x29",
-    "\x2a",     "\x2b",     "\x2c",     "\x2d",     "\x2e",     "\x2f",
-    "\x30",     "\x31",     "\x32",     "\x33",     "\x34",     "\x35",
-    "\x36",     "\x37",     "\x38",     "\x39",     "\x3a",     "\x3b",
-    "\x3c",     "\x3d",     "\x3e",     "\x3f",     "\x40",     "\x41",
-    "\x42",     "\x43",     "\x44",     "\x45",     "\x46",     "\x47",
-    "\x48",     "\x49",     "\x4a",     "\x4b",     "\x4c",     "\x4d",
-    "\x4e",     "\x4f",     "\x50",     "\x51",     "\x52",     "\x53",
-    "\x54",     "\x55",     "\x56",     "\x57",     "\x58",     "\x59",
-    "\x5a",     "\x5b",     "\x5c",     "\x5d",     "\x5e",     "\x5f",
-    "\x60",     "\x61",     "\x62",     "\x63",     "\x64",     "\x65",
-    "\x66",     "\x67",     "\x68",     "\x69",     "\x6a",     "\x6b",
-    "\x6c",     "\x6d",     "\x6e",     "\x6f",     "\x70",     "\x71",
-    "\x72",     "\x73",     "\x74",     "\x75",     "\x76",     "\x77",
-    "\x78",     "\x79",     "\x7a",     "\x7b",     "\x7c",     "\x7d",
-    "\x7e",     "\xc4\xa1", "\xc4\xa2", "\xc4\xa3", "\xc4\xa4", "\xc4\xa5",
-    "\xc4\xa6", "\xc4\xa7", "\xc4\xa8", "\xc4\xa9", "\xc4\xaa", "\xc4\xab",
-    "\xc4\xac", "\xc4\xad", "\xc4\xae", "\xc4\xaf", "\xc4\xb0", "\xc4\xb1",
-    "\xc4\xb2", "\xc4\xb3", "\xc4\xb4", "\xc4\xb5", "\xc4\xb6", "\xc4\xb7",
-    "\xc4\xb8", "\xc4\xb9", "\xc4\xba", "\xc4\xbb", "\xc4\xbc", "\xc4\xbd",
-    "\xc4\xbe", "\xc4\xbf", "\xc5\x80", "\xc5\x81", "\xc5\x82", "\xc2\xa1",
-    "\xc2\xa2", "\xc2\xa3", "\xc2\xa4", "\xc2\xa5", "\xc2\xa6", "\xc2\xa7",
-    "\xc2\xa8", "\xc2\xa9", "\xc2\xaa", "\xc2\xab", "\xc2\xac", "\xc5\x83",
-    "\xc2\xae", "\xc2\xaf", "\xc2\xb0", "\xc2\xb1", "\xc2\xb2", "\xc2\xb3",
-    "\xc2\xb4", "\xc2\xb5", "\xc2\xb6", "\xc2\xb7", "\xc2\xb8", "\xc2\xb9",
-    "\xc2\xba", "\xc2\xbb", "\xc2\xbc", "\xc2\xbd", "\xc2\xbe", "\xc2\xbf",
-    "\xc3\x80", "\xc3\x81", "\xc3\x82", "\xc3\x83", "\xc3\x84", "\xc3\x85",
-    "\xc3\x86", "\xc3\x87", "\xc3\x88", "\xc3\x89", "\xc3\x8a", "\xc3\x8b",
-    "\xc3\x8c", "\xc3\x8d", "\xc3\x8e", "\xc3\x8f", "\xc3\x90", "\xc3\x91",
-    "\xc3\x92", "\xc3\x93", "\xc3\x94", "\xc3\x95", "\xc3\x96", "\xc3\x97",
-    "\xc3\x98", "\xc3\x99", "\xc3\x9a", "\xc3\x9b", "\xc3\x9c", "\xc3\x9d",
-    "\xc3\x9e", "\xc3\x9f", "\xc3\xa0", "\xc3\xa1", "\xc3\xa2", "\xc3\xa3",
-    "\xc3\xa4", "\xc3\xa5", "\xc3\xa6", "\xc3\xa7", "\xc3\xa8", "\xc3\xa9",
-    "\xc3\xaa", "\xc3\xab", "\xc3\xac", "\xc3\xad", "\xc3\xae", "\xc3\xaf",
-    "\xc3\xb0", "\xc3\xb1", "\xc3\xb2", "\xc3\xb3", "\xc3\xb4", "\xc3\xb5",
-    "\xc3\xb6", "\xc3\xb7", "\xc3\xb8", "\xc3\xb9", "\xc3\xba", "\xc3\xbb",
-    "\xc3\xbc", "\xc3\xbd", "\xc3\xbe", "\xc3\xbf",
-};
-
-/**
- * Pre-process input bytes using GPT-2 byte-to-unicode mapping
- * This converts raw bytes to the format used in the vocabulary
- */
-static std::string encode_bytes(const std::string &text) {
-  std::string encoded;
-  for (unsigned char c : text) {
-    encoded += BYTE_ENCODER[c];
-  }
-  return encoded;
-}
-
-/**
- * Decode byte-level BPE tokens back to original bytes
- * Inverse of encode_bytes()
- */
-static std::string decode_bytes(const std::string &text) {
-  std::string decoded;
-  size_t pos = 0;
-  while (pos < text.size()) {
-    unsigned char c = static_cast<unsigned char>(text[pos]);
-    size_t char_len = 1;
-
-    // Determine UTF-8 character length
-    if ((c & 0x80) == 0x00) {
-      char_len = 1;
-    } else if ((c & 0xE0) == 0xC0) {
-      char_len = 2;
-    } else if ((c & 0xF0) == 0xE0) {
-      char_len = 3;
-    } else if ((c & 0xF8) == 0xF0) {
-      char_len = 4;
-    }
-
-    if (pos + char_len > text.size()) {
-      // Invalid UTF-8, skip
-      pos++;
-      continue;
-    }
-
-    // Look up the byte value
-    bool found = false;
-    for (int byte_val = 0; byte_val < 256; byte_val++) {
-      const char *encoded = BYTE_ENCODER[byte_val];
-      size_t enc_len = strlen(encoded);
-      if (enc_len == char_len &&
-          text.compare(pos, char_len, encoded, enc_len) == 0) {
-        decoded += static_cast<char>(byte_val);
-        pos += char_len;
-        found = true;
-        break;
-      }
-    }
-
-    if (!found) {
-      // Not a byte encoding, keep as-is (for normal ASCII/Unicode)
-      decoded += text.substr(pos, char_len);
-      pos += char_len;
-    }
-  }
-  return decoded;
-}
 
 std::vector<std::string>
 llm_vocab::tokenize_to_chars(const std::string &text) const {

@@ -9,6 +9,12 @@
 #define KV_LOG_ERROR(fmt, ...)                                                 \
   std::fprintf(stderr, "[KV] Error: " fmt "\n", ##__VA_ARGS__)
 
+#ifndef NDEBUG
+  #define KV_LOG_DEBUG(fmt, ...) \
+  std::printf("[KV] [DEBUG] [%s:%d] " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__)
+#else
+  #define KV_LOG_DEBUG(fmt, ...) ((void)0)
+#endif
 // ============================================
 // llm_kv_cache Implementation
 // ============================================
@@ -54,7 +60,7 @@ llm_kv_cache::llm_kv_cache(const config &cfg, uint32_t n_embd_k_gqa,
       throw std::runtime_error("Failed to allocate KV cache buffer");
     }
 
-    KV_LOG_INFO("Allocated KV cache: K=%zu MB, V=%zu MB",
+    KV_LOG_DEBUG("Allocated KV cache: K=%zu MB, V=%zu MB",
                 ggml_nbytes(layer.k) / (1 << 20),
                 ggml_nbytes(layer.v) / (1 << 20));
   }

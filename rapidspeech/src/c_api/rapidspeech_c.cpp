@@ -13,10 +13,10 @@
 // Internal Thread-Local Error Storage
 // ============================================
 
-#ifndef _WIN32
-#define THREAD_LOCAL __thread
+#if defined(_MSC_VER)
+    #define THREAD_LOCAL __declspec(thread)
 #else
-#define THREAD_LOCAL thread_local
+    #define THREAD_LOCAL thread_local
 #endif
 
 static THREAD_LOCAL rs_error_info_t g_last_error = {RS_OK, ""};

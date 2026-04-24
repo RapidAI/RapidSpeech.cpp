@@ -60,7 +60,11 @@ endif()
 add_subdirectory(${GGML_PATH} ggml)
 
 # --- Core Source Files ---
-include_directories(include rapidspeech/src)
+include_directories(
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/c_api
+)
 
 # Note: LLM-related files are now included for Qwen3 integration
 set(RS_SOURCES
@@ -88,6 +92,14 @@ set(RS_SOURCES
 add_library(rapidspeech-core SHARED
         ${RS_SOURCES}
         rapidspeech/src/c_api/rapidspeech_c.cpp
+)
+
+target_include_directories(rapidspeech-core PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/c_api
+        ${GGML_PATH}/include
+        ${GGML_PATH}/src
 )
 
 # Define RAPIDSPEECH_BUILD for proper symbol export
@@ -204,10 +216,10 @@ endif()
 # --- Example Executables ---
 add_executable(rs-asr-offline
     examples/rs-asr-offline.cpp
-    rapidspeech/src/utils/rs_wav.cpp
 )
 target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
 target_include_directories(rs-asr-offline PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
     ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
     ${GGML_PATH}/include
@@ -228,7 +240,10 @@ if (RS_BUILD_TESTS)
 
     foreach(module ${TEST_MODULES})
         set(test_target "test_${module}")
-        set(test_source "tests/${test_target}.cpp")
+        set(test_source "tests/${test_target}.cpp"
+                examples/quantize/quantize.cpp
+                examples/quantize/common_quantize.cpp
+                examples/quantize/common_quantize.h)
 
         if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${test_source}")
             add_executable(${test_target} ${test_source})

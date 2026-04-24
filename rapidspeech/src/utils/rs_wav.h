@@ -1,5 +1,7 @@
 #pragma once
 
+#include "rapidspeech.h"
+
 #include <cstdint>
 #include <vector>
 /**
@@ -28,8 +30,8 @@ struct WaveHeader {
  * @param sample_rate sample rate
  * @return true if success
  */
-bool load_wav_file(const char *filename, std::vector<float> &data,
-                   int *sample_rate);
+RS_API bool load_wav_file(const char *filename, std::vector<float> &data,
+                          int *sample_rate);
 
 void load_cmvn_params(struct gguf_context *ctx_gguf, std::vector<float> &means,
                       std::vector<float> &vars);

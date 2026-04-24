@@ -36,6 +36,8 @@ public:
   // Get token by ID
   const token &get_token(int32_t id) const;
 
+  std::string decode(int32_t id) const;
+
   // Special tokens
   int32_t token_bos() const { return token_bos_; }
   int32_t token_eos() const { return token_eos_; }

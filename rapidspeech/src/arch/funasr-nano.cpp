@@ -689,7 +689,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   token_ids.push_back(best_token);
 
   RS_LOG_INFO("First token: %d (%s)", best_token,
-              llm_model_->vocab().get_token(best_token).text.c_str());
+              llm_model_->vocab().decode(best_token).c_str());
 
   // Extract K/V per layer from output tensors and store in host cache
   const auto &lp = llm_model_->hparams();
@@ -786,7 +786,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
         (llm_pos)(n_cached_tokens_ + 2); // +2 to match prefill position offset
     RS_LOG_INFO("Decode step %d: pos=%d, n_cached=%d, input_token=%d (%s)",
                 step, (int)decode_pos, n_cached_tokens_, best_token,
-                llm_model_->vocab().get_token(best_token).text.c_str());
+                llm_model_->vocab().decode(best_token).c_str());
 
     struct ggml_init_params dec_input_params = {64 * ggml_tensor_overhead(),
                                                 nullptr, true};
@@ -889,8 +889,8 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
       }
     }
 
-    RS_LOG_INFO("Decode step %d: token=%d (%s)", step, next_token,
-                llm_model_->vocab().get_token(next_token).text.c_str());
+    // RS_LOG_INFO("Decode step %d: token=%d (%s)", step, next_token,
+    //             llm_model_->vocab().decode(next_token).c_str());
 
     // Update host KV cache from output
     for (int il = 0; il < n_layer; ++il) {
