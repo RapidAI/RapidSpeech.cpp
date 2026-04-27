@@ -54,9 +54,11 @@ jobs:
             RS_BACKEND=${{ matrix.backend }}
             RAPIDSPEECH_IS_FOR_PYPI=1
             SETUPTOOLS_SCM_PRETEND_VERSION=${{ startsWith(github.ref_name, 'v') && github.ref_name || '0.0.0.dev0' }}
+            ${{ matrix.backend == 'cuda' && 'CUDA_PATH=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH' || '' }}
 
-          # Use NVIDIA's devel image for Linux CUDA to ensure nvcc is available
-          CIBW_MANYLINUX_X86_64_IMAGE: ${{ matrix.backend == 'cuda' && 'nvidia/cuda:11.8.0-devel-centos7' || 'manylinux2014' }}
+          # Install CUDA toolkit inside standard manylinux container for Linux CUDA builds
+          CIBW_BEFORE_ALL_LINUX: >-
+            ${{ matrix.backend == 'cuda' && 'yum install -y yum-utils && yum-config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel7/x86_64/cuda-rhel7.repo && yum install -y cuda-nvcc-11-8 cuda-cudart-devel-11-8 && ln -s /usr/local/cuda-11.8 /usr/local/cuda' || '' }}
 
           # Debug tip: build only for Python 3.9 in debug mode to save time
           CIBW_BUILD: ${{ github.event.inputs.debug_mode == 'true' && 'cp39-*' || '*' }}

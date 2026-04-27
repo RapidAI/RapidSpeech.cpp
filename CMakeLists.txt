@@ -195,6 +195,23 @@ if (RS_ENABLE_PYTHON)
                 RUNTIME DESTINATION .
         )
     endif()
+    if (TARGET ggml-metal)
+        install(TARGETS ggml-metal
+                LIBRARY DESTINATION .
+                RUNTIME DESTINATION .
+        )
+    endif()
+    if (TARGET ggml-blas)
+        install(TARGETS ggml-blas
+                LIBRARY DESTINATION .
+                RUNTIME DESTINATION .
+        )
+    endif()
+
+    # Set @rpath relative to install location so dylibs find each other
+    # At runtime, @loader_path refers to the directory containing the loading dylib
+    set(CMAKE_INSTALL_RPATH "@loader_path")
+    set(CMAKE_BUILD_RPATH "@loader_path")
 
     target_link_libraries(rapidspeech
             PRIVATE rapidspeech-core

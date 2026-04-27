@@ -193,14 +193,9 @@ try:
     class bdist_wheel(_bdist_wheel):
         def finalize_options(self):
             _bdist_wheel.finalize_options(self)
-            # In this case, the generated wheel has a name in the form
-            # sherpa-xxx-pyxx-none-any.whl
-            if is_for_pypi() and not is_macos():
-                self.root_is_pure = True
-            else:
-                # The generated wheel has a name ending with
-                # -linux_x86_64.whl
-                self.root_is_pure = False
+            # The package contains compiled C++ extensions (.so/.pyd),
+            # so it must always be a platform-specific wheel.
+            self.root_is_pure = False
 
 except ImportError:
     bdist_wheel = None
