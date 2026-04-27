@@ -238,6 +238,20 @@ llm_graph_result_ptr llm_build_qwen3::build_graph_from_embeds(
 
   switch (current_opts_.output_mode) {
   case llm_output_mode::OUTPUT_LOGITS: {
+    // Prefill optimisation: when n_tokens > 1 and we are NOT in a decode
+    // step, only the LAST token's hidden state is needed for lm_head.
+    // Slicing here avoids computing and transferring n_tokens*n_vocab logits
+    // (e.g. 400*151669*4B ≈ 242 MB) and only processes 1 row (~0.6 MB).
+    if (n_tokens > 1 && !current_opts_.is_decode_step) {
+      // cur shape (ggml column-major): ne[0]=n_embd, ne[1]=n_tokens
+      cur = ggml_view_2d(ctx_, cur,
+                         cur->ne[0], // n_embd
+                         1,          // single token
+                         cur->nb[1], // row stride unchanged
+                         (size_t)(n_tokens - 1) *
+                             cur->nb[1]); // offset to last token
+      ggml_set_name(cur, "last_hidden");
+    }
     if (!current_opts_.skip_output_norm) {
       cur = build_output_norm(ctx_, cur, model_.output_norm(),
                               model_.output_norm_b());
@@ -346,17 +360,12 @@ ggml_tensor *llm_build_qwen3::build_attention_layer(
 
   const float scale = 1.0f / sqrtf(static_cast<float>(n_embd_head));
 
-  // Use manual attention (QK^T + mask + softmax + V) instead of
-  // ggml_flash_attn_ext. ggml_flash_attn_ext has a numerical stability bug on
-  // CPU backend when using mask with -INFINITY values in the online softmax
-  // algorithm.
-  //
-  // Manual attention using build_multi_head_attn which handles:
-  // - GQA (grouped-query attention) via repeat
-  // - Causal mask via ggml_add
-  // - Standard QK^T + softmax + V computation
-  cur = build_multi_head_attn(ctx, q, k_final, v_final, causal_mask, scale,
-                              n_head, n_head_kv);
+  if (cparams_.flash_attn) {
+    cur = build_flash_attn(ctx, q, k_final, v_final, causal_mask, scale);
+  } else {
+    cur = build_multi_head_attn(ctx, q, k_final, v_final, causal_mask, scale,
+                                n_head, n_head_kv);
+  }
 
   // Reshape from [d_k, n_head, n_tokens] to [n_embd, n_tokens]
   cur = ggml_reshape_2d(ctx, cur, n_embd_head * n_head, n_tokens);

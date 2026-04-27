@@ -352,7 +352,68 @@ llm_graph_builder::build_kv_cache_concat(ggml_context *ctx, ggml_tensor *k_cur,
   const int64_t head_dim = k_cur->ne[0];
   const int64_t n_head_kv = k_cur->ne[1];
 
-  // Create input tensors for cached K/V (will be filled from host)
+  // O3 optimisation: use GPU-persistent KV buffer if provided.
+  // The GPU KV buffer already contains the first n_cached columns from
+  // previous steps. We create a view of [kv_dim, n_cached+1] for attention,
+  // but the NEW column at position n_cached is NOT yet written — it will be
+  // written by the host after compute via ggml_backend_tensor_set.
+  //
+  // For correctness, we still need the current step's K/V to be part of the
+  // attention input. We use the original concat path but REPLACE the
+  // kv_cached_k/v input tensors with views into the GPU KV buffer.
+  if (current_opts_.gpu_kv_k && current_opts_.gpu_kv_v &&
+      current_opts_.n_kv_max > 0) {
+    ggml_tensor *k_gpu = current_opts_.gpu_kv_k[il];
+    ggml_tensor *v_gpu = current_opts_.gpu_kv_v[il];
+
+    if (k_gpu && v_gpu && n_cached > 0) {
+      // Create a view of the first n_cached columns in the GPU buffer
+      // This replaces the kv_cached_k/v_layer_N input tensors
+      const int64_t kv_dim_2d = head_dim * n_head_kv;
+      ggml_tensor *k_cached_view =
+          ggml_view_2d(ctx, k_gpu, kv_dim_2d, n_cached, k_gpu->nb[1], 0);
+      ggml_tensor *v_cached_view =
+          ggml_view_2d(ctx, v_gpu, kv_dim_2d, n_cached, v_gpu->nb[1], 0);
+      // No ggml_set_input needed — the data is already in GPU memory
+
+      // Reshape current K/V to 2D: [kv_dim, 1]
+      ggml_tensor *k_cur_2d =
+          ggml_reshape_2d(ctx, ggml_cont(ctx, k_cur), kv_dim_2d, k_cur->ne[2]);
+      ggml_tensor *v_cur_2d =
+          ggml_reshape_2d(ctx, ggml_cont(ctx, v_cur), kv_dim_2d, v_cur->ne[2]);
+
+      // Concat GPU cached view + current K/V
+      ggml_tensor *k_final_2d = ggml_concat(ctx, k_cached_view, k_cur_2d, 1);
+      ggml_tensor *v_final_2d = ggml_concat(ctx, v_cached_view, v_cur_2d, 1);
+
+      ggml_tensor *k_cont_2d = ggml_cont(ctx, k_final_2d);
+      ggml_tensor *v_cont_2d = ggml_cont(ctx, v_final_2d);
+
+      // Reshape to 3D for attention: [head_dim, n_head_kv, n_cached + 1]
+      const int64_t n_total = n_cached + (int64_t)k_cur->ne[2];
+      ggml_tensor *k_final =
+          ggml_reshape_3d(ctx, k_cont_2d, head_dim, n_head_kv, n_total);
+      ggml_tensor *v_final =
+          ggml_reshape_3d(ctx, v_cont_2d, head_dim, n_head_kv, n_total);
+
+      // Mark outputs for host-side extraction of the NEW column
+      if (current_opts_.use_kv_cache) {
+        char k_name[64], v_name[64];
+        snprintf(k_name, sizeof(k_name), "kv_k_layer_%d", il);
+        snprintf(v_name, sizeof(v_name), "kv_v_layer_%d", il);
+        ggml_set_name(k_cont_2d, k_name);
+        ggml_set_name(v_cont_2d, v_name);
+        ggml_set_output(k_cont_2d);
+        ggml_set_output(v_cont_2d);
+        tmp_kv_outputs_k_.push_back(k_cont_2d);
+        tmp_kv_outputs_v_.push_back(v_cont_2d);
+      }
+
+      return {k_final, v_final};
+    }
+  }
+
+  // Original path: create input tensors for cached K/V (uploaded from host)
   ggml_tensor *k_cached =
       ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim * n_head_kv, n_cached);
   ggml_tensor *v_cached =
@@ -492,7 +553,36 @@ ggml_tensor *llm_graph_builder::build_flash_attn(ggml_context *ctx,
   // mask should be a 2D [n_kv, n_tokens] input tensor with -INF for masked
   // positions. max_bias=0.0f means no ALiBi; logit_softcap=0.0f means no
   // softcap.
-  return ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f);
+  //
+  // ggml_flash_attn_ext expects:
+  //   q: [d_k, n_batch, n_head]
+  //   k: [d_k, n_kv,    n_head_kv]
+  //   v: [d_k, n_kv,    n_head_kv]
+  //   res: [d_k, n_head, n_batch, 1]
+  // Input tensors are in [d_k, n_head, n_seq] layout, so we permute (0,2,1,3).
+
+  q = ggml_cont(
+      ctx,
+      ggml_permute(ctx, q, 0, 2, 1,
+                   3)); // [d_k, n_head, n_tokens] -> [d_k, n_tokens, n_head]
+  k = ggml_cont(
+      ctx, ggml_permute(ctx, k, 0, 2, 1,
+                        3)); // [d_k, n_head_kv, n_kv] -> [d_k, n_kv, n_head_kv]
+  v = ggml_cont(
+      ctx, ggml_permute(ctx, v, 0, 2, 1,
+                        3)); // [d_k, n_head_kv, n_kv] -> [d_k, n_kv, n_head_kv]
+
+  // ggml_flash_attn_ext requires mask to be F16, convert if necessary.
+  if (mask && mask->type != GGML_TYPE_F16) {
+    mask = ggml_cast(ctx, mask, GGML_TYPE_F16);
+  }
+
+  ggml_tensor *result =
+      ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f);
+
+  // Result is [d_k, n_head, n_batch, 1], reshape to [d_k, n_head, n_batch]
+  return ggml_reshape_3d(ctx, result, result->ne[0], result->ne[1],
+                         result->ne[2]);
 }
 
 ggml_tensor *llm_graph_builder::build_norm(ggml_context *ctx, ggml_tensor *cur,

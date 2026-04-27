@@ -26,7 +26,6 @@ static std::map<std::string, model_loader_fn> &get_model_registry() {
   return registry;
 }
 
-
 // GPT-2 style byte-to-unicode mapping table
 // Maps each byte (0x00-0xFF) to its Unicode representation
 // This ensures all tokens are valid printable Unicode strings
@@ -343,7 +342,6 @@ void llm_vocab::build_token_map() const {
   }
   token_map_built_ = true;
 }
-
 
 std::vector<std::string>
 llm_vocab::tokenize_to_chars(const std::string &text) const {

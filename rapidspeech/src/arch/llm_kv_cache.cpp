@@ -10,10 +10,11 @@
   std::fprintf(stderr, "[KV] Error: " fmt "\n", ##__VA_ARGS__)
 
 #ifndef NDEBUG
-  #define KV_LOG_DEBUG(fmt, ...) \
-  std::printf("[KV] [DEBUG] [%s:%d] " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__)
+#define KV_LOG_DEBUG(fmt, ...)                                                 \
+  std::printf("[KV] [DEBUG] [%s:%d] " fmt "\n", __FILE__, __LINE__,            \
+              ##__VA_ARGS__)
 #else
-  #define KV_LOG_DEBUG(fmt, ...) ((void)0)
+#define KV_LOG_DEBUG(fmt, ...) ((void)0)
 #endif
 // ============================================
 // llm_kv_cache Implementation
@@ -61,8 +62,8 @@ llm_kv_cache::llm_kv_cache(const config &cfg, uint32_t n_embd_k_gqa,
     }
 
     KV_LOG_DEBUG("Allocated KV cache: K=%zu MB, V=%zu MB",
-                ggml_nbytes(layer.k) / (1 << 20),
-                ggml_nbytes(layer.v) / (1 << 20));
+                 ggml_nbytes(layer.k) / (1 << 20),
+                 ggml_nbytes(layer.v) / (1 << 20));
   }
 
   KV_LOG_INFO("KV cache initialized: n_ctx=%d, type_k=%d, type_v=%d",

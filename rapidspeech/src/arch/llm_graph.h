@@ -85,7 +85,7 @@ struct llm_cparams {
 
   // Attention
   bool causal_attn = true;
-  bool flash_attn = false;
+  bool flash_attn = true;
   bool offload_kqv = true;
 
   // Embeddings mode
@@ -167,6 +167,13 @@ struct llm_build_opts {
   bool is_decode_step =
       false;               // true = decode step (n_tokens=1, concat cached K/V)
   uint32_t n_kv_cache = 0; // Number of cached KV pairs for decode step
+  uint32_t n_kv_max = 0;   // Max KV cache capacity (for GPU-persistent buffers)
+
+  // GPU-persistent KV cache buffers (optional, for O3 optimisation)
+  // When provided, build_kv_cache_concat will use a view into these
+  // pre-allocated buffers instead of creating new input tensors each step.
+  ggml_tensor **gpu_kv_k = nullptr; // [n_layer] array of GPU KV key tensors
+  ggml_tensor **gpu_kv_v = nullptr; // [n_layer] array of GPU KV value tensors
 
   // Input control
   bool input_is_embeds = false; // Input is embeddings, not token IDs
