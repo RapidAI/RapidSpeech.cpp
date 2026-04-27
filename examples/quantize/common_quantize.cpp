@@ -1,5 +1,6 @@
 #include "common_quantize.h"
 #include <climits>
+#include <cstring>
 #include <inttypes.h>
 #include <map>
 #include <mutex>

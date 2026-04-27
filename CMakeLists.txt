@@ -223,7 +223,12 @@ add_executable(rs-quantize
         examples/quantize/common_quantize.cpp
 )
 target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
-target_link_libraries(rs-quantize PRIVATE ggml pthread)
+target_link_libraries(rs-quantize PRIVATE ggml)
+
+if (NOT MSVC)
+    target_link_libraries(rs-quantize PRIVATE pthread)
+endif()
+
 target_include_directories(rs-quantize PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/examples/quantize
     ${GGML_PATH}/include
