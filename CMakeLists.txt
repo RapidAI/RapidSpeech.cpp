@@ -57,6 +57,15 @@ if (RS_OPENCL)
     set(GGML_OPENCL ON CACHE BOOL "ggml: enable OpenCL" FORCE)
 endif()
 
+# Override ggml's install directories so all shared libraries end up
+# in the same directory as the pybind module (required for wheel packaging).
+# Without this, GNUInstallDirs puts backends in lib/ and the pybind in .
+if (RS_ENABLE_PYTHON)
+    set(CMAKE_INSTALL_LIBDIR "." CACHE PATH "lib install dir" FORCE)
+    set(CMAKE_INSTALL_BINDIR "." CACHE PATH "bin install dir" FORCE)
+    set(CMAKE_INSTALL_INCLUDEDIR "include" CACHE PATH "header install dir" FORCE)
+endif()
+
 add_subdirectory(${GGML_PATH} ggml)
 
 # --- Core Source Files ---
@@ -183,30 +192,9 @@ if (RS_ENABLE_PYTHON)
             RUNTIME DESTINATION .     # Windows (.dll)
     )
 
-    # Install ggml shared libraries next to the pybind module
-    # so that the OS loader finds all transitive dependencies.
-    install(TARGETS ggml ggml-base
-            LIBRARY DESTINATION .
-            RUNTIME DESTINATION .
-    )
-    if (TARGET ggml-cpu)
-        install(TARGETS ggml-cpu
-                LIBRARY DESTINATION .
-                RUNTIME DESTINATION .
-        )
-    endif()
-    if (TARGET ggml-metal)
-        install(TARGETS ggml-metal
-                LIBRARY DESTINATION .
-                RUNTIME DESTINATION .
-        )
-    endif()
-    if (TARGET ggml-blas)
-        install(TARGETS ggml-blas
-                LIBRARY DESTINATION .
-                RUNTIME DESTINATION .
-        )
-    endif()
+    # ggml shared libraries are installed by ggml's own install rules.
+    # We overrode CMAKE_INSTALL_LIBDIR/BINDIR to "." above so they end up
+    # in the same directory as the pybind module.
 
     # Set @rpath relative to install location so dylibs find each other
     # At runtime, @loader_path refers to the directory containing the loading dylib
