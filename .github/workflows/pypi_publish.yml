@@ -40,9 +40,10 @@ jobs:
       # Specific setup for Windows CUDA
       - name: Install CUDA (Windows)
         if: matrix.os == 'windows-latest' && matrix.backend == 'cuda'
-        uses: jimmy-huang/setup-cuda@v2
+        uses: jimver/cuda-toolkit@v0.2.20
         with:
           cuda: '11.8'
+          method: 'network'
 
       - name: Build wheels
         uses: pypa/cibuildwheel@v2.22.0
