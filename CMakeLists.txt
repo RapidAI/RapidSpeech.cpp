@@ -64,6 +64,14 @@ if (RS_ENABLE_PYTHON)
     set(CMAKE_INSTALL_LIBDIR "." CACHE PATH "lib install dir" FORCE)
     set(CMAKE_INSTALL_BINDIR "." CACHE PATH "bin install dir" FORCE)
     set(CMAKE_INSTALL_INCLUDEDIR "include" CACHE PATH "header install dir" FORCE)
+    # Disable library SONAME versioning for Python wheel packaging.
+    # Versioned sonames (e.g., libfoo.so.1) confuse auditwheel/delocate
+    # because the symlink .so.1 -> .so.1.0.0 is not preserved in the wheel.
+    set(GGML_VERSION_MAJOR 0 CACHE STRING "" FORCE)
+    set(GGML_VERSION_MINOR 10 CACHE STRING "" FORCE)
+    set(GGML_VERSION_PATCH 0 CACHE STRING "" FORCE)
+    set(GGML_VERSION "0.10.0" CACHE STRING "" FORCE)
+    set(CMAKE_PLATFORM_NO_VERSIONED_SONAME ON)
 endif()
 
 add_subdirectory(${GGML_PATH} ggml)
@@ -114,10 +122,14 @@ target_include_directories(rapidspeech-core PUBLIC
 # Define RAPIDSPEECH_BUILD for proper symbol export
 target_compile_definitions(rapidspeech-core PRIVATE RAPIDSPEECH_BUILD)
 
-# Set library version
+# Set library version (skip SOVERSION for Python wheels to avoid auditwheel issues)
+if (NOT RS_ENABLE_PYTHON)
+    set_target_properties(rapidspeech-core PROPERTIES
+        VERSION ${PROJECT_VERSION}
+        SOVERSION 1
+    )
+endif()
 set_target_properties(rapidspeech-core PROPERTIES
-    VERSION ${PROJECT_VERSION}
-    SOVERSION 1
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
 )
