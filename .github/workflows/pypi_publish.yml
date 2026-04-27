@@ -42,7 +42,7 @@ jobs:
         if: matrix.os == 'windows-latest' && matrix.backend == 'cuda'
         uses: jimver/cuda-toolkit@v0.2.20
         with:
-          cuda: '11.8'
+          cuda: '11.8.0'
           method: 'network'
 
       - name: Build wheels
