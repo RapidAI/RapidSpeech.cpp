@@ -3,7 +3,6 @@ name: Build and Publish Python Wheels
 on:
   push:
     tags: ['v*']
-    branches: [main]
   workflow_dispatch:  # Allows manual triggering for debugging
     inputs:
       debug_mode:
@@ -54,7 +53,7 @@ jobs:
           CIBW_ENVIRONMENT: >
             RS_BACKEND=${{ matrix.backend }}
             RAPIDSPEECH_IS_FOR_PYPI=1
-            SETUPTOOLS_SCM_PRETEND_VERSION=${{ github.ref_name || '0.0.0.dev0' }}
+            SETUPTOOLS_SCM_PRETEND_VERSION=${{ startsWith(github.ref_name, 'v') && github.ref_name || '0.0.0.dev0' }}
 
           # Use NVIDIA's devel image for Linux CUDA to ensure nvcc is available
           CIBW_MANYLINUX_X86_64_IMAGE: ${{ matrix.backend == 'cuda' && 'nvidia/cuda:11.8.0-devel-centos7' || 'manylinux2014' }}
