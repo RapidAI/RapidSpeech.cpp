@@ -215,9 +215,20 @@ endif()
 
 # --- Example Executables ---
 add_executable(rs-asr-offline
-    examples/rs-asr-offline.cpp
+        examples/asr/rs-asr-offline.cpp
+)
+
+add_executable(rs-quantize
+        examples/quantize/quantize.cpp
+        examples/quantize/common_quantize.cpp
 )
 target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
+target_link_libraries(rs-quantize PRIVATE ggml pthread)
+target_include_directories(rs-quantize PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/examples/quantize
+    ${GGML_PATH}/include
+    ${GGML_PATH}/src
+)
 target_include_directories(rs-asr-offline PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
@@ -240,10 +251,7 @@ if (RS_BUILD_TESTS)
 
     foreach(module ${TEST_MODULES})
         set(test_target "test_${module}")
-        set(test_source "tests/${test_target}.cpp"
-                examples/quantize/quantize.cpp
-                examples/quantize/common_quantize.cpp
-                examples/quantize/common_quantize.h)
+        set(test_source "tests/${test_target}.cpp")
 
         if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${test_source}")
             add_executable(${test_target} ${test_source})
