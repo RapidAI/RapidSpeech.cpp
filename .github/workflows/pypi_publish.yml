@@ -3,6 +3,7 @@ name: Build and Publish Python Wheels
 on:
   push:
     tags: ['v*']
+    branches: [main]
   workflow_dispatch:  # Allows manual triggering for debugging
     inputs:
       debug_mode:
