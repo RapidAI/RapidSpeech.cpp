@@ -76,6 +76,25 @@ endif()
 
 add_subdirectory(${GGML_PATH} ggml)
 
+# Remove SONAME versioning from ggml targets for Python wheel packaging.
+# ggml explicitly sets SOVERSION on its targets, which creates versioned symlinks
+# (libggml.so.0 -> libggml.so.0.10.0) that aren't preserved in wheels, causing
+# auditwheel/delocate to fail.
+if (RS_ENABLE_PYTHON)
+    set(_ggml_targets ggml ggml-base ggml-cpu ggml-metal ggml-blas ggml-vulkan)
+    foreach(_t IN LISTS _ggml_targets)
+        if (TARGET ${_t})
+            set_target_properties(${_t} PROPERTIES
+                SOVERSION ""
+                VERSION ""
+                NO_SONAME ON
+                INSTALL_RPATH "@loader_path"
+                BUILD_WITH_INSTALL_RPATH ON
+            )
+        endif()
+    endforeach()
+endif()
+
 # --- Core Source Files ---
 include_directories(
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -127,6 +146,12 @@ if (NOT RS_ENABLE_PYTHON)
     set_target_properties(rapidspeech-core PROPERTIES
         VERSION ${PROJECT_VERSION}
         SOVERSION 1
+    )
+else()
+    set_target_properties(rapidspeech-core PROPERTIES
+        NO_SONAME ON
+        INSTALL_RPATH "@loader_path"
+        BUILD_WITH_INSTALL_RPATH ON
     )
 endif()
 set_target_properties(rapidspeech-core PROPERTIES
