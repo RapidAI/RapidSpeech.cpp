@@ -220,6 +220,8 @@ setuptools.setup(
     author="lovemefan",
     author_email="lovemefan@outlook.com",
     packages=["rapidspeech"],
+    package_data={"rapidspeech": ["*.so", "*.pyd", "*.dylib", "*.dll"]},
+    include_package_data=True,
     data_files=(
         [
             (
