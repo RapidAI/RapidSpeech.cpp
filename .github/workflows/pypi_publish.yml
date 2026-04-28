@@ -54,9 +54,10 @@ jobs:
             SETUPTOOLS_SCM_PRETEND_VERSION=${{ startsWith(github.ref_name, 'v') && github.ref_name || '0.0.0.dev0' }}
             ${{ matrix.backend == 'cuda' && 'CUDA_PATH=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH' || '' }}
 
-          # 关键修改：动态查找 build 目录下所有可能的库路径并加入 LD_LIBRARY_PATH
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
-            LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$(find /project/build -type d -name "rapidspeech" | tr '\n' ':') 
+            export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$(find /project/build -type d -name "rapidspeech" | tr '\n' ':');
+            yum install -y patchelf &&
+            find /project/build -name "*.so" -exec patchelf --replace-needed ggml/src/libggml-cpu.so libggml-cpu.so {} \; || true;
             auditwheel repair -w {dest_dir} {wheel}
 
           CIBW_BEFORE_ALL_LINUX: >-
