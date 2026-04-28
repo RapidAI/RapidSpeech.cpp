@@ -57,7 +57,9 @@ jobs:
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
             export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$(find /project/build -type d -name "rapidspeech" | tr '\n' ':');
             yum install -y patchelf &&
-            find /project/build -name "*.so" -exec patchelf --replace-needed ggml/src/libggml-cpu.so libggml-cpu.so {} \; || true;
+            for lib in libggml-cpu.so libggml-base.so libggml.so; do
+              find /project/build -name "*.so" -exec patchelf --replace-needed "ggml/src/$lib" "$lib" {} \; || true;
+            done;
             auditwheel repair -w {dest_dir} {wheel}
 
           CIBW_BEFORE_ALL_LINUX: >-
