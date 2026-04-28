@@ -48,28 +48,22 @@ jobs:
       - name: Build wheels
         uses: pypa/cibuildwheel@v2.22.0
         env:
-          # 1. Pass the backend type to setup.py
-          # 2. Pass the version: use git tag if available, otherwise fallback to dev version
           CIBW_ENVIRONMENT: >
             RS_BACKEND=${{ matrix.backend }}
             RAPIDSPEECH_IS_FOR_PYPI=1
             SETUPTOOLS_SCM_PRETEND_VERSION=${{ startsWith(github.ref_name, 'v') && github.ref_name || '0.0.0.dev0' }}
             ${{ matrix.backend == 'cuda' && 'CUDA_PATH=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH' || '' }}
 
-          CIBW_REPAIR_WHEEL_COMMAND_LINUX: |
-            ls -R /project && auditwheel repair -w {dest_dir} {wheel}
-            
-          # Install CUDA toolkit inside standard manylinux container for Linux CUDA builds
+          # 关键修改：动态查找 build 目录下所有可能的库路径并加入 LD_LIBRARY_PATH
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
+            LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$(find /project/build -type d -name "rapidspeech" | tr '\n' ':') 
+            auditwheel repair -w {dest_dir} {wheel}
+
           CIBW_BEFORE_ALL_LINUX: >-
             ${{ matrix.backend == 'cuda' && 'yum install -y yum-utils && yum-config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel7/x86_64/cuda-rhel7.repo && yum install -y cuda-nvcc-11-8 cuda-cudart-devel-11-8 && ln -s /usr/local/cuda-11.8 /usr/local/cuda' || '' }}
 
-          # Debug tip: build only for Python 3.9 in debug mode to save time
           CIBW_BUILD: ${{ github.event.inputs.debug_mode == 'true' && 'cp39-*' || '*' }}
-
-          # Install build dependencies
           CIBW_BEFORE_BUILD: pip install pybind11 numpy cmake
-
-          # Skip legacy Python versions and PyPy
           CIBW_SKIP: cp36-* cp37-* pp*
 
       - uses: actions/upload-artifact@v4
