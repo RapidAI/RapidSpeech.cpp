@@ -94,6 +94,7 @@ class BuildExtension(build_ext):
         if not need_split_package():
             extra_cmake_args += f" -DCMAKE_INSTALL_PREFIX={install_dir} "
         extra_cmake_args += " -DRS_ENABLE_PYTHON=ON "
+        extra_cmake_args += " -DRS_BUILD_CLI=OFF "
 
 
         if "PYTHON_EXECUTABLE" not in cmake_args:

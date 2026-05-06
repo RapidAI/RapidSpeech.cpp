@@ -14,6 +14,7 @@ option(RS_VULKAN "Enable Vulkan acceleration" OFF)
 option(RS_CANN "Enable CANN acceleration (Huawei)" OFF)
 option(RS_OPENCL "Enable OpenCL acceleration" OFF)
 option(RS_ENABLE_PYTHON "Enable Python bindings via pybind11" OFF)
+option(RS_BUILD_CLI "Build command-line example executables" ON)
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
@@ -272,59 +273,77 @@ if (RS_ENABLE_PYTHON)
 endif()
 
 # --- Example Executables ---
-add_executable(rs-asr-offline
-        examples/asr/rs-asr-offline.cpp
-)
+if (RS_BUILD_CLI)
+    # Download miniaudio.h if not present (3rd-party single-header library)
+    set(MINIAUDIO_PATH "${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/utils/miniaudio.h")
+    if (NOT EXISTS "${MINIAUDIO_PATH}")
+        message(STATUS "Downloading miniaudio.h ...")
+        file(DOWNLOAD
+            "https://raw.githubusercontent.com/mackron/miniaudio/refs/tags/0.11.21/miniaudio.h"
+            "${MINIAUDIO_PATH}"
+            STATUS _ma_status
+            TIMEOUT 60
+        )
+        list(GET _ma_status 0 _ma_code)
+        if (NOT _ma_code EQUAL 0)
+            message(FATAL_ERROR "Failed to download miniaudio.h. "
+                                "Place it at third_party/miniaudio/miniaudio.h manually.")
+        endif()
+    endif()
 
-add_executable(rs-asr-online
-        examples/asr/rs-asr-online.cpp
-)
+    add_executable(rs-asr-offline
+            examples/asr/rs-asr-offline.cpp
+    )
 
-add_executable(rs-quantize
-        examples/quantize/quantize.cpp
-        examples/quantize/common_quantize.cpp
-)
-target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
-target_link_libraries(rs-asr-online  PRIVATE rapidspeech-core ggml)
-target_link_libraries(rs-quantize PRIVATE ggml)
+    add_executable(rs-asr-online
+            examples/asr/rs-asr-online.cpp
+    )
 
-if (NOT MSVC)
-    target_link_libraries(rs-quantize PRIVATE pthread)
+    add_executable(rs-quantize
+            examples/quantize/quantize.cpp
+            examples/quantize/common_quantize.cpp
+    )
+    target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
+    target_link_libraries(rs-asr-online  PRIVATE rapidspeech-core ggml)
+    target_link_libraries(rs-quantize PRIVATE ggml)
+
+    if (NOT MSVC)
+        target_link_libraries(rs-quantize PRIVATE pthread)
+    endif()
+
+    target_include_directories(rs-quantize PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/quantize
+        ${GGML_PATH}/include
+        ${GGML_PATH}/src
+    )
+    target_include_directories(rs-asr-offline PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
+        ${GGML_PATH}/include
+        ${GGML_PATH}/src
+    )
+
+    target_include_directories(rs-asr-online PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
+        ${GGML_PATH}/include
+        ${GGML_PATH}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniaudio
+    )
+    # miniaudio uses dlopen on Linux for ALSA/PulseAudio/JACK backend discovery
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(rs-asr-online PRIVATE dl)
+    endif()
+
+    install(TARGETS rs-asr-offline
+            RUNTIME DESTINATION bin
+    )
+    install(TARGETS rs-asr-online
+            RUNTIME DESTINATION bin
+    )
 endif()
-
-target_include_directories(rs-quantize PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/examples/quantize
-    ${GGML_PATH}/include
-    ${GGML_PATH}/src
-)
-target_include_directories(rs-asr-offline PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
-    ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
-    ${GGML_PATH}/include
-    ${GGML_PATH}/src
-)
-
-target_include_directories(rs-asr-online PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
-    ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
-    ${GGML_PATH}/include
-    ${GGML_PATH}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniaudio
-)
-# miniaudio uses dlopen on Linux for ALSA/PulseAudio/JACK backend discovery
-if(UNIX AND NOT APPLE)
-    target_link_libraries(rs-asr-online PRIVATE dl)
-endif()
-
-
-install(TARGETS rs-asr-offline
-        RUNTIME DESTINATION bin
-)
-install(TARGETS rs-asr-online
-        RUNTIME DESTINATION bin
-)
 # --- Tests ---
 if (RS_BUILD_TESTS)
     message(STATUS "Tests are enabled.")
