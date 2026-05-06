@@ -280,16 +280,12 @@ add_executable(rs-asr-online
         examples/asr/rs-asr-online.cpp
 )
 
-add_executable(rs-vad-test
-        examples/asr/rs-vad-test.cpp
-)
 add_executable(rs-quantize
         examples/quantize/quantize.cpp
         examples/quantize/common_quantize.cpp
 )
 target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
 target_link_libraries(rs-asr-online  PRIVATE rapidspeech-core ggml)
-target_link_libraries(rs-vad-test    PRIVATE rapidspeech-core ggml)
 target_link_libraries(rs-quantize PRIVATE ggml)
 
 if (NOT MSVC)
@@ -322,13 +318,6 @@ if(UNIX AND NOT APPLE)
     target_link_libraries(rs-asr-online PRIVATE dl)
 endif()
 
-target_include_directories(rs-vad-test PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
-    ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
-    ${GGML_PATH}/include
-    ${GGML_PATH}/src
-)
 
 install(TARGETS rs-asr-offline
         RUNTIME DESTINATION bin
