@@ -1,9 +1,9 @@
-name: Build and Publish Python Wheels
+name: Build and Publish
 
 on:
   push:
     tags: ['v*']
-  workflow_dispatch:  # Allows manual triggering for debugging
+  workflow_dispatch:
     inputs:
       debug_mode:
         description: 'Debug mode (builds only one Python version to save time)'
@@ -34,40 +34,55 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0 # Required by setuptools_scm to retrieve git history for versioning
           submodules: recursive
-          fetch-depth: 0  # Required by setuptools_scm to retrieve git history for versioning
 
       # Specific setup for Windows CUDA
       - name: Install CUDA (Windows)
         if: matrix.os == 'windows-latest' && matrix.backend == 'cuda'
-        uses: jimver/cuda-toolkit@v0.2.20
+        uses: jimmy-huang/setup-cuda@v2
         with:
-          cuda: '11.8.0'
-          method: 'network'
+          cuda: '11.8'
 
       - name: Build wheels
         uses: pypa/cibuildwheel@v2.22.0
         env:
+          # 1. Pass the backend type to setup.py
+          # 2. Pass the version: use git tag if available, otherwise fallback to dev version
           CIBW_ENVIRONMENT: >
             RS_BACKEND=${{ matrix.backend }}
             RAPIDSPEECH_IS_FOR_PYPI=1
-            SETUPTOOLS_SCM_PRETEND_VERSION=${{ startsWith(github.ref_name, 'v') && github.ref_name || '0.0.0.dev0' }}
-            ${{ matrix.backend == 'cuda' && 'CUDA_PATH=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH' || '' }}
+            SETUPTOOLS_SCM_PRETEND_VERSION=${{ github.ref_name || '0.0.0.dev0' }}
 
-          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
-            export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$(find /project/build -type d -name "rapidspeech" | tr '\n' ':');
-            yum install -y patchelf &&
-            for lib in libggml-cpu.so libggml-base.so libggml.so; do
-              find /project/build -name "*.so" -exec patchelf --replace-needed "ggml/src/$lib" "$lib" {} \; || true;
-            done;
-            auditwheel repair -w {dest_dir} {wheel}
+          # Use NVIDIA's devel image for Linux CUDA to ensure nvcc is available
+          CIBW_MANYLINUX_X86_64_IMAGE: ${{ matrix.backend == 'cuda' && 'nvidia/cuda:11.8.0-devel-centos7' || 'manylinux2014' }}
 
-          CIBW_BEFORE_ALL_LINUX: >-
-            ${{ matrix.backend == 'cuda' && 'yum install -y yum-utils && yum-config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel7/x86_64/cuda-rhel7.repo && yum install -y cuda-nvcc-11-8 cuda-cudart-devel-11-8 && ln -s /usr/local/cuda-11.8 /usr/local/cuda' || '' }}
-
+          # Debug tip: build only for Python 3.9 in debug mode to save time
           CIBW_BUILD: ${{ github.event.inputs.debug_mode == 'true' && 'cp39-*' || '*' }}
-          CIBW_BEFORE_BUILD: pip install pybind11 numpy cmake
+
+          # Install build dependencies (patchelf on Linux fixes ggml NEEDED entries)
+          CIBW_BEFORE_BUILD: >
+            pip install pybind11 numpy cmake &&
+            (command -v yum >/dev/null 2>&1 && yum install -y patchelf || true)
+
+          # Skip legacy Python versions and PyPy
           CIBW_SKIP: cp36-* cp37-* pp*
+
+          # Fix NEEDED entries before auditwheel repair on Linux.
+          # cmake embeds build-tree paths like "ggml/src/libggml-base.so"
+          # which auditwheel cannot resolve.
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
+            tmpdir=$(mktemp -d) &&
+            unzip -q {wheel} -d $tmpdir &&
+            for f in $(find $tmpdir -name '*.so'); do
+              patchelf --set-rpath '$ORIGIN' $f 2>/dev/null || true;
+              for lib in libggml-base libggml-cpu libggml; do
+                patchelf --replace-needed "ggml/src/$lib.so" "$lib.so" $f 2>/dev/null || true;
+              done;
+            done &&
+            (cd $tmpdir && zip -qr {wheel} .) &&
+            rm -rf $tmpdir &&
+            auditwheel repair -w {dest_dir} {wheel}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -75,22 +90,18 @@ jobs:
           path: ./wheelhouse/*.whl
 
   publish:
-    name: Publish to PyPI
     # Trigger publishing only on actual tag pushes, not manual workflow runs
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs: [build_wheels]
     runs-on: ubuntu-latest
     permissions:
-      id-token: write  # Mandatory for OIDC (Trusted Publishers) authentication
+      id-token: write # Mandatory for OIDC (Trusted Publishers) authentication
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
-
-      - name: List wheels
-        run: ls -la dist/
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from setuptools.command.build_ext import build_ext
 import setuptools
+python_executable = sys.executable
 
 def is_macos():
     return platform.system() == "Darwin"
@@ -75,6 +76,7 @@ class BuildExtension(build_ext):
         rapidspeech_dir = Path(__file__).parent.resolve()
 
         cmake_args = os.environ.get("RAPIDSPEECH_CMAKE_ARGS", "")
+        cmake_args += f" -DPYTHON_EXECUTABLE={python_executable} -DPython3_EXECUTABLE={python_executable}"
 
         backend = os.environ.get("RS_BACKEND", "cpu").lower()
         if backend == "cuda":
@@ -179,6 +181,32 @@ class BuildExtension(build_ext):
                     "You can ask for help by creating an issue on GitHub.\n"
                     "\nClick:\n\thttps://github.com/RapidAI/RapidSpeech.cpp/issues/new\n"  # noqa
                 )
+
+            # After cmake install, fix NEEDED entries and RPATH on Linux.
+            # cmake links against build-tree library paths, which can embed
+            # relative paths like "ggml/src/libggml-base.so" into ELF NEEDED
+            # entries.  auditwheel cannot locate those, so we rewrite them
+            # to simple filenames and set $ORIGIN RPATH.
+            if is_linux() and is_for_pypi():
+                import subprocess as sp
+                out_dir = Path(self.build_lib) / "rapidspeech"
+                so_files = list(out_dir.glob("*.so"))
+                if so_files:
+                    # check if patchelf is available
+                    r = sp.run(["which", "patchelf"], capture_output=True)
+                    if r.returncode == 0:
+                        patchelf = r.stdout.decode().strip()
+                        for so_file in so_files:
+                            sf = str(so_file)
+                            sp.run([patchelf, "--set-rpath", "$ORIGIN", sf],
+                                   capture_output=True)
+                            for lib in ["libggml-base", "libggml-cpu", "libggml"]:
+                                sp.run([patchelf, "--replace-needed",
+                                       f"ggml/src/{lib}.so", f"{lib}.so", sf],
+                                       capture_output=True)
+                        print(f"Fixed NEEDED entries in {len(so_files)} .so files")
+                    else:
+                        print("WARNING: patchelf not found, wheel may not be repairable")
 
 
         # cmake install already places all files (pybind module, shared libs,
