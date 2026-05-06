@@ -64,7 +64,7 @@ jobs:
           # Install build dependencies (patchelf on Linux fixes ggml NEEDED entries)
           CIBW_BEFORE_BUILD: >
             pip install pybind11 numpy cmake &&
-            (command -v yum >/dev/null 2>&1 && yum install -y patchelf || true)
+            (command -v yum >/dev/null 2>&1 && yum install -y patchelf zip unzip || true)
 
           # Skip legacy Python versions and PyPy
           CIBW_SKIP: cp36-* cp37-* pp*
@@ -84,6 +84,29 @@ jobs:
             (cd $tmpdir && zip -qr {wheel} .) &&
             rm -rf $tmpdir &&
             auditwheel repair -w {dest_dir} {wheel}
+
+          # Fix install_name entries before delocate-wheel repair on macOS.
+          # cmake embeds build-tree paths in dylib install_names and their
+          # NEEDED references (e.g. /build/path/libggml-base.dylib),
+          # which delocate-wheel cannot resolve. Rewrite them to @rpath-relative.
+          CIBW_REPAIR_WHEEL_COMMAND_MACOS: >
+            tmpdir=$(mktemp -d) &&
+            unzip -q {wheel} -d $tmpdir &&
+            pkg_dir=$tmpdir/rapidspeech &&
+            for f in $(find $pkg_dir -name '*.dylib' -o -name '*.so'); do
+              for lib in libggml-base libggml-cpu libggml-metal libggml-blas libggml librapidspeech-core; do
+                install_name_tool -change "$lib.dylib" "@rpath/$lib.dylib" "$f" 2>/dev/null || true;
+                install_name_tool -change "ggml/src/$lib.dylib" "@rpath/$lib.dylib" "$f" 2>/dev/null || true;
+              done;
+              id=$(otool -D "$f" | tail -1) &&
+              basename_id=$(basename "$id") &&
+              if [ "$id" != "$basename_id" ] && [ -n "$basename_id" ]; then
+                install_name_tool -id "@rpath/$basename_id" "$f" 2>/dev/null || true;
+              fi;
+            done &&
+            (cd $tmpdir && zip -qr {wheel} .) &&
+            rm -rf $tmpdir &&
+            delocate-wheel --require-archs {plat} -w {dest_dir} {wheel}
 
       - uses: actions/upload-artifact@v4
         with:

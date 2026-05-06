@@ -93,13 +93,26 @@ if (RS_ENABLE_PYTHON)
     set(_ggml_targets ggml ggml-base ggml-cpu ggml-metal ggml-blas ggml-vulkan)
     foreach(_t IN LISTS _ggml_targets)
         if (TARGET ${_t})
-            set_target_properties(${_t} PROPERTIES
-                SOVERSION ""
-                VERSION ""
-                NO_SONAME ON
-                INSTALL_RPATH "${RS_RPATH}"
-                BUILD_WITH_INSTALL_RPATH ON
-            )
+            if (APPLE)
+                # On macOS, NO_SONAME ON causes install_name to be the build-tree
+                # path, which delocate-wheel cannot resolve. Use INSTALL_NAME_DIR
+                # instead so install_name becomes @rpath/libname.dylib.
+                set_target_properties(${_t} PROPERTIES
+                    SOVERSION ""
+                    VERSION ""
+                    INSTALL_NAME_DIR "@rpath"
+                    INSTALL_RPATH "${RS_RPATH}"
+                    BUILD_WITH_INSTALL_RPATH ON
+                )
+            else()
+                set_target_properties(${_t} PROPERTIES
+                    SOVERSION ""
+                    VERSION ""
+                    NO_SONAME ON
+                    INSTALL_RPATH "${RS_RPATH}"
+                    BUILD_WITH_INSTALL_RPATH ON
+                )
+            endif()
         endif()
     endforeach()
 endif()
@@ -164,11 +177,19 @@ if (NOT RS_ENABLE_PYTHON)
         SOVERSION 1
     )
 else()
-    set_target_properties(rapidspeech-core PROPERTIES
-        NO_SONAME ON
-        INSTALL_RPATH "${RS_RPATH}"
-        BUILD_WITH_INSTALL_RPATH ON
-    )
+    if (APPLE)
+        set_target_properties(rapidspeech-core PROPERTIES
+            INSTALL_NAME_DIR "@rpath"
+            INSTALL_RPATH "${RS_RPATH}"
+            BUILD_WITH_INSTALL_RPATH ON
+        )
+    else()
+        set_target_properties(rapidspeech-core PROPERTIES
+            NO_SONAME ON
+            INSTALL_RPATH "${RS_RPATH}"
+            BUILD_WITH_INSTALL_RPATH ON
+        )
+    endif()
 endif()
 set_target_properties(rapidspeech-core PROPERTIES
     CXX_VISIBILITY_PRESET hidden
