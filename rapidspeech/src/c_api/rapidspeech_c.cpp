@@ -377,9 +377,42 @@ RS_API rs_error_t rs_reset(rs_context_t *ctx) {
     return RS_ERR_INVALID_ARGS;
   }
 
-  // TODO: Implement reset in RSProcessor
-  set_error(RS_ERR_NOT_IMPLEMENTED, "rs_reset not implemented yet");
-  return RS_ERR_NOT_IMPLEMENTED;
+  ctx->processor->Reset();
+  return RS_OK;
+}
+
+// ============================================
+// 2-pass (CTC + LLM rescoring) support
+// ============================================
+
+RS_API rs_error_t rs_set_use_llm(rs_context_t *ctx, bool use_llm) {
+  if (!ctx || !ctx->model) {
+    set_error(RS_ERR_INVALID_ARGS, "Context or model is NULL");
+    return RS_ERR_INVALID_ARGS;
+  }
+
+  ctx->model->SetUseLLM(use_llm);
+  return RS_OK;
+}
+
+RS_API int32_t rs_redecode(rs_context_t *ctx) {
+  if (!ctx || !ctx->processor) {
+    set_error(RS_ERR_INVALID_ARGS, "Context or processor is NULL");
+    return -1;
+  }
+
+  try {
+    int result = ctx->processor->DecodeOnly();
+    if (result < 0)
+      set_error(RS_ERR_INFERENCE_FAILED, "Re-decode failed");
+    return result;
+  } catch (const std::exception &e) {
+    set_error(RS_ERR_INFERENCE_FAILED, "Re-decode exception: %s", e.what());
+    return -1;
+  } catch (...) {
+    set_error(RS_ERR_INFERENCE_FAILED, "Re-decode unknown error");
+    return -1;
+  }
 }
 
 // ============================================

@@ -52,6 +52,13 @@ public:
   int Process();
 
   /**
+   * Re-run Decode only (skip Encode), used for 2-pass rescoring.
+   * Caller must have already called Process() once to produce encoder output.
+   * @return 0: No new results, 1: New text/audio output available, -1: Error
+   */
+  int DecodeOnly();
+
+  /**
    * Returns the accumulated text result.
    */
   std::string GetTextResult();
@@ -76,6 +83,12 @@ public:
   bool IsValid() const {
     return model_ != nullptr && state_ != nullptr && sched_ != nullptr;
   }
+
+  /**
+   * Reset processor state for a new utterance.
+   * Clears audio buffer, text accumulator, and recreates model state.
+   */
+  void Reset();
 
 private:
   std::shared_ptr<ISpeechModel> model_;

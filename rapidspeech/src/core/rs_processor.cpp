@@ -108,9 +108,44 @@ int RSProcessor::Process() {
   return 1;
 }
 
+int RSProcessor::DecodeOnly() {
+  if (!model_ || !state_ || !sched_) {
+    RS_LOG_ERR("DecodeOnly: Missing model, state, or scheduler.");
+    return -1;
+  }
+
+  if (!model_->SupportsTwoPass()) {
+    RS_LOG_ERR("DecodeOnly: model does not support 2-pass rescoring.");
+    return -1;
+  }
+
+  ggml_backend_sched_reset(sched_);
+
+  auto start = std::chrono::steady_clock::now();
+  if (!model_->Decode(*state_, sched_)) {
+    RS_LOG_ERR("Model decoding failed in DecodeOnly.");
+    return -1;
+  }
+  auto end = std::chrono::steady_clock::now();
+  RS_LOG_INFO("re-decoder takes: %f",
+              std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+                      .count() /
+                  1e6);
+  return 1;
+}
+
 std::string RSProcessor::GetTextResult() {
   text_accumulator_ = model_->GetTranscription(*state_);
   return text_accumulator_;
+}
+
+void RSProcessor::Reset() {
+  audio_buffer_ = CircularBuffer();
+  text_accumulator_.clear();
+  last_token_id_ = -1;
+  if (model_) {
+    state_ = model_->CreateState();
+  }
 }
 
 // CircularBuffer implementation...

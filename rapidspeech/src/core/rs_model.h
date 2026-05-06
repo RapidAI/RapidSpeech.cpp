@@ -43,6 +43,11 @@ public:
 
   virtual std::string GetTranscription(RSState &state) = 0;
 
+  // 2-pass support: runtime control of LLM rescoring (FunASRNano only).
+  // Default no-ops — only FunASRNanoModel overrides these.
+  virtual void SetUseLLM(bool use) { (void)use; }
+  virtual bool SupportsTwoPass() const { return false; }
+
   // Get metadata
   virtual const RSModelMeta &GetMeta() const = 0;
 };

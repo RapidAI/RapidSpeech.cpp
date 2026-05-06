@@ -185,6 +185,22 @@ RS_API int32_t rs_get_audio_buffer_duration_ms(const rs_context_t* ctx);
 // Returns: RS_OK on success, error code on failure
 RS_API rs_error_t rs_reset(rs_context_t* ctx);
 
+// ── 2-pass (CTC + LLM rescoring) support ──
+
+// Enable/disable LLM decoder at runtime (FunASRNano only, other models no-op).
+// When disabled, Decode() uses CTC-greedy (fast, lower accuracy).
+// When enabled,  Decode() uses the LLM (slower, higher accuracy).
+// Typical 2-pass flow: push audio, process with LLM=off (first pass),
+//   then rs_redecode with LLM=on (second pass).
+// Returns: RS_OK on success
+RS_API rs_error_t rs_set_use_llm(rs_context_t* ctx, bool use_llm);
+
+// Re-run the decoder only (skip encoder) — used after rs_set_use_llm to
+// rescore the same encoder output with different decoder settings.
+// Caller must have completed at least one rs_process() first.
+// Returns: 0=No output, 1=Has output, -1=Error
+RS_API int32_t rs_redecode(rs_context_t* ctx);
+
 // ============================================
 // Utility Functions
 // ============================================
