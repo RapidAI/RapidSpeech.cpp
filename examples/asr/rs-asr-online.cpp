@@ -58,7 +58,7 @@
 #include <iomanip>
 #include <iostream>
 #include <mutex>
-#include <queue>
+#include <deque>
 #include <string>
 #include <thread>
 #include <vector>
@@ -121,11 +121,11 @@ public:
       float oldest_dur = oldest.end_s - oldest.start_s;
       queue_dur_s_ -= oldest_dur;
       dropped_++;
-      segments_.pop();
+      segments_.pop_front();
     }
 
     queue_dur_s_ += seg_dur;
-    segments_.push(std::move(seg));
+    segments_.push_back(std::move(seg));
     total_queued_++;
 
     // Signal ASR thread
@@ -143,9 +143,28 @@ public:
     if (segments_.empty())
       return false; // done_ is true and nothing left
     seg = std::move(segments_.front());
-    segments_.pop();
+    segments_.pop_front();
     queue_dur_s_ -= (seg.end_s - seg.start_s);
     return true;
+  }
+
+  // Non-blocking pop — returns false if queue is empty.
+  bool try_pop(Segment &seg) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (segments_.empty())
+      return false;
+    seg = std::move(segments_.front());
+    segments_.pop_front();
+    queue_dur_s_ -= (seg.end_s - seg.start_s);
+    return true;
+  }
+
+  // Push a segment to the front (used when putting back an unmerged segment).
+  void push_front(Segment seg) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    float seg_dur = seg.end_s - seg.start_s;
+    queue_dur_s_ += seg_dur;
+    segments_.push_front(std::move(seg));
   }
 
   // Signal that no more segments will be pushed.
@@ -179,7 +198,7 @@ public:
   int dropped() const { return dropped_.load(); }
 
 private:
-  std::queue<Segment> segments_;
+  std::deque<Segment> segments_;
   std::mutex mtx_;
   std::condition_variable cv_;
   bool done_ = false;
@@ -504,7 +523,20 @@ static bool process_segment(rs_context_t *asr_ctx,
   float seg_dur = (float)pcm.size() / 16000;
   auto t0 = std::chrono::steady_clock::now();
 
-  rs_error_t err = rs_push_audio(asr_ctx, pcm.data(), (int32_t)pcm.size());
+  // Pad short segments (< 1s) with trailing zeros so the ASR processor
+  // has enough audio to run inference (Process() requires >= chunk_size_samples).
+  const int MIN_ASR_SAMPLES = 16000; // 1 second at 16 kHz
+  std::vector<float> pcm_padded;
+  const float *pcm_ptr = pcm.data();
+  int32_t pcm_len = (int32_t)pcm.size();
+  if (pcm_len < MIN_ASR_SAMPLES) {
+    pcm_padded = pcm;
+    pcm_padded.resize(MIN_ASR_SAMPLES, 0.f);
+    pcm_ptr = pcm_padded.data();
+    pcm_len = MIN_ASR_SAMPLES;
+  }
+
+  rs_error_t err = rs_push_audio(asr_ctx, pcm_ptr, pcm_len);
   if (err != RS_OK) {
     LOG_ERROR("rs_push_audio failed for seg #%d", seg_index);
     rs_reset(asr_ctx);
@@ -618,8 +650,39 @@ static void asr_worker(const std::string &model_path, int n_threads,
   }
   worker_ready = true;
 
+  // Merge consecutive short segments that are close together.
+  // Short utterances (< 1.2s) with small gaps (< 0.5s) are often
+  // VAD fragmentation artifacts — merging them gives ASR enough
+  // context to produce a result.
+  const float SHORT_SEG_S = 1.2f;
+  const float MERGE_GAP_S = 0.5f;
+  const int SAMPLE_RATE = 16000;
+
   SpeechSegmentQueue::Segment seg;
   while (queue.pop(seg)) {
+    float seg_dur = seg.end_s - seg.start_s;
+    if (seg_dur < SHORT_SEG_S) {
+      // Try to merge with upcoming segments
+      SpeechSegmentQueue::Segment next;
+      while (queue.try_pop(next)) {
+        float gap = next.start_s - seg.end_s;
+        if (gap <= MERGE_GAP_S) {
+          // Fill gap with zeros and append
+          int gap_samples = (int)(gap * SAMPLE_RATE);
+          seg.pcm.insert(seg.pcm.end(), gap_samples, 0.f);
+          seg.pcm.insert(seg.pcm.end(), next.pcm.begin(), next.pcm.end());
+          seg.end_s = next.end_s;
+          seg_dur = seg.end_s - seg.start_s;
+          if (seg_dur >= SHORT_SEG_S)
+            break; // enough audio now
+        } else {
+          // Gap too large — put back and stop merging
+          queue.push_front(std::move(next));
+          break;
+        }
+      }
+    }
+
     process_segment(asr_ctx, seg.pcm, seg.start_s, seg.end_s, seg.index,
                     two_pass);
     seg_processed++;
@@ -661,7 +724,13 @@ process_vad_chunk(const float *chunk, int chunk_samples,
   ggml_backend_sched_reset(vad_sched);
   bool vad_ok = vad_model.Encode(vad_in, vad_state, vad_sched);
   float prob = vad_ok ? vad_model.GetSpeechProbability(vad_state) : 0.f;
-  bool is_speech = (prob >= args.vad_threshold);
+
+  // Hysteresis: use a lower exit threshold once in speech to avoid
+  // splitting on brief probability dips (matches Silero VADIterator logic).
+  float enter_threshold = args.vad_threshold;
+  float exit_threshold = std::max(0.01f, args.vad_threshold - 0.15f);
+  bool is_speech = state.in_speech ? (prob >= exit_threshold)
+                                   : (prob >= enter_threshold);
 
   // Progress indicator
   float pos_s = (float)state.total_samples_read / SAMPLE_RATE;

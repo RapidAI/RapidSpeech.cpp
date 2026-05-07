@@ -106,5 +106,5 @@ private:
 
   // Config: SenseVoice usually processes in chunks.
   // 1600 samples = 100ms at 16kHz. Adjust based on model requirements.
-  int chunk_size_samples_ = 16000; // 1 second chunks for offline-like testing
+  int chunk_size_samples_ = 1600; // 100ms chunks
 };

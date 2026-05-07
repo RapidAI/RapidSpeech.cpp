@@ -65,7 +65,7 @@ RapidSpeech.cpp is not just an inference wrapper — it is a full-featured speec
   A `ggml`-based computation backend supporting mixed-precision inference from INT4 to FP32.
 
 - **Architecture Layer**
-  A plugin-style model construction and loading system, with planned support for FunASR-nano, CosyVoice, Qwen3-TTS, and more.
+  A plugin-style model construction and loading system, with support for FunASR-nano, SenseVoice, and planned support for CosyVoice, Qwen3-TTS, and more.
 
 - **Business Logic Layer**
   Built-in ring buffers, VAD (voice activity detection), text frontend processing (e.g., phonemization), and multi-session management.
@@ -74,11 +74,11 @@ RapidSpeech.cpp is not just an inference wrapper — it is a full-featured speec
 
 ## 🚀 Core Features
 
-- **Extreme Quantization**: Native support for 4-bit, 5-bit, and 6-bit quantization schemes to match diverse hardware constraints.
-- **Zero Dependencies**: Implemented entirely in C/C++, producing a single lightweight binary.
-- **GPU / NPU Acceleration**: Customized CUDA and Metal backends optimized for speech models.
-- **Unified Model Format**: Both ASR and TTS models use an extended **GGUF** format.
-- **Python Bindings**: Python interface via pybind11, installable via pip, callable with just one line of code.
+- [x] **Extreme Quantization**: Native support for 4-bit, 5-bit, and 6-bit quantization schemes to match diverse hardware constraints.
+- [x] **Zero Dependencies**: Implemented entirely in C/C++, producing a single lightweight binary.
+- [x] **GPU / NPU Acceleration**: Customized CUDA and Metal backends optimized for speech models.
+- [x] **Unified Model Format**: Both ASR and TTS models use an extended **GGUF** format.
+- [x] **Python Bindings**: Python API via pybind11, installable with `pip install`.
 
 ------
 
@@ -86,14 +86,12 @@ RapidSpeech.cpp is not just an inference wrapper — it is a full-featured speec
 
 ### Download Models
 
-Download GGUF model files from:
+Models are available on:
 
 - 🤗 Hugging Face: https://huggingface.co/RapidAI/RapidSpeech
 - ModelScope: https://www.modelscope.cn/models/RapidAI/RapidSpeech
 
-### C++ Build
-
-#### Basic Build (CPU only)
+### Build from Source
 
 ```bash
 git clone https://github.com/RapidAI/RapidSpeech.cpp
@@ -103,208 +101,203 @@ cmake -B build
 cmake --build build --config Release
 ```
 
-#### Enable GPU Acceleration
+Build artifacts are located in the `build/` directory:
+- `rs-asr-offline` — Offline ASR command-line tool
+- `rs-asr-online` — Online (streaming) ASR command-line tool
+- `rs-quantize` — Model quantization tool
 
-<details>
-<summary>🍎 macOS Metal (enabled by default)</summary>
+### C++ CLI Usage
 
-Metal acceleration is enabled by default on macOS — no extra configuration needed:
+#### Offline Recognition (rs-asr-offline)
 
-```bash
-cmake -B build
-cmake --build build --config Release
-```
-
-</details>
-
-<details>
-<summary>🖥️ NVIDIA CUDA</summary>
+**Basic — single file without VAD:**
 
 ```bash
-cmake -B build -DRS_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
-cmake --build build --config Release
-```
-
-</details>
-
-<details>
-<summary>🌋 Vulkan</summary>
-
-```bash
-cmake -B build -DRS_VULKAN=ON
-cmake --build build --config Release
-```
-
-</details>
-
-<details>
-<summary>⚡ Huawei CANN (Ascend NPU)</summary>
-
-```bash
-cmake -B build -DRS_CANN=ON
-cmake --build build --config Release
-```
-
-</details>
-
-### C++ Command-Line Usage
-
-After building, use `rs-asr-offline` for offline speech recognition:
-
-```bash
-# Basic usage
 ./build/rs-asr-offline \
-  -m /path/to/model.gguf \
-  -w /path/to/audio.wav
-
-# Specify threads and GPU
-./build/rs-asr-offline \
-  -m /path/to/model.gguf \
+  -m /path/to/funasr-nano-fp16.gguf \
   -w /path/to/audio.wav \
-  -t 8 \
-  --gpu 1
+  -t 4 \
+  --gpu true
 ```
 
-**Command-line arguments:**
+**With VAD segmentation (recommended for long audio):**
 
-| Argument | Description | Default |
+```bash
+./build/rs-asr-offline \
+  -m /path/to/funasr-nano-fp16.gguf \
+  -v /path/to/silero_vad_v6.gguf \
+  -w /path/to/audio.wav \
+  -t 4 \
+  --vad-threshold 0.5 \
+  --silence-ms 600
+```
+
+When a VAD model is provided, the tool automatically segments the audio by speech activity and produces timestamped results per segment.
+
+Parameters:
+
+| Flag | Description | Default |
 | --- | --- | --- |
-| `-m, --model` | Model file path (required) | - |
-| `-w, --wav` | WAV audio file path (optional; uses a test sine wave if not provided) | - |
+| `-m, --model` | Path to GGUF model file (required) | — |
+| `-w, --wav` | Path to WAV audio file (16 kHz, required) | — |
+| `-v, --vad` | Path to Silero VAD GGUF model (optional, enables VAD segmentation) | — |
 | `-t, --threads` | Number of CPU threads | 4 |
 | `--gpu` | Enable GPU acceleration (`true`/`false`) | true |
-| `-h, --help` | Show help message | - |
+| `--vad-threshold` | VAD speech probability threshold (0–1, lower = more sensitive) | 0.5 |
+| `--silence-ms` | Silence duration to split segments (ms) | 600 |
+| `--max-segment-s` | Max segment length for ASR input (seconds) | 30.0 |
+
+#### Online / Streaming Recognition (rs-asr-online)
+
+**WAV file (simulate streaming):**
+
+```bash
+./build/rs-asr-online \
+  -m /path/to/funasr-nano-fp16.gguf \
+  -v /path/to/silero_vad_v6.gguf \
+  -w /path/to/audio.wav \
+  -t 4 \
+  --vad-threshold 0.5 \
+  --silence-ms 600
+```
+
+**Microphone (live mode):**
+
+```bash
+./build/rs-asr-online \
+  -m /path/to/funasr-nano-fp16.gguf \
+  -v /path/to/silero_vad_v6.gguf \
+  --mic \
+  -t 4
+```
+
+**Two-pass mode (CTC fast pass + LLM rescoring, FunASR-Nano only):**
+
+```bash
+./build/rs-asr-online \
+  -m /path/to/funasr-nano-fp16.gguf \
+  -v /path/to/silero_vad_v6.gguf \
+  -w /path/to/audio.wav \
+  --two-pass
+```
+
+Parameters:
+
+| Flag | Description | Default |
+| --- | --- | --- |
+| `-m, --model` | Path to ASR GGUF model file (required) | — |
+| `-v, --vad` | Path to Silero VAD model file (required) | — |
+| `-w, --wav` | Path to WAV audio file (16 kHz) | — |
+| `--mic` | Use microphone input (live mode) | off |
+| `--mic-device` | Audio device index for mic input | auto |
+| `--mic-chunk-ms` | Mic read chunk size (ms) | 32 |
+| `-t, --threads` | Number of CPU threads | 4 |
+| `--gpu` | Enable GPU acceleration (`true`/`false`) | true |
+| `--vad-threshold` | VAD speech detection threshold (0–1, lower = more sensitive) | 0.5 |
+| `--silence-ms` | Silence timeout for segment splitting (ms) | 600 |
+| `--two-pass` | Enable 2-pass mode: CTC decode + LLM rescore | off |
+
+#### Model Quantization (rs-quantize)
+
+```bash
+./build/rs-quantize /path/to/funasr-nano-fp16.gguf /path/to/output-q4_k.gguf q4_k
+```
+
+Supported quantization types: `q4_0`, `q4_k`, `q5_0`, `q5_k`, `q8_0`, `f16`, `f32`
+
+> ⚠️ **Note**: Q2_K quantization causes unacceptable accuracy loss for FunASR Nano, producing garbled output. Not recommended.
 
 ### Python Usage
 
 #### Installation
 
-**Option 1: pip install (recommended)**
-
 ```bash
-# CPU version
+# Install from PyPI (CPU version)
 pip install rapidspeech
 
 # CUDA version
 pip install rapidspeech-cuda
 
-# Metal version (macOS)
+# macOS Metal version
 pip install rapidspeech-metal
 ```
 
-**Option 2: Build from source**
+#### Build Python Package from Source
 
 ```bash
-git clone https://github.com/RapidAI/RapidSpeech.cpp
-cd RapidSpeech.cpp
-git submodule sync && git submodule update --init --recursive
-
-# Build with Python bindings
 pip install .
-
-# Or specify CUDA backend
+# Or specify backend
 RS_BACKEND=cuda pip install .
 ```
 
-#### Python API Example
+#### Python API
 
 ```python
-import numpy as np
 import rapidspeech
+import numpy as np
 
-# 1. Initialize the offline ASR recognizer
-asr = rapidspeech.asr_offline(
-    model_path="/path/to/model.gguf",
+# Initialize ASR context
+ctx = rapidspeech.asr_offline(
+    model_path="funasr-nano-fp16.gguf",
     n_threads=4,
     use_gpu=True
 )
 
-# 2. Load audio data (float32, 16kHz, mono)
-# pcm should be a numpy float32 array in the range [-1.0, 1.0]
-pcm = load_wav("audio.wav")  # Implement WAV loading yourself, or use soundfile / scipy.io.wavfile
+# Read WAV audio (16 kHz, float32, mono)
+pcm = ...  # np.ndarray, shape=[N], dtype=float32
 
-# 3. Push audio data
-asr.push_audio(pcm)
+# Push audio and recognize
+ctx.push_audio(pcm)
+ctx.process()
 
-# 4. Run inference
-asr.process()
-
-# 5. Get the recognition result
-text = asr.get_text()
+# Get recognition result
+text = ctx.get_text()
 print(f"Result: {text}")
 ```
 
-A complete offline recognition example script is available at [`python-api-examples/asr/asr-offline.py`](./python-api-examples/asr/asr-offline.py).
-
-Run the example:
-
-```bash
-python python-api-examples/asr/asr-offline.py \
-  --model /path/to/model.gguf \
-  --audio /path/to/audio.wav \
-  --threads 4 \
-  --gpu 1
-```
-
-#### Python API Reference
-
-| Class / Method | Description |
-| --- | --- |
-| `rapidspeech.asr_offline(model_path, n_threads=4, use_gpu=True)` | Create an offline ASR recognizer |
-| `asr.push_audio(pcm)` | Push float32 audio data (1-D numpy array) |
-| `asr.process()` | Run inference, returns status code (0=no output, 1=has output, -1=error) |
-| `asr.get_text()` | Get the recognized text result |
-
-### C API Reference
-
-RapidSpeech provides a C interface for integration with other languages and projects. Key APIs:
-
-```c
-#include "rapidspeech.h"
-
-// Initialization
-rs_init_params_t params = rs_default_params();
-params.model_path = "/path/to/model.gguf";
-params.n_threads   = 4;
-params.use_gpu     = true;
-rs_context_t* ctx = rs_init_from_file(params);
-
-// Push audio and run inference
-rs_push_audio(ctx, pcm_data, num_samples);
-int32_t status = rs_process(ctx);
-
-// Get result
-const char* text = rs_get_text_output(ctx);
-
-// Release resources
-rs_free(ctx);
-```
-
-For the complete C API documentation, see [`include/rapidspeech.h`](./include/rapidspeech.h).
+See [python-api-examples/asr/asr-offline.py](python-api-examples/asr/asr-offline.py) for a complete example.
 
 ------
 
-## 🔧 Development & Build Options
+## 📊 Performance Benchmarks
 
-### CMake Options
+Test environment: Apple M1 Pro, funasr-nano-fp16.gguf, 15s audio
 
-| Option | Description | Default |
-| --- | --- | --- |
-| `RS_BUILD_TESTS` | Build test executables | ON |
-| `RS_CUDA` | Enable CUDA acceleration | OFF |
-| `RS_METAL` | Enable Metal acceleration (macOS only) | Auto-detect |
-| `RS_VULKAN` | Enable Vulkan acceleration | OFF |
-| `RS_CANN` | Enable Huawei CANN acceleration | OFF |
-| `RS_OPENCL` | Enable OpenCL acceleration | OFF |
-| `RS_ENABLE_PYTHON` | Enable Python bindings (pybind11) | OFF |
+| Configuration | RTF | Wall Time | Notes |
+| --- | --- | --- | --- |
+| CPU -t 4 | 0.465 | 12.4s | CPU-only inference |
+| GPU -t 4 | 0.170 | 5.2s | Metal acceleration |
+| GPU -t 4 Q4_K | 0.756 | — | Quantized model: GPU dequant overhead |
+| CPU -t 4 Q4_K | 0.530 | — | Quantized model CPU inference, 596 MB (3.3× compression) |
 
-### Model Conversion
+> RTF (Real-Time Factor) = Processing time / Audio duration. Lower is faster. RTF < 1 means faster than real-time.
 
-Use the provided script to convert Hugging Face models to GGUF format:
+------
+
+## 🔧 Model Format Conversion
+
+### ASR Model (HF → GGUF)
+
+A conversion tool from HuggingFace models to GGUF format is provided:
 
 ```bash
-python scripts/convert_hf_to_gguf.py --model /path/to/hf-model --output /path/to/output.gguf
+python scripts/convert_hf_to_gguf.py \
+  --model /path/to/hf-model-dir \
+  --outfile /path/to/output.gguf \
+  --outtype f16
 ```
+
+### Silero VAD Model (safetensors → GGUF)
+
+To convert the Silero VAD model for use with `rs-asr-online` or offline VAD segmentation:
+
+```bash
+python scripts/convert_silero_to_gguf.py \
+  --model /path/to/silero_vad_16k.safetensors \
+  --output /path/to/silero_vad_v6.gguf
+```
+
+The converted VAD model is also available for direct download from [HuggingFace](https://huggingface.co/RapidAI/RapidSpeech) and [ModelScope](https://www.modelscope.cn/models/RapidAI/RapidSpeech).
 
 ------
 
@@ -312,9 +305,9 @@ python scripts/convert_hf_to_gguf.py --model /path/to/hf-model --output /path/to
 
 If you are interested in the following areas, we welcome your PRs or participation in discussions:
 
-- Adapting more models (Qwen3-ASR, CosyVoice3, etc.)
-- Refining the framework architecture and performance optimization
-- Improving documentation and examples
+- Adapting more models to the framework.
+- Refining and optimizing the project architecture.
+- Improving inference performance.
 
 ## Acknowledgements
 
