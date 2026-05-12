@@ -83,6 +83,8 @@ if (RS_ENABLE_PYTHON)
     endif()
 endif()
 
+add_compile_definitions(GGML_MAX_NAME=128)
+
 add_subdirectory(${GGML_PATH} ggml)
 
 # Remove SONAME versioning from ggml targets for Python wheel packaging.
