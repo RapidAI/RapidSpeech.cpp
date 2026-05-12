@@ -191,15 +191,29 @@ RS_API rs_error_t rs_push_text(rs_context_t *ctx, const char *text) {
     return RS_ERR_INVALID_ARGS;
   }
 
+  if (!ctx->processor) {
+    set_error(RS_ERR_INVALID_ARGS, "Processor not initialized");
+    return RS_ERR_INVALID_ARGS;
+  }
+
   if (!text) {
     set_error(RS_ERR_INVALID_ARGS, "Text is NULL");
     return RS_ERR_INVALID_ARGS;
   }
 
-  // TODO: Implement TTS/LLM text push when TTS models are supported
-  set_error(RS_ERR_NOT_IMPLEMENTED,
-            "rs_push_text not implemented yet (TTS/LLM support pending)");
-  return RS_ERR_NOT_IMPLEMENTED;
+  try {
+    if (ctx->processor->PushText(text) != 0) {
+      set_error(RS_ERR_INFERENCE_FAILED, "PushText failed");
+      return RS_ERR_INFERENCE_FAILED;
+    }
+    return RS_OK;
+  } catch (const std::exception &e) {
+    set_error(RS_ERR_INFERENCE_FAILED, "PushText failed: %s", e.what());
+    return RS_ERR_INFERENCE_FAILED;
+  } catch (...) {
+    set_error(RS_ERR_INFERENCE_FAILED, "PushText unknown error");
+    return RS_ERR_INFERENCE_FAILED;
+  }
 }
 
 RS_API int32_t rs_process(rs_context_t *ctx) {
@@ -209,7 +223,14 @@ RS_API int32_t rs_process(rs_context_t *ctx) {
   }
 
   try {
-    int result = ctx->processor->Process();
+    int result;
+    // Route to TTS or ASR processing based on model architecture
+    const std::string &arch = ctx->processor->GetArchName();
+    if (arch == "openvoice2" || arch == "OmniVoice") {
+      result = ctx->processor->ProcessTTS();
+    } else {
+      result = ctx->processor->Process();
+    }
 
     if (result < 0) {
       set_error(RS_ERR_INFERENCE_FAILED, "Processing failed");
@@ -240,11 +261,61 @@ RS_API int32_t rs_get_audio_output(rs_context_t *ctx, float **out_pcm) {
     return -1;
   }
 
-  // TODO: Implement TTS audio output when TTS models are supported
-  *out_pcm = nullptr;
-  set_error(RS_ERR_NOT_IMPLEMENTED,
-            "rs_get_audio_output not implemented yet (TTS support pending)");
-  return -1;
+  if (!ctx->processor) {
+    set_error(RS_ERR_INVALID_ARGS, "Processor not initialized");
+    return -1;
+  }
+
+  return ctx->processor->GetAudioOutput(out_pcm);
+}
+
+RS_API int rs_push_reference_audio(rs_context_t *ctx, const float *samples,
+                                       int32_t n_samples, int32_t sample_rate) {
+  if (!ctx || !ctx->processor) {
+    set_error(RS_ERR_INVALID_ARGS, "Context or processor is NULL");
+    return -1;
+  }
+  if (!samples || n_samples <= 0) {
+    set_error(RS_ERR_INVALID_ARGS, "Invalid reference audio data");
+    return -1;
+  }
+  try {
+    return ctx->processor->PushReferenceAudio(samples, n_samples, sample_rate);
+  } catch (const std::exception &e) {
+    set_error(RS_ERR_INFERENCE_FAILED, "PushReferenceAudio failed: %s", e.what());
+    return -1;
+  } catch (...) {
+    set_error(RS_ERR_INFERENCE_FAILED, "PushReferenceAudio unknown error");
+    return -1;
+  }
+}
+
+RS_API rs_error_t rs_push_reference_text(rs_context_t *ctx, const char *ref_text) {
+  if (!ctx) {
+    set_error(RS_ERR_INVALID_ARGS, "Context is NULL");
+    return RS_ERR_INVALID_ARGS;
+  }
+  if (!ctx->processor) {
+    set_error(RS_ERR_INVALID_ARGS, "Processor not initialized");
+    return RS_ERR_INVALID_ARGS;
+  }
+  if (!ref_text) {
+    set_error(RS_ERR_INVALID_ARGS, "Reference text is NULL");
+    return RS_ERR_INVALID_ARGS;
+  }
+  try {
+    if (ctx->processor->PushReferenceText(ref_text) != 0) {
+      set_error(RS_ERR_INFERENCE_FAILED, "PushReferenceText failed");
+      return RS_ERR_INFERENCE_FAILED;
+    }
+    return RS_OK;
+  } catch (const std::exception &e) {
+    set_error(RS_ERR_INFERENCE_FAILED, "PushReferenceText failed: %s", e.what());
+    return RS_ERR_INFERENCE_FAILED;
+  } catch (...) {
+    set_error(RS_ERR_INFERENCE_FAILED, "PushReferenceText unknown error");
+    return RS_ERR_INFERENCE_FAILED;
+  }
 }
 
 RS_API const char *rs_get_text_output(rs_context_t *ctx) {
@@ -336,6 +407,24 @@ RS_API rs_error_t rs_set_cmvn_params(rs_context_t *ctx, const float *means,
   }
 }
 
+RS_API rs_error_t rs_set_tts_params(rs_context_t *ctx, const char *instruct,
+                                    const char *language, int32_t seed) {
+  if (!ctx || !ctx->processor) {
+    set_error(RS_ERR_INVALID_ARGS, "Context or processor is NULL");
+    return RS_ERR_INVALID_ARGS;
+  }
+  try {
+    ctx->processor->SetTTSParams(instruct, language, seed);
+    return RS_OK;
+  } catch (const std::exception &e) {
+    set_error(RS_ERR_INFERENCE_FAILED, "SetTTSParams failed: %s", e.what());
+    return RS_ERR_INFERENCE_FAILED;
+  } catch (...) {
+    set_error(RS_ERR_INFERENCE_FAILED, "SetTTSParams unknown error");
+    return RS_ERR_INFERENCE_FAILED;
+  }
+}
+
 RS_API rs_error_t rs_set_chunk_size(rs_context_t *ctx, int32_t chunk_size_ms) {
   if (!ctx || !ctx->processor) {
     set_error(RS_ERR_INVALID_ARGS, "Context or processor is NULL");
@@ -385,6 +474,31 @@ RS_API rs_error_t rs_reset(rs_context_t *ctx) {
 // 2-pass (CTC + LLM rescoring) support
 // ============================================
 
+RS_API rs_error_t rs_set_user_input_prompt(rs_context_t *ctx,
+                                           const char *prompt) {
+  if (!ctx || !ctx->processor) {
+    set_error(RS_ERR_INVALID_ARGS, "Context or processor is NULL");
+    return RS_ERR_INVALID_ARGS;
+  }
+
+  if (!prompt) {
+    set_error(RS_ERR_INVALID_ARGS, "prompt is NULL");
+    return RS_ERR_INVALID_ARGS;
+  }
+
+  try {
+    ctx->processor->SetUserInputPrompt(std::string(prompt));
+    return RS_OK;
+  } catch (const std::exception &e) {
+    set_error(RS_ERR_INFERENCE_FAILED, "SetUserInputPrompt failed: %s",
+              e.what());
+    return RS_ERR_INFERENCE_FAILED;
+  } catch (...) {
+    set_error(RS_ERR_INFERENCE_FAILED, "SetUserInputPrompt unknown error");
+    return RS_ERR_INFERENCE_FAILED;
+  }
+}
+
 RS_API rs_error_t rs_set_use_llm(rs_context_t *ctx, bool use_llm) {
   if (!ctx || !ctx->model) {
     set_error(RS_ERR_INVALID_ARGS, "Context or model is NULL");
@@ -392,6 +506,16 @@ RS_API rs_error_t rs_set_use_llm(rs_context_t *ctx, bool use_llm) {
   }
 
   ctx->model->SetUseLLM(use_llm);
+  return RS_OK;
+}
+
+RS_API rs_error_t rs_set_ctc_precheck(rs_context_t *ctx, bool enable) {
+  if (!ctx || !ctx->model) {
+    set_error(RS_ERR_INVALID_ARGS, "Context or model is NULL");
+    return RS_ERR_INVALID_ARGS;
+  }
+
+  ctx->model->SetCTCPrecheck(enable);
   return RS_OK;
 }
 
