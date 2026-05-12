@@ -28,7 +28,7 @@ struct rs_context_t {
   rs_context_t();
   ~rs_context_t();
 
-  bool init_backend();
+  bool init_backend(bool prefer_cpu = false);
 };
 
 // --- Internal Framework Registry API ---

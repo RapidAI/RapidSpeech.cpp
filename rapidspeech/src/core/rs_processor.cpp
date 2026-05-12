@@ -37,6 +37,12 @@ void RSProcessor::SetCMVN(const std::vector<float> &means,
   }
 }
 
+void RSProcessor::SetUserInputPrompt(const std::string &prompt) {
+  if (model_) {
+    model_->SetUserInputPrompt(prompt);
+  }
+}
+
 int RSProcessor::Process() {
   if (!model_ || !state_ || !sched_) {
     RS_LOG_ERR("Processor error: Missing model, state, or scheduler.");
@@ -143,9 +149,83 @@ void RSProcessor::Reset() {
   audio_buffer_ = CircularBuffer();
   text_accumulator_.clear();
   last_token_id_ = -1;
+  tts_encoded_ = false;
+  tts_decoded_ = false;
+  tts_audio_buf_.clear();
+  tts_audio_read_pos_ = 0;
   if (model_) {
     state_ = model_->CreateState();
   }
+}
+
+// =====================================================================
+// TTS methods
+// =====================================================================
+
+void RSProcessor::SetTTSParams(const char *instruct, const char *language,
+                                int seed) {
+  if (instruct) tts_instruct_ = instruct;
+  if (language) tts_language_ = language;
+  tts_seed_ = seed;
+}
+
+int RSProcessor::PushText(const char *text, const char *language) {
+  if (!model_ || !state_) return -1;
+  const char *lang = language ? language : tts_language_.c_str();
+  return model_->PushText(*state_, text, lang, tts_instruct_.c_str()) ? 0 : -1;
+}
+
+int RSProcessor::PushReferenceAudio(const float *samples, int n_samples,
+                                     int sample_rate) {
+  if (!model_ || !state_ || !sched_) return -1;
+  return model_->PushReferenceAudio(*state_, samples, n_samples, sample_rate,
+                                    sched_) ? 0 : -1;
+}
+
+int RSProcessor::PushReferenceText(const char *ref_text) {
+  if (!model_ || !state_) return -1;
+  return model_->PushReferenceText(*state_, ref_text) ? 0 : -1;
+}
+
+int RSProcessor::ProcessTTS() {
+  if (!model_ || !state_ || !sched_) return -1;
+
+  if (!tts_encoded_) {
+    ggml_backend_sched_reset(sched_);
+    if (!model_->Encode({}, *state_, sched_)) return -1;
+    tts_encoded_ = true;
+  }
+
+  if (tts_decoded_) {
+    return 0;
+  }
+
+  ggml_backend_sched_reset(sched_);
+  if (!model_->Decode(*state_, sched_)) {
+    tts_decoded_ = true;  // No more chunks to decode
+    return 0;
+  }
+
+  float *chunk_data = nullptr;
+  int chunk_n = model_->GetAudioOutput(*state_, &chunk_data);
+  if (chunk_n > 0 && chunk_data) {
+    tts_audio_buf_.assign(chunk_data, chunk_data + chunk_n);
+    tts_audio_read_pos_ = 0;
+  }
+
+  return 1;  // More chunks available
+}
+
+int RSProcessor::GetAudioOutput(float **out_data) {
+  if (tts_audio_buf_.empty() ||
+      tts_audio_read_pos_ >= static_cast<int>(tts_audio_buf_.size())) {
+    *out_data = nullptr;
+    return 0;
+  }
+  *out_data = tts_audio_buf_.data() + tts_audio_read_pos_;
+  int n = static_cast<int>(tts_audio_buf_.size()) - tts_audio_read_pos_;
+  tts_audio_read_pos_ = static_cast<int>(tts_audio_buf_.size());
+  return n;
 }
 
 // CircularBuffer implementation...

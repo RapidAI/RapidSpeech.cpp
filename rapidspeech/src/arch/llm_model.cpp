@@ -596,6 +596,9 @@ bool llm_model::load_hparams(struct gguf_context *ctx_gguf) {
   if (arch_str == "qwen3" || arch_str == "FunASRNano") {
     hparams_.arch = LLM_ARCH_QWEN3;
     arch_key = arch_str == "FunASRNano" ? "qwen3" : arch_str;
+  } else if (arch_str == "omnivoice-lm") {
+    hparams_.arch = LLM_ARCH_QWEN3;
+    arch_key = "omnivoice-lm";
   } else if (arch_str == "llama") {
     hparams_.arch = LLM_ARCH_LLAMA;
     arch_key = "llama";
@@ -612,7 +615,11 @@ bool llm_model::load_hparams(struct gguf_context *ctx_gguf) {
       key = full_key.c_str();
     }
     int idx = gguf_find_key(ctx_gguf, key);
-    return (idx != -1) ? gguf_get_val_i32(ctx_gguf, idx) : default_val;
+    if (idx == -1) return default_val;
+    auto type = gguf_get_kv_type(ctx_gguf, idx);
+    if (type == GGUF_TYPE_UINT32)
+      return (int32_t)gguf_get_val_u32(ctx_gguf, idx);
+    return gguf_get_val_i32(ctx_gguf, idx);
   };
 
   auto get_f32 = [&](const char *key, float default_val) -> float {
@@ -624,10 +631,21 @@ bool llm_model::load_hparams(struct gguf_context *ctx_gguf) {
       key = full_key.c_str();
     }
     int idx = gguf_find_key(ctx_gguf, key);
-    return (idx != -1) ? gguf_get_val_f32(ctx_gguf, idx) : default_val;
+    if (idx == -1) return default_val;
+    auto type = gguf_get_kv_type(ctx_gguf, idx);
+    if (type == GGUF_TYPE_INT32)
+      return (float)gguf_get_val_i32(ctx_gguf, idx);
+    if (type == GGUF_TYPE_UINT32)
+      return (float)gguf_get_val_u32(ctx_gguf, idx);
+    if (type == GGUF_TYPE_INT64)
+      return (float)gguf_get_val_i64(ctx_gguf, idx);
+    if (type == GGUF_TYPE_UINT64)
+      return (float)gguf_get_val_u64(ctx_gguf, idx);
+    return gguf_get_val_f32(ctx_gguf, idx);
   };
 
-  hparams_.n_vocab = get_i32("tokenizer.vocab_size", 0);
+  hparams_.n_vocab = get_i32("tokenizer.vocab_size",
+                              get_i32("%s.vocab_size", 0));
   hparams_.n_embd = get_i32("%s.embedding_length", 0);
   hparams_.n_layer = get_i32("%s.block_count", 0);
   hparams_.n_head = get_i32("%s.attention.head_count", 0);
@@ -640,7 +658,7 @@ bool llm_model::load_hparams(struct gguf_context *ctx_gguf) {
   hparams_.f_norm_rms_eps =
       get_f32("%s.attention.layer_norm_rms_epsilon", hparams_.f_norm_eps);
 
-  hparams_.rope_freq_base = get_i32("%s.rope.freq_base", 10000);
+  hparams_.rope_freq_base = (int32_t)get_f32("%s.rope.freq_base", 10000.0f);
   hparams_.rope_freq_scale = get_f32("%s.rope.freq_scale", 1.0f);
 
   if (!hparams_.is_valid()) {
@@ -775,12 +793,22 @@ bool llm_model::map_tensors_qwen3(
   const std::string arch_prefix = "llm";
 
   auto find_tensor = [&](const std::string &suffix) -> ggml_tensor * {
+    // Try "llm.model.xxx" (standard Qwen3 GGUF)
     std::string full_name = arch_prefix + "." + suffix;
     auto it = tensors.find(full_name);
     if (it != tensors.end())
       return it->second;
+    // Try "qwen3.model.xxx" (alternative)
     full_name = "qwen3." + suffix;
     it = tensors.find(full_name);
+    if (it != tensors.end())
+      return it->second;
+    // Try "llm.xxx" without "model." sub-path (OmniVoice convention)
+    // suffix like "model.embed_tokens.weight" -> "llm.embed_tokens.weight"
+    if (suffix.find("model.") == 0) {
+      full_name = arch_prefix + "." + suffix.substr(6); // skip "model."
+      it = tensors.find(full_name);
+    }
     return (it != tensors.end()) ? it->second : nullptr;
   };
 
@@ -798,6 +826,7 @@ bool llm_model::map_tensors_qwen3(
     std::string layer_prefix =
         arch_prefix + ".model.layers." + std::to_string(il) + ".";
     std::string layer_prefix_alt = "qwen3.blk." + std::to_string(il) + ".";
+    std::string layer_prefix_ovo = arch_prefix + ".layers." + std::to_string(il) + ".";
 
     auto find_layer_tensor = [&](const std::string &suffix) -> ggml_tensor * {
       std::string name = layer_prefix + suffix;
@@ -805,6 +834,10 @@ bool llm_model::map_tensors_qwen3(
       if (it != tensors.end())
         return it->second;
       name = layer_prefix_alt + suffix;
+      it = tensors.find(name);
+      if (it != tensors.end())
+        return it->second;
+      name = layer_prefix_ovo + suffix;
       it = tensors.find(name);
       return (it != tensors.end()) ? it->second : nullptr;
     };

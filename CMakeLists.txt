@@ -143,6 +143,9 @@ set(RS_SOURCES
         rapidspeech/src/arch/llm_kv_cache.cpp
         rapidspeech/src/arch/qwen3.h
         rapidspeech/src/arch/qwen3.cpp
+	    rapidspeech/src/arch/openvoice2.cpp
+        rapidspeech/src/arch/omnivoice.cpp
+        rapidspeech/src/frontend/text_frontend.cpp
 #        rapidspeech/src/arch/qwen3_asr.h
 #        rapidspeech/src/arch/qwen3_asr.cpp
         rapidspeech/src/utils/rs_wav.cpp
@@ -296,7 +299,7 @@ endif()
 # --- Example Executables ---
 if (RS_BUILD_CLI)
     # Download miniaudio.h if not present (3rd-party single-header library)
-    set(MINIAUDIO_PATH "${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/utils/miniaudio.h")
+    set(MINIAUDIO_PATH "${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils/miniaudio.h")
     if (NOT EXISTS "${MINIAUDIO_PATH}")
         message(STATUS "Downloading miniaudio.h ...")
         file(DOWNLOAD
@@ -320,12 +323,17 @@ if (RS_BUILD_CLI)
             examples/asr/rs-asr-online.cpp
     )
 
+    add_executable(rs-tts-offline
+            examples/tts/rs-tts-offline.cpp
+    )
+
     add_executable(rs-quantize
             examples/quantize/quantize.cpp
             examples/quantize/common_quantize.cpp
     )
     target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-asr-online  PRIVATE rapidspeech-core ggml)
+    target_link_libraries(rs-tts-offline PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-quantize PRIVATE ggml)
 
     if (NOT MSVC)
@@ -351,7 +359,13 @@ if (RS_BUILD_CLI)
         ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
         ${GGML_PATH}/include
         ${GGML_PATH}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniaudio
+    )
+    target_include_directories(rs-tts-offline PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
+        ${GGML_PATH}/include
+        ${GGML_PATH}/src
     )
     # miniaudio uses dlopen on Linux for ALSA/PulseAudio/JACK backend discovery
     if(UNIX AND NOT APPLE)
@@ -362,6 +376,9 @@ if (RS_BUILD_CLI)
             RUNTIME DESTINATION bin
     )
     install(TARGETS rs-asr-online
+            RUNTIME DESTINATION bin
+    )
+    install(TARGETS rs-tts-offline
             RUNTIME DESTINATION bin
     )
 endif()

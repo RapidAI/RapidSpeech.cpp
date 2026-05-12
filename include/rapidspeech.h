@@ -135,6 +135,20 @@ RS_API rs_error_t rs_push_audio(rs_context_t* ctx, const float* pcm, int32_t n_s
 // Returns: RS_OK on success, error code on failure
 RS_API rs_error_t rs_push_text(rs_context_t* ctx, const char* text);
 
+// Push reference audio for voice cloning (TTS mode, optional)
+// samples: 32-bit float reference audio data
+// n_samples: number of samples
+// sample_rate: reference audio sample rate
+// Returns: 0 on success, -1 on error
+RS_API int rs_push_reference_audio(rs_context_t* ctx, const float* samples,
+                                   int32_t n_samples, int32_t sample_rate);
+
+// Push reference text for voice cloning (TTS mode, optional)
+// ref_text: UTF-8 encoded transcript of the reference audio
+// Must be called before rs_process when using rs_push_reference_audio.
+// Returns: RS_OK on success, error code on failure
+RS_API rs_error_t rs_push_reference_text(rs_context_t* ctx, const char* ref_text);
+
 // Execute single inference step
 // Returns: 0=No output yet, 1=Has output, -1=Error (use rs_get_last_error)
 RS_API int32_t rs_process(rs_context_t* ctx);
@@ -185,7 +199,22 @@ RS_API int32_t rs_get_audio_buffer_duration_ms(const rs_context_t* ctx);
 // Returns: RS_OK on success, error code on failure
 RS_API rs_error_t rs_reset(rs_context_t* ctx);
 
+// ── TTS parameters ──
+
+// Set TTS generation parameters (OmniVoice only).
+// instruct: voice description, e.g. "male, young adult, moderate pitch"
+// language: target language, e.g. "English" or "zh"
+// seed: random seed for reproducible generation
+// Returns: RS_OK on success
+RS_API rs_error_t rs_set_tts_params(rs_context_t* ctx, const char* instruct,
+                                     const char* language, int32_t seed);
+
 // ── 2-pass (CTC + LLM rescoring) support ──
+
+// Set user input prompt for the LLM decoder (FunASRNano only).
+// For example: "语音转写：" (default), "Transcribe speech to text:", etc.
+// Returns: RS_OK on success
+RS_API rs_error_t rs_set_user_input_prompt(rs_context_t* ctx, const char* prompt);
 
 // Enable/disable LLM decoder at runtime (FunASRNano only, other models no-op).
 // When disabled, Decode() uses CTC-greedy (fast, lower accuracy).
@@ -194,6 +223,14 @@ RS_API rs_error_t rs_reset(rs_context_t* ctx);
 //   then rs_redecode with LLM=on (second pass).
 // Returns: RS_OK on success
 RS_API rs_error_t rs_set_use_llm(rs_context_t* ctx, bool use_llm);
+
+// Enable/disable a CTC pre-check pass before LLM decoding (FunASRNano only).
+// When enabled, a lightweight CTC decode runs first to detect silence —
+// if no speech tokens are found the expensive LLM decode is skipped,
+// preventing hallucinated output on noise/silence segments.
+// Disabled by default.  Adds a small latency overhead (~ms) when enabled.
+// Returns: RS_OK on success
+RS_API rs_error_t rs_set_ctc_precheck(rs_context_t* ctx, bool enable);
 
 // Re-run the decoder only (skip encoder) — used after rs_set_use_llm to
 // rescore the same encoder output with different decoder settings.

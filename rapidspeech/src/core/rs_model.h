@@ -48,6 +48,38 @@ public:
   virtual void SetUseLLM(bool use) { (void)use; }
   virtual bool SupportsTwoPass() const { return false; }
 
+  // CTC pre-check before LLM decode: runs a lightweight CTC pass to
+  // detect silence and skip expensive LLM decoding when no speech is
+  // present.  Reduces hallucination on silence but adds a small latency
+  // overhead.  Disabled by default.  (FunASRNano only.)
+  virtual void SetCTCPrecheck(bool enable) { (void)enable; }
+
+  // Set the user input prompt for the LLM decoder (FunASRNano only).
+  virtual void SetUserInputPrompt(const std::string &prompt) { (void)prompt; }
+
+  // --- TTS interface (default no-ops; overridden by TTS models) ---
+
+  virtual bool PushText(RSState &state, const char *text,
+                        const char *language = nullptr,
+                        const char *instruct = nullptr) {
+    (void)state; (void)text; (void)language; (void)instruct; return false;
+  }
+
+  virtual bool PushReferenceAudio(RSState &state, const float *samples,
+                                  int n_samples, int sample_rate,
+                                  ggml_backend_sched_t sched) {
+    (void)state; (void)samples; (void)n_samples; (void)sample_rate;
+    (void)sched; return false;
+  }
+
+  virtual bool PushReferenceText(RSState &state, const char *ref_text) {
+    (void)state; (void)ref_text; return false;
+  }
+
+  virtual int GetAudioOutput(RSState &state, float **out_data) {
+    (void)state; (void)out_data; return 0;
+  }
+
   // Get metadata
   virtual const RSModelMeta &GetMeta() const = 0;
 };
