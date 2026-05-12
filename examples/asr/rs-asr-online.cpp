@@ -29,6 +29,9 @@
  *       --gpu <true|false>   GPU on/off (default: true)
  *       --vad-threshold <f>  Speech probability threshold (default: 0.5)
  *       --silence-ms <ms>    Silence duration to trigger decode (default: 600)
+ *       --speech-pad-ms <ms> Pre-roll padding before speech start (default: 200)
+ *       --preroll-ms <ms>    Audio kept during silence to avoid onset clip (default: 500)
+ *       --prob-smooth <f>    VAD prob EMA alpha, 0=disable (default: 0.3)
  *   -h, --help               Show help
  */
 
@@ -353,6 +356,7 @@ static ggml_context *load_gguf_weights(const char *path,
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <windows.h>
 #endif
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
@@ -422,7 +426,10 @@ struct OnlineArgs {
   float vad_threshold = 0.5f;
   int silence_ms = 600;
   int speech_pad_ms = 200;
+  int preroll_ms = 500;
+  float prob_smooth = 0.3f;
   bool two_pass = false;
+  bool ctc_precheck = false;
 };
 
 static bool parse_bool(const std::string &v) {
@@ -453,8 +460,16 @@ static bool parse_args(int argc, char **argv, OnlineArgs &args) {
       args.vad_threshold = std::stof(argv[++i]);
     } else if (a == "--silence-ms" && i + 1 < argc) {
       args.silence_ms = std::stoi(argv[++i]);
+    } else if (a == "--speech-pad-ms" && i + 1 < argc) {
+      args.speech_pad_ms = std::stoi(argv[++i]);
+    } else if (a == "--preroll-ms" && i + 1 < argc) {
+      args.preroll_ms = std::stoi(argv[++i]);
+    } else if (a == "--prob-smooth" && i + 1 < argc) {
+      args.prob_smooth = std::stof(argv[++i]);
     } else if (a == "--two-pass") {
       args.two_pass = true;
+    } else if (a == "--ctc-precheck") {
+      args.ctc_precheck = true;
     } else if (a == "-h" || a == "--help") {
       std::cout
           << "Usage: rs-asr-online -m <asr.gguf> -v <vad.gguf> [options]\n"
@@ -473,9 +488,17 @@ static bool parse_args(int argc, char **argv, OnlineArgs &args) {
              "      --vad-threshold <f>  VAD threshold (default: 0.5)\n"
              "      --silence-ms <ms>    Silence to end segment (default: "
              "600)\n"
+             "      --speech-pad-ms <ms> Pre-roll padding before speech start "
+             "(default: 200)\n"
+             "      --preroll-ms <ms>    Audio buffer kept during silence to "
+             "avoid onset clipping (default: 500)\n"
+             "      --prob-smooth <f>    EMA alpha for VAD prob smoothing "
+             "(0=disable, default: 0.3)\n"
              "      --mic-chunk-ms <ms>  Mic read chunk size (default: 32)\n"
              "      --two-pass           2-pass mode: CTC fast pass + LLM "
              "rescore (FunASRNano)\n"
+             "      --ctc-precheck       CTC pre-check before LLM to skip "
+             "silence (reduces hallucination)\n"
              "  -h, --help               Show this help\n"
           << std::endl;
       return false;
@@ -509,6 +532,21 @@ struct StreamState {
   int silence_frames = 0;
   int speech_start_offset = 0;
   int total_samples_read = 0;
+
+  // --- Pre-roll buffer: retains recent audio during silence so that ---
+  // speech onset isn't truncated.  Works as a sliding window that is
+  // flushed into speech_buf when VAD triggers.
+  std::deque<float> preroll_buf;
+  int preroll_max_samples = 8000; // 500 ms @ 16 kHz (overridden by CLI)
+
+  // --- EMA-smoothed VAD probability ---
+  float smoothed_prob = 0.0f;
+  float prob_smooth_alpha = 0.3f; // 0 = disable smoothing
+
+  // --- Adaptive silence threshold ---
+  float adaptive_silence_ms = 600.0f; // current effective threshold
+  float base_silence_ms = 600.0f;     // user-configured baseline
+  std::deque<float> recent_seg_durs;  // last few segment durations (seconds)
 };
 
 // ─────────────────────────────────────────────────────
@@ -631,7 +669,7 @@ static bool process_segment(rs_context_t *asr_ctx,
 // Pops segments from the queue and transcribes them.
 // ─────────────────────────────────────────────────────
 static void asr_worker(const std::string &model_path, int n_threads,
-                       bool use_gpu, bool two_pass,
+                       bool use_gpu, bool two_pass, bool ctc_precheck,
                        SpeechSegmentQueue &queue,
                        std::atomic<int> &seg_processed,
                        std::atomic<bool> &worker_done,
@@ -649,6 +687,7 @@ static void asr_worker(const std::string &model_path, int n_threads,
     return;
   }
   worker_ready = true;
+  rs_set_ctc_precheck(asr_ctx, ctc_precheck);
 
   // Merge consecutive short segments that are close together.
   // Short utterances (< 1.2s) with small gaps (< 0.5s) are often
@@ -703,6 +742,14 @@ static void asr_worker(const std::string &model_path, int n_threads,
 // ─────────────────────────────────────────────────────
 // Process a single VAD chunk — pushes completed speech
 // segments to the queue (does NOT run ASR inline).
+//
+// Improvements over the baseline:
+//   A. Pre-roll buffer — audio during silence is kept in a sliding
+//      window so speech onset isn't clipped.
+//   B. Adaptive silence threshold — dynamically adjusted based on
+//      recent segment durations to match the speaker's pace.
+//   C. EMA probability smoothing — reduces jitter / fragmentation
+//      from single-frame probability spikes or dips.
 // ─────────────────────────────────────────────────────
 static bool
 process_vad_chunk(const float *chunk, int chunk_samples,
@@ -712,10 +759,6 @@ process_vad_chunk(const float *chunk, int chunk_samples,
                   SpeechSegmentQueue &queue, std::atomic<int> &seg_counter) {
   const int SAMPLE_RATE = 16000;
   const int VAD_WINDOW = 512;
-  const int SILENCE_FRAMES =
-      (args.silence_ms * SAMPLE_RATE) / (1000 * VAD_WINDOW);
-  const int SPEECH_PAD_SAMPLES =
-      (args.speech_pad_ms * SAMPLE_RATE) / 1000;
 
   std::vector<float> vad_in(chunk, chunk + chunk_samples);
   if (chunk_samples < VAD_WINDOW)
@@ -725,38 +768,87 @@ process_vad_chunk(const float *chunk, int chunk_samples,
   bool vad_ok = vad_model.Encode(vad_in, vad_state, vad_sched);
   float prob = vad_ok ? vad_model.GetSpeechProbability(vad_state) : 0.f;
 
-  // Hysteresis: use a lower exit threshold once in speech to avoid
-  // splitting on brief probability dips (matches Silero VADIterator logic).
+  // --- C. EMA probability smoothing ---
+  if (args.prob_smooth > 0.0f) {
+    state.smoothed_prob = args.prob_smooth * prob +
+                          (1.0f - args.prob_smooth) * state.smoothed_prob;
+  } else {
+    state.smoothed_prob = prob;
+  }
+
+  // Use smoothed probability for threshold decisions.
+  // Hysteresis: lower exit threshold once in speech to avoid splitting
+  // on brief probability dips (matches Silero VADIterator logic).
   float enter_threshold = args.vad_threshold;
   float exit_threshold = std::max(0.01f, args.vad_threshold - 0.15f);
-  bool is_speech = state.in_speech ? (prob >= exit_threshold)
-                                   : (prob >= enter_threshold);
+  bool is_speech = state.in_speech
+                       ? (state.smoothed_prob >= exit_threshold)
+                       : (state.smoothed_prob >= enter_threshold);
 
-  // Progress indicator
+  // --- B. Adaptive silence threshold ---
+  // Recompute SILENCE_FRAMES each call so the adaptive value takes effect.
+  int silence_frames_limit =
+      (int)(state.adaptive_silence_ms * SAMPLE_RATE) / (1000 * VAD_WINDOW);
+  if (silence_frames_limit < 1)
+    silence_frames_limit = 1;
+
+  // Progress indicator (shows raw prob for debugging)
   float pos_s = (float)state.total_samples_read / SAMPLE_RATE;
   if (is_speech) {
     std::cout << "\r" << Color::c(Color::Green) << "["
               << format_timestamp(pos_s) << "] "
-              << "▌SPEECH  p=" << std::fixed << std::setprecision(3) << prob
+              << "▌SPEECH  p=" << std::fixed << std::setprecision(3)
+              << state.smoothed_prob
               << Color::c(Color::Reset) << "  " << std::flush;
   } else {
     std::cout << "\r" << Color::c(Color::Grey) << "[" << format_timestamp(pos_s)
               << "] "
-              << "·silence p=" << std::fixed << std::setprecision(3) << prob
+              << "·silence p=" << std::fixed << std::setprecision(3)
+              << state.smoothed_prob
               << Color::c(Color::Reset) << "  " << std::flush;
+  }
+
+  // --- A. Pre-roll buffer management ---
+  // During silence, keep audio in a sliding window.
+  if (!state.in_speech) {
+    state.preroll_buf.insert(state.preroll_buf.end(), chunk,
+                             chunk + chunk_samples);
+    // Trim to max size
+    while ((int)state.preroll_buf.size() > state.preroll_max_samples) {
+      int overshoot = (int)state.preroll_buf.size() - state.preroll_max_samples;
+      int to_drop = std::min(overshoot, chunk_samples);
+      for (int i = 0; i < to_drop; ++i)
+        state.preroll_buf.pop_front();
+    }
   }
 
   if (is_speech) {
     state.silence_frames = 0;
     if (!state.in_speech) {
       state.in_speech = true;
+
+      // Flush pre-roll buffer into speech_buf so the segment starts
+      // with audio from *before* the VAD trigger point.
+      int preroll_samples = (int)state.preroll_buf.size();
+      if (preroll_samples > 0) {
+        state.speech_buf.clear();
+        state.speech_buf.insert(state.speech_buf.end(),
+                                state.preroll_buf.begin(),
+                                state.preroll_buf.end());
+        state.preroll_buf.clear();
+      } else {
+        state.speech_buf.clear();
+      }
+
+      // speech_start_offset accounts for the pre-roll audio we just prepended.
+      state.speech_start_offset = std::max(
+          0, state.total_samples_read - chunk_samples - preroll_samples);
+
+      // Also apply the explicit speech_pad_ms: rewind the start offset
+      // further so the timestamp includes the configured padding.
+      int extra_pad_samples = (args.speech_pad_ms * SAMPLE_RATE) / 1000;
       state.speech_start_offset =
-          std::max(0, state.total_samples_read - chunk_samples - SPEECH_PAD_SAMPLES);
-      state.speech_buf.clear();
-      // Add pre-roll context (matching offline VAD behavior)
-      // Note: pre-roll samples are already in the PCM stream; we record the
-      // earlier start time so timestamps are correct. The actual audio before
-      // chunk_samples was already processed (and discarded during silence).
+          std::max(0, state.speech_start_offset - extra_pad_samples);
     }
     state.speech_buf.insert(state.speech_buf.end(), chunk,
                             chunk + chunk_samples);
@@ -766,10 +858,30 @@ process_vad_chunk(const float *chunk, int chunk_samples,
                               chunk + chunk_samples);
       ++state.silence_frames;
 
-      if (state.silence_frames >= SILENCE_FRAMES) {
+      if (state.silence_frames >= silence_frames_limit) {
         int idx = ++seg_counter;
         float start_s = (float)state.speech_start_offset / SAMPLE_RATE;
         float end_s = (float)state.total_samples_read / SAMPLE_RATE;
+        float seg_dur = end_s - start_s;
+
+        // --- B. Update adaptive silence threshold ---
+        // Short utterances → lower threshold (faster response).
+        // Long utterances  → raise threshold (avoid premature cuts).
+        const float ADAPT_ALPHA = 0.15f;
+        if (seg_dur < 1.0f) {
+          state.adaptive_silence_ms =
+              std::max(300.0f, state.adaptive_silence_ms * (1.0f - ADAPT_ALPHA) +
+                                   300.0f * ADAPT_ALPHA);
+        } else if (seg_dur > 5.0f) {
+          state.adaptive_silence_ms =
+              std::min(1200.0f, state.adaptive_silence_ms * (1.0f - ADAPT_ALPHA) +
+                                    1200.0f * ADAPT_ALPHA);
+        } else {
+          // Drift back toward the user-configured baseline.
+          state.adaptive_silence_ms =
+              state.adaptive_silence_ms * (1.0f - ADAPT_ALPHA * 0.5f) +
+              state.base_silence_ms * ADAPT_ALPHA * 0.5f;
+        }
 
         queue.push({std::move(state.speech_buf), start_s, end_s, idx});
 
@@ -788,6 +900,11 @@ process_vad_chunk(const float *chunk, int chunk_samples,
 // main
 // ─────────────────────────────────────────────────────
 int main(int argc, char **argv) {
+#ifdef _WIN32
+  SetConsoleOutputCP(CP_UTF8);
+  SetConsoleCP(CP_UTF8);
+#endif
+
   OnlineArgs args;
   if (!parse_args(argc, argv, args))
     return 1;
@@ -847,7 +964,7 @@ int main(int argc, char **argv) {
 
   std::string model_path = args.asr_model;
   std::thread worker(asr_worker, model_path, args.n_threads, args.use_gpu,
-                     args.two_pass,
+                     args.two_pass, args.ctc_precheck,
                      std::ref(seg_queue), std::ref(seg_processed),
                      std::ref(worker_done), std::ref(worker_ready));
 
@@ -873,6 +990,10 @@ int main(int argc, char **argv) {
 
   // ── 3. Streaming loop ──────────────────────────────────
   StreamState state;
+  state.preroll_max_samples = (args.preroll_ms * SAMPLE_RATE) / 1000;
+  state.prob_smooth_alpha = args.prob_smooth;
+  state.base_silence_ms = (float)args.silence_ms;
+  state.adaptive_silence_ms = (float)args.silence_ms;
   auto t_start = std::chrono::steady_clock::now();
 
   LOG_INFO("─────────────────────────────────────────────────────────");

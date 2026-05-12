@@ -149,6 +149,11 @@ SenseVoiceEncoderModel::~SenseVoiceEncoderModel() {
     ggml_free(ctx_weights_);
     ctx_weights_ = nullptr;
   }
+  if (cached_ctx_) {
+    ggml_free(cached_ctx_);
+    cached_ctx_ = nullptr;
+  }
+  cached_gf_ = nullptr;
 }
 
 bool SenseVoiceEncoderModel::Load(const std::unique_ptr<rs_context_t> &ctx,
@@ -286,6 +291,11 @@ void SenseVoiceEncoderModel::ensure_pos_encoding_size(int required_len,
  * Build and execute the Encoder computation graph.
  * 4 Prompt Tokens + Mel Features -> SANM Encoders -> Parallel Encoders ->
  * Hidden States.
+ *
+ * Graph caching: for repeated calls with the same input shape (common in
+ * streaming ASR with fixed chunk sizes), the 50-layer encoder graph is built
+ * once and reused.  Subsequent calls skip graph construction and only update
+ * input tensors before re-computing.
  */
 bool SenseVoiceEncoderModel::Encode(const std::vector<float> &input_frames,
                                     RSState &state,
@@ -299,24 +309,31 @@ bool SenseVoiceEncoderModel::Encode(const std::vector<float> &input_frames,
   int required_pos_len = model_->embedding ? n_len + 4 : n_len;
   ensure_pos_encoding_size(required_pos_len, hparams_.feats_dim);
 
-  struct ggml_context *ctx0 = nullptr;
-  struct ggml_cgraph *gf = nullptr;
+  // Free previous cached context and rebuild graph each call.
+  // Reusing the cached graph across scheduler reset cycles causes stale tensor
+  // buffer pointers that conflict with the scheduler's backend assignment pass
+  // (ggml_backend_sched_backend_id_from_cur), leading to "pre-allocated tensor
+  // in a buffer that cannot run the operation" aborts for MUL ops on Metal.
+  if (cached_ctx_) {
+    ggml_free(cached_ctx_);
+    cached_ctx_ = nullptr;
+    cached_gf_ = nullptr;
+  }
 
-  // Initialize context. Ensure SENSE_VOICE_model_MAX_NODES is large enough.
-  if (!init_compute_ctx(&ctx0, &gf, SENSE_VOICE_model_MAX_NODES)) {
+  if (!init_compute_ctx(&cached_ctx_, &cached_gf_,
+                        SENSE_VOICE_model_MAX_NODES)) {
     return false;
   }
 
   // --- Define Input Tensors ---
   struct ggml_tensor *feature =
-      ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams_.feats_dim, n_len);
+      ggml_new_tensor_2d(cached_ctx_, GGML_TYPE_F32, hparams_.feats_dim, n_len);
 
   struct ggml_tensor *prompt_ids =
-      ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 4, 1);
+      ggml_new_tensor_2d(cached_ctx_, GGML_TYPE_I32, 4, 1);
 
-  // Note: 'required_pos_len' is used here for the dimension
   struct ggml_tensor *position = ggml_new_tensor_3d(
-      ctx0, GGML_TYPE_F32, hparams_.feats_dim, required_pos_len, 1);
+      cached_ctx_, GGML_TYPE_F32, hparams_.feats_dim, required_pos_len, 1);
 
   ggml_set_name(feature, "feats");
   ggml_set_name(prompt_ids, "prompt_ids");
@@ -330,82 +347,71 @@ bool SenseVoiceEncoderModel::Encode(const std::vector<float> &input_frames,
   struct ggml_tensor *cur = feature;
   if (model_->embedding) {
     struct ggml_tensor *emb =
-        ggml_get_rows(ctx0, model_->embedding, prompt_ids);
+        ggml_get_rows(cached_ctx_, model_->embedding, prompt_ids);
     ggml_set_name(emb, "embedding");
 
-    // Repeat the embedding to match dimensions
     emb = ggml_repeat(
-        ctx0, emb,
-        ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, emb->ne[0], emb->ne[1], 1));
+        cached_ctx_, emb,
+        ggml_new_tensor_3d(cached_ctx_, GGML_TYPE_I32, emb->ne[0], emb->ne[1],
+                           1));
 
-    cur = ggml_concat(ctx0, emb, feature, 1);
+    cur = ggml_concat(cached_ctx_, emb, feature, 1);
   }
 
-  cur = ggml_scale(ctx0, cur, sqrtf(hidden));
-  cur = ggml_add(ctx0, position, cur);
+  cur = ggml_scale(cached_ctx_, cur, sqrtf(hidden));
+  cur = ggml_add(cached_ctx_, position, cur);
 
   // Forward pass: Main Encoder Layers
-  cur = model_layer_sanm_forward(hparams_, ctx0, cur, model_->encoder0);
+  cur = model_layer_sanm_forward(hparams_, cached_ctx_, cur, model_->encoder0);
   for (int i = 0; i < hparams_.n_encoder_layers - 1; ++i) {
-    cur = model_layer_sanm_forward(hparams_, ctx0, cur,
+    cur = model_layer_sanm_forward(hparams_, cached_ctx_, cur,
                                    model_->encoders_layer[i]);
   }
 
   // Normalization and projection
-  cur = ggml_norm(ctx0, cur, hparams_.eps);
-  cur = ggml_add(ctx0, ggml_mul(ctx0, cur, model_->e_after_norm_w),
+  cur = ggml_norm(cached_ctx_, cur, hparams_.eps);
+  cur = ggml_add(cached_ctx_,
+                 ggml_mul(cached_ctx_, cur, model_->e_after_norm_w),
                  model_->e_after_norm_b);
 
   // Forward pass: TP Encoder Layers
   for (int i = 0; i < hparams_.n_tp_encoder_layers; ++i) {
-    cur = model_layer_sanm_forward(hparams_, ctx0, cur,
+    cur = model_layer_sanm_forward(hparams_, cached_ctx_, cur,
                                    model_->tp_encoders_layer[i]);
   }
 
   // Final Normalization
-  cur = ggml_norm(ctx0, cur, hparams_.eps);
-  cur = ggml_add(ctx0, ggml_mul(ctx0, cur, model_->e_tp_norm_w),
+  cur = ggml_norm(cached_ctx_, cur, hparams_.eps);
+  cur = ggml_add(cached_ctx_, ggml_mul(cached_ctx_, cur, model_->e_tp_norm_w),
                  model_->e_tp_norm_b);
 
   ggml_set_name(cur, "encoder_out");
   ggml_set_output(cur);
-  ggml_build_forward_expand(gf, cur);
+  ggml_build_forward_expand(cached_gf_, cur);
 
   // --- Allocation ---
-  if (!ggml_backend_sched_alloc_graph(sched, gf)) {
-    // Allocation failed (likely OOM or node limit exceeded)
-    ggml_free(ctx0);
+  if (!ggml_backend_sched_alloc_graph(sched, cached_gf_)) {
     return false;
   }
 
-  // --- Set Tensor Data (Optimized) ---
-
-  // 1. Set Feature Data
+  // --- Set Tensor Data ---
   ggml_backend_tensor_set(feature, input_frames.data(), 0,
                           input_frames.size() * sizeof(float));
 
-  // 2. Set Prompt IDs
   if (model_->embedding) {
-    // Use a stack array instead of dynamic allocation for better performance
     int p_tokens[4] = {sv_state.language_id, 1, 2, sv_state.use_itn ? 14 : 15};
     ggml_backend_tensor_set(prompt_ids, p_tokens, 0, sizeof(p_tokens));
   }
 
-  // 3. Set Positional Encoding (Key Optimization)
-  // Instead of recalculating sin/cos in a triple loop, copy from pre-computed
-  // cache.
+  // Positional Encoding — copy from pre-computed cache
   int p_dim = hparams_.feats_dim;
   size_t bytes_per_batch = (size_t)required_pos_len * p_dim * sizeof(float);
-
-  // Handle batching (though typically batch=1 for inference)
   int n_batch = position->ne[2];
 
   if (n_batch == 1) {
-    // Single batch copy
     ggml_backend_tensor_set(position, cached_pos_encoding_.data(), 0,
                             bytes_per_batch);
   } else {
-    // If batch > 1, broadcast the same positional encoding to all batches
     for (int b = 0; b < n_batch; ++b) {
       ggml_backend_tensor_set(position, cached_pos_encoding_.data(),
                               b * bytes_per_batch, bytes_per_batch);
@@ -413,15 +419,12 @@ bool SenseVoiceEncoderModel::Encode(const std::vector<float> &input_frames,
   }
 
   // --- Compute ---
-  // ggml_backend_sched_set_eval_callback(sched, ggml_debug, new
-  // callback_data());
-  if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
-    ggml_free(ctx0);
+  if (ggml_backend_sched_graph_compute(sched, cached_gf_) !=
+      GGML_STATUS_SUCCESS) {
     return false;
   }
 
   // --- State Persistence Logic ---
-  // Ensure the output tensor in the state matches the current output dimensions
   if (sv_state.encoder_out == nullptr ||
       sv_state.encoder_out->ne[0] != cur->ne[0] ||
       sv_state.encoder_out->ne[1] != cur->ne[1]) {
@@ -430,7 +433,6 @@ bool SenseVoiceEncoderModel::Encode(const std::vector<float> &input_frames,
       ggml_backend_buffer_free(sv_state.buffer_persistent);
     }
 
-    // Allocate persistent tensor
     sv_state.encoder_out = ggml_new_tensor_2d(
         sv_state.ctx_persistent, cur->type, cur->ne[0], cur->ne[1]);
 
@@ -446,6 +448,11 @@ bool SenseVoiceEncoderModel::Encode(const std::vector<float> &input_frames,
   // Copy result to persistent state
   ggml_backend_tensor_copy(cur, sv_state.encoder_out);
 
-  ggml_free(ctx0);
+  // Free the compute context immediately to avoid stale tensor buffers leaking
+  // into the next scheduler cycle.
+  ggml_free(cached_ctx_);
+  cached_ctx_ = nullptr;
+  cached_gf_ = nullptr;
+
   return true;
 }

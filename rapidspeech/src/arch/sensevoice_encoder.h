@@ -93,6 +93,11 @@ private:
   std::vector<float> cached_pos_encoding_;
   int max_pos_len_ = 0; // Tracks the current maximum length allocated
 
+  // Compute graph context — rebuilt each call to avoid stale tensor buffer
+  // pointers from confusing the backend scheduler.
+  struct ggml_context *cached_ctx_ = nullptr;
+  struct ggml_cgraph *cached_gf_ = nullptr;
+
   // Helper to resize and pre-compute the table
   void ensure_pos_encoding_size(int required_len, int dim);
   bool SetLayerWeights(std::vector<SenseVoiceLayerEncoder> &layers,

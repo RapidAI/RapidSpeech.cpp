@@ -19,6 +19,9 @@
  *       --gpu <true|false>   Enable GPU acceleration (default: true)
  *       --vad-threshold <f>  VAD speech probability threshold (default: 0.5)
  *       --silence-ms <ms>    Silence duration to split segments (default: 600)
+ *       --speech-pad-ms <ms> Pre-roll padding before speech start (default: 200)
+ *       --preroll-ms <ms>    Extra audio before speech onset to include (default: 0)
+ *       --prob-smooth <f>    VAD prob EMA alpha, 0=disable (default: 0.3)
  *   -h, --help               Show help
  */
 
@@ -110,6 +113,9 @@ struct OfflineArgs {
   bool use_gpu = true;
   float vad_threshold = 0.5f;
   int silence_ms = 600;
+  int speech_pad_ms = 200;
+  int preroll_ms = 0;
+  float prob_smooth = 0.3f;
   float max_segment_s = 30.0f;
 };
 
@@ -132,6 +138,12 @@ static void print_usage(const char *prog) {
          "(default: 0.5)\n"
       << "      --silence-ms <ms>    Silence duration to split segments "
          "(default: 600)\n"
+      << "      --speech-pad-ms <ms> Pre-roll padding before speech start "
+         "(default: 200)\n"
+      << "      --preroll-ms <ms>    Extra audio before speech onset "
+         "(default: 0)\n"
+      << "      --prob-smooth <f>    VAD prob EMA alpha, 0=disable "
+         "(default: 0.3)\n"
       << "      --max-segment-s <s>  Max segment length for ASR input "
          "(default: 30.0)\n"
       << "  -h, --help               Show this help\n"
@@ -155,6 +167,12 @@ static bool parse_args(int argc, char **argv, OfflineArgs &args) {
       args.vad_threshold = std::stof(argv[++i]);
     } else if (a == "--silence-ms" && i + 1 < argc) {
       args.silence_ms = std::stoi(argv[++i]);
+    } else if (a == "--speech-pad-ms" && i + 1 < argc) {
+      args.speech_pad_ms = std::stoi(argv[++i]);
+    } else if (a == "--preroll-ms" && i + 1 < argc) {
+      args.preroll_ms = std::stoi(argv[++i]);
+    } else if (a == "--prob-smooth" && i + 1 < argc) {
+      args.prob_smooth = std::stof(argv[++i]);
     } else if (a == "--max-segment-s" && i + 1 < argc) {
       args.max_segment_s = std::stof(argv[++i]);
     } else if (a == "-h" || a == "--help") {
@@ -205,21 +223,44 @@ static std::string format_timestamp(float seconds) {
 
 // ─────────────────────────────────────────────────────
 // VAD segmentation: detect speech segments from PCM
+//
+// Improvements over the baseline:
+//   A. Pre-roll buffer — offline variant: directly indexes into the full
+//      PCM array to include audio before the VAD trigger point.  An extra
+//      preroll_ms window is also included when requested.
+//   B. Adaptive silence threshold — dynamically adjusted based on recent
+//      segment durations to match the speaker's pace.
+//   C. EMA probability smoothing — reduces jitter / fragmentation from
+//      single-frame spikes or dips.
+//   + Hysteresis — lower exit threshold once in speech (matches Silero
+//      VADIterator logic, already used in the online CLI).
 // ─────────────────────────────────────────────────────
 static std::vector<SpeechSegment>
 vad_segment(const std::vector<float> &pcm, SileroVadModel &vad_model,
             SileroVadState &vad_state, ggml_backend_sched_t vad_sched,
-            float vad_threshold, int silence_ms, int speech_pad_ms) {
+            float vad_threshold, int silence_ms, int speech_pad_ms,
+            int preroll_ms, float prob_smooth_alpha) {
   const int SAMPLE_RATE = 16000;
   const int VAD_WINDOW = 512;
-  const int SILENCE_FRAMES = (silence_ms * SAMPLE_RATE) / (1000 * VAD_WINDOW);
+
+  // ── Initialise adaptive threshold ──────────────────────
+  float adaptive_silence_ms = (float)silence_ms;
+  const float base_silence_ms = (float)silence_ms;
+  const float ADAPT_ALPHA = 0.15f;
+
   const int SPEECH_PAD_SAMPLES = (speech_pad_ms * SAMPLE_RATE) / 1000;
+  const int PREROLL_SAMPLES = (preroll_ms * SAMPLE_RATE) / 1000;
+
+  // Hysteresis thresholds
+  float enter_threshold = vad_threshold;
+  float exit_threshold = std::max(0.01f, vad_threshold - 0.15f);
 
   std::vector<SpeechSegment> segments;
   std::vector<float> speech_buf;
   bool in_speech = false;
   int silence_frames = 0;
-  int speech_start_offset = 0; // sample offset where current speech started
+  int speech_start_offset = 0;
+  float smoothed_prob = 0.0f;
 
   const int n_total = (int)pcm.size();
 
@@ -235,7 +276,24 @@ vad_segment(const std::vector<float> &pcm, SileroVadModel &vad_model,
     ggml_backend_sched_reset(vad_sched);
     bool vad_ok = vad_model.Encode(vad_in, vad_state, vad_sched);
     float prob = vad_ok ? vad_model.GetSpeechProbability(vad_state) : 0.f;
-    bool is_speech = (prob >= vad_threshold);
+
+    // --- C. EMA probability smoothing ---
+    if (prob_smooth_alpha > 0.0f) {
+      smoothed_prob = prob_smooth_alpha * prob +
+                      (1.0f - prob_smooth_alpha) * smoothed_prob;
+    } else {
+      smoothed_prob = prob;
+    }
+
+    // Hysteresis-aware speech decision
+    bool is_speech = in_speech ? (smoothed_prob >= exit_threshold)
+                               : (smoothed_prob >= enter_threshold);
+
+    // --- B. Adaptive silence threshold ---
+    int silence_frames_limit =
+        (int)(adaptive_silence_ms * SAMPLE_RATE) / (1000 * VAD_WINDOW);
+    if (silence_frames_limit < 1)
+      silence_frames_limit = 1;
 
     // Progress indicator
     float pos_s = (float)offset / SAMPLE_RATE;
@@ -244,34 +302,55 @@ vad_segment(const std::vector<float> &pcm, SileroVadModel &vad_model,
     std::cout << "\r  VAD scanning: [" << std::string(pct / 5, '=')
               << std::string(20 - pct / 5, ' ') << "] " << std::fixed
               << std::setprecision(1) << pos_s << "s / " << total_s << "s  "
-              << "prob=" << std::setprecision(3) << prob
+              << "p=" << std::setprecision(3) << smoothed_prob
+              << " thr=" << std::setprecision(0)
+              << adaptive_silence_ms << "ms"
               << (is_speech ? " ▌SPEECH" : " ·silence") << "  " << std::flush;
 
     if (is_speech) {
       silence_frames = 0;
       if (!in_speech) {
         in_speech = true;
-        speech_start_offset = std::max(0, offset - SPEECH_PAD_SAMPLES);
+        // --- A. Pre-roll: read audio before trigger from full PCM buffer ---
+        speech_start_offset =
+            std::max(0, offset - SPEECH_PAD_SAMPLES - PREROLL_SAMPLES);
         speech_buf.clear();
-        // Add pre-roll context
-        speech_buf.insert(speech_buf.end(), pcm.begin() + speech_start_offset,
+        speech_buf.insert(speech_buf.end(),
+                          pcm.begin() + speech_start_offset,
                           pcm.begin() + offset);
       }
       speech_buf.insert(speech_buf.end(), pcm.begin() + offset,
                         pcm.begin() + end);
     } else {
       if (in_speech) {
-        // Append silence tail
         speech_buf.insert(speech_buf.end(), pcm.begin() + offset,
                           pcm.begin() + end);
         ++silence_frames;
 
-        if (silence_frames >= SILENCE_FRAMES) {
-          // End of speech segment
+        if (silence_frames >= silence_frames_limit) {
           SpeechSegment seg;
           seg.start_s = (float)speech_start_offset / SAMPLE_RATE;
           seg.end_s = (float)(offset + VAD_WINDOW) / SAMPLE_RATE;
           seg.pcm = std::move(speech_buf);
+          float seg_dur = seg.end_s - seg.start_s;
+
+          // --- B. Update adaptive silence threshold ---
+          if (seg_dur < 1.0f) {
+            adaptive_silence_ms =
+                std::max(300.0f,
+                         adaptive_silence_ms * (1.0f - ADAPT_ALPHA) +
+                             300.0f * ADAPT_ALPHA);
+          } else if (seg_dur > 5.0f) {
+            adaptive_silence_ms =
+                std::min(1200.0f,
+                         adaptive_silence_ms * (1.0f - ADAPT_ALPHA) +
+                             1200.0f * ADAPT_ALPHA);
+          } else {
+            adaptive_silence_ms =
+                adaptive_silence_ms * (1.0f - ADAPT_ALPHA * 0.5f) +
+                base_silence_ms * ADAPT_ALPHA * 0.5f;
+          }
+
           segments.push_back(std::move(seg));
 
           in_speech = false;
@@ -359,8 +438,9 @@ int main(int argc, char **argv) {
   std::vector<SpeechSegment> segments;
 
   if (args.vad_path) {
-    LOG_INFO("VAD model: %s (threshold=%.2f, silence=%dms)", args.vad_path,
-             args.vad_threshold, args.silence_ms);
+    LOG_INFO("VAD model: %s (threshold=%.2f, silence=%dms, smooth=%.2f)",
+             args.vad_path, args.vad_threshold, args.silence_ms,
+             args.prob_smooth);
 
     VadBackend vad_backend;
     if (!vad_backend.init()) {
@@ -394,7 +474,8 @@ int main(int argc, char **argv) {
     LOG_INFO("Running VAD segmentation...");
     segments =
         vad_segment(pcm_normalized, *vad_model, *vad_state, vad_backend.sched,
-                    args.vad_threshold, args.silence_ms, 200);
+                    args.vad_threshold, args.silence_ms, args.speech_pad_ms,
+                    args.preroll_ms, args.prob_smooth);
 
     LOG_INFO("Detected %zu speech segment(s)", segments.size());
   } else {
