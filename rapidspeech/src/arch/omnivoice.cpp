@@ -1224,7 +1224,7 @@ bool OmniVoiceModel::LoadCodec(struct ggml_context *gguf_data) {
     compute_inv_b(dac_enc_.s_final.a, dac_enc_.s_final.inv_b);
 
     // Precompute RVQ embed_sq (||embed[:,j]||^2 for each codebook entry)
-    // embed is [dim, vocab] in GGUF after conversion transpose (ne[0]=dim, ne[1]=vocab)
+    // embed after conversion: [ne0=dim, ne1=vocab] in ggml
     for (int k = 0; k < rvq_.num_codebooks; k++) {
         if (!rvq_.cb[k].embed) continue;
         int cb_dim = rvq_.codebook_dim;
@@ -1237,11 +1237,11 @@ bool OmniVoiceModel::LoadCodec(struct ggml_context *gguf_data) {
             float s = 0;
             for (int d = 0; d < cb_dim; d++) {
                 float val;
-                // After transpose, embed[j,d] is at flat offset d*cb_size + j
+                // ggml layout [ne0=dim, ne1=vocab]: element (ne0=d, ne1=j) at flat d + j*cb_dim
                 if (rvq_.cb[k].embed->type == GGML_TYPE_F16)
-                    val = ggml_fp16_to_fp32(((ggml_fp16_t *)emb_raw.data())[d * cb_size + j]);
+                    val = ggml_fp16_to_fp32(((ggml_fp16_t *)emb_raw.data())[d + j * cb_dim]);
                 else
-                    val = ((float *)emb_raw.data())[d * cb_size + j];
+                    val = ((float *)emb_raw.data())[d + j * cb_dim];
                 s += val * val;
             }
             rvq_.cb[k].embed_sq_cpu[j] = s;
@@ -1269,19 +1269,77 @@ bool OmniVoiceModel::LoadCodec(struct ggml_context *gguf_data) {
 // Audio resampling helper (simple linear interpolation)
 // =====================================================================
 
+// Hann-windowed sinc resampler matching torchaudio.functional.resample.
+// Replaces the linear-interpolation resampler which caused audible aliasing
+// artifacts when downsampling 24kHz→16kHz for HuBERT feature extraction.
+// The HuBERT model was trained on torchaudio-resampled audio; feeding it
+// linear-interpolated audio produces subtly wrong features that degrade
+// voice cloning quality.
+
+static int resample_gcd(int a, int b) {
+    while (b) { int t = b; b = a % b; a = t; }
+    return a;
+}
+
 static std::vector<float> audio_resample_linear(const float *in, int n_in,
                                                   int sr_in, int sr_out) {
+    if (!in || n_in <= 0) return {};
     if (sr_in == sr_out) return std::vector<float>(in, in + n_in);
-    int n_out = (int)((int64_t)n_in * sr_out / sr_in);
-    std::vector<float> out(n_out);
-    for (int i = 0; i < n_out; i++) {
-        double pos = (double)i * sr_in / sr_out;
-        int idx = (int)pos;
-        double frac = pos - idx;
-        if (idx + 1 < n_in)
-            out[i] = (float)(in[idx] * (1.0 - frac) + in[idx + 1] * frac);
-        else if (idx < n_in)
-            out[i] = in[idx];
+
+    const int    g    = resample_gcd(sr_in, sr_out);
+    const int    orig = sr_in / g;   // up/down factors after gcd reduction
+    const int    newf = sr_out / g;
+    const double rolloff = 0.99;
+    const int    lpfw = 6;           // torchaudio default lowpass_filter_width
+
+    // Build Hann-sinc polyphase kernel, matching torchaudio _get_sinc_resample_kernel.
+    int    base_int = (orig < newf) ? orig : newf;
+    double base     = (double)base_int * rolloff;
+    int    width    = (int)std::ceil((double)lpfw * (double)orig / base);
+    int    K        = 2 * width + orig;
+    double scale    = base / (double)orig;
+    double inv_o    = 1.0 / (double)orig;
+    double inv_n    = 1.0 / (double)newf;
+
+    std::vector<float> kernel((size_t)newf * (size_t)K);
+    for (int j = 0; j < newf; j++) {
+        double t_off = (double)(-j) * inv_n;
+        for (int k = 0; k < K; k++) {
+            double idx_k = (double)(k - width) * inv_o;
+            double t     = (t_off + idx_k) * base;
+            if (t < -lpfw) t = -lpfw;
+            if (t > lpfw) t = lpfw;
+
+            double w = std::cos(t * M_PI / (double)lpfw / 2.0);
+            w = w * w;  // Hann window: cos² = (1+cos)/2
+
+            double tp   = t * M_PI;
+            double sinc = (tp == 0.0) ? 1.0 : std::sin(tp) / tp;
+            kernel[(size_t)j * (size_t)K + (size_t)k] = (float)(sinc * w * scale);
+        }
+    }
+
+    // Apply: pad (width zeros on both sides + orig for polyphase alignment),
+    // then strided conv1d over the padded signal.
+    long long target = (long long)std::ceil((double)sr_out * (double)n_in / (double)sr_in);
+    int       Np     = n_in + 2 * width + orig;
+    std::vector<float> padded((size_t)Np, 0.0f);
+    std::memcpy(padded.data() + width, in, (size_t)n_in * sizeof(float));
+
+    int       n_per_chan = (Np - K) / orig + 1;
+    long long total      = (long long)n_per_chan * (long long)newf;
+    long long out_len    = (target < total) ? target : total;
+
+    std::vector<float> out((size_t)out_len);
+    for (long long t_out = 0; t_out < out_len; t_out++) {
+        int           chan = (int)(t_out % (long long)newf);
+        int           pos  = (int)(t_out / (long long)newf);
+        const float * w    = kernel.data() + (size_t)chan * (size_t)K;
+        const float * x    = padded.data() + (size_t)pos * (size_t)orig;
+        float         sum  = 0.0f;
+        for (int k = 0; k < K; k++)
+            sum += x[k] * w[k];
+        out[(size_t)t_out] = sum;
     }
     return out;
 }
@@ -1329,7 +1387,6 @@ static bool rvq_encode_cpu(const RVQCodec &rvq, const float *embeddings,
         // Download project_out weights (for decoding back to residual space)
         std::vector<float> out_w, out_b;
         if (k + 1 < K && cb.project_out_w) {
-            // project_out_w is [dim, hidden] after transpose
             out_w.resize(D * H);
             get_as_f32(cb.project_out_w, out_w);
         }
@@ -1341,27 +1398,27 @@ static bool rvq_encode_cpu(const RVQCodec &rvq, const float *embeddings,
         for (int t = 0; t < T; t++) {
             const float *r = residual.data() + t * H;
 
-            // Project residual to codebook dim: proj = proj_w^T @ r + proj_b
-            // proj_w after transpose: [H, D] in ggml (ne0=H, ne1=D), row-major flat [H*D]
-            // proj_w[h*D + d] = weight[d, h]
+            // Project residual to codebook dim: proj = proj_in @ r + proj_b
+            // ggml layout [ne0=H, ne1=D]: element (ne0=h, ne1=d) at flat h + d*H
+            // = PT proj_in[d, h]
             std::vector<float> proj(D, 0);
             for (int d = 0; d < D; d++) {
                 float s = proj_b[d];
                 for (int h = 0; h < H; h++)
-                    s += proj_w[h * D + d] * r[h];
+                    s += proj_w[h + d * H] * r[h];
                 proj[d] = s;
             }
 
             // Find nearest codebook entry by Euclidean distance
             // ||proj - emb[j]||^2 = ||proj||^2 + ||emb[j]||^2 - 2*proj·emb[j]
             // embed_sq_cpu[j] = ||emb[j]||^2 (precomputed)
-            // After transpose, embed[j,d] is at flat offset d*V + j
+            // ggml layout [ne0=D, ne1=V]: element (ne0=d, ne1=j) at flat d + j*D
             int best_j = 0;
             float best_dist = 1e30f;
             for (int j = 0; j < V; j++) {
                 float dist = cb.embed_sq_cpu[j];
                 for (int d = 0; d < D; d++)
-                    dist -= 2.0f * proj[d] * emb[d * V + j];
+                    dist -= 2.0f * proj[d] * emb[d + j * D];
                 if (dist < best_dist) { best_dist = dist; best_j = j; }
             }
             codes[k * T + t] = best_j;
@@ -1371,16 +1428,16 @@ static bool rvq_encode_cpu(const RVQCodec &rvq, const float *embeddings,
         if (k + 1 < K) {
             for (int t = 0; t < T; t++) {
                 int code = codes[k * T + t];
-                // After transpose, embed[code, d] is at offset d*V + code
                 float *r = residual.data() + t * H;
 
                 if (!out_w.empty()) {
                     // Decode: decoded = project_out_w @ q_emb + project_out_b
-                    // project_out_w after transpose: [D, H] in ggml, weight[h,d]=out_w[d*H+h]
+                    // ggml layout [ne0=D, ne1=H]: element (ne0=d, ne1=h) at flat d + h*D
+                    // embed layout [ne0=D, ne1=V]: element (ne0=d, ne1=code) at flat d + code*D
                     for (int h = 0; h < H; h++) {
                         float s = out_b.empty() ? 0.0f : out_b[h];
                         for (int d = 0; d < D; d++)
-                            s += out_w[d * H + h] * emb[d * V + code];
+                            s += out_w[d + h * D] * emb[d + code * D];
                         r[h] -= s;
                     }
                 } else {
@@ -1392,6 +1449,24 @@ static bool rvq_encode_cpu(const RVQCodec &rvq, const float *embeddings,
         }
     }
     return true;
+}
+
+// Conv1d with F32 im2col — ggml_conv_1d hardcodes F16 im2col, which
+// overflows to Inf for values > 65504. The DAC encoder produces intermediate
+// feature values exceeding this range, so we must use F32 im2col.
+// a = [K, IC, OC]  (weight kernel)
+// b = [OW, IW, IC] (input: ne0=OW/output-spatial, ne1=IW/input-spatial, ne2=IC)
+static struct ggml_tensor *conv_1d_f32(struct ggml_context *ctx,
+                                        struct ggml_tensor *a,
+                                        struct ggml_tensor *b,
+                                        int s, int p, int d) {
+    // CPU backend mul_mat requires both inputs F32 when one is F32
+    if (a->type != GGML_TYPE_F32) a = ggml_cast(ctx, a, GGML_TYPE_F32);
+    struct ggml_tensor *im2col = ggml_im2col(ctx, a, b, s, 0, p, 0, d, 0, false, GGML_TYPE_F32);
+    struct ggml_tensor *result = ggml_mul_mat(ctx,
+        ggml_reshape_2d(ctx, im2col, im2col->ne[0], (im2col->ne[2] * im2col->ne[1])),
+        ggml_reshape_2d(ctx, a, (a->ne[0] * a->ne[1]), a->ne[2]));
+    return ggml_reshape_3d(ctx, result, im2col->ne[1], a->ne[2], im2col->ne[2]);
 }
 
 // Forward declaration (defined later in RunVocoder section)
@@ -1430,28 +1505,32 @@ static struct ggml_tensor *hubert_feature_extractor_graph(
     struct ggml_context *ctx, struct ggml_tensor *x,
     const HubertFeatExtractor &feat, int *out_T)
 {
-    // Layer 0: conv1d k=10 s=5, GroupNorm(1 group), GELU.
-    // GroupNorm normalizes along ne0, so we transpose to [C, T] for it,
-    // then transpose back to [T, C] for subsequent conv ops.
+    // HF HuBERT uses valid padding (pad=0) and dilation 1 on every conv.
+    // Layer 0: conv1d k=10 s=5 pad=0, GroupNorm(G=C, affine), GELU exact.
+    // GroupNorm with n_groups==C == InstanceNorm: normalizes each channel
+    // independently over the time axis. Input is reshaped to [T, 1, C] so
+    // ggml_group_norm reads channels from ne[2].
     if (feat.conv[0].conv_w) {
         struct ggml_tensor *w = feat.conv[0].conv_w;
         if (w->type != GGML_TYPE_F16) w = ggml_cast(ctx, w, GGML_TYPE_F16);
         x = ggml_conv_1d(ctx, w, ggml_reshape_3d(ctx, x, x->ne[0], 1, 1), 5, 0, 1);
         x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1]);
-        // Transpose to [C, T] for GroupNorm (ne0=channels)
-        x = feat_to_ct(ctx, x);
         if (feat.conv[0].ln_w) {
-            x = ggml_group_norm(ctx, x, 1, 1e-5f);
-            x = ggml_mul(ctx, x, feat.conv[0].ln_w);
-            x = ggml_add(ctx, x, feat.conv[0].ln_b);
+            int T = (int)x->ne[0];
+            int C = (int)x->ne[1];
+            x = ggml_reshape_3d(ctx, x, T, 1, C);
+            x = ggml_group_norm(ctx, x, C, 1e-5f);
+            x = ggml_reshape_2d(ctx, x, T, C);
+            struct ggml_tensor *w2 = ggml_reshape_2d(ctx, feat.conv[0].ln_w, 1, C);
+            struct ggml_tensor *b2 = ggml_reshape_2d(ctx, feat.conv[0].ln_b, 1, C);
+            x = ggml_mul(ctx, x, w2);
+            x = ggml_add(ctx, x, b2);
         }
-        x = ggml_gelu(ctx, x);
-        // Transpose back to [T, C] for next conv1d
-        x = feat_to_tc(ctx, x);
+        x = ggml_gelu_erf(ctx, x);
         x = ggml_cont(ctx, x);
     }
 
-    // Layers 1-6: conv1d k=3/2 s=2, GELU (all in [T, C] layout)
+    // Layers 1-6: conv1d k=3/2 s=2 pad=0, GELU exact (all in [T, C] layout)
     static const int hubert_kernels[] = {3, 3, 3, 3, 2, 2};
     static const int hubert_strides[] = {2, 2, 2, 2, 2, 2};
     for (int i = 1; i < 7; i++) {
@@ -1460,10 +1539,9 @@ static struct ggml_tensor *hubert_feature_extractor_graph(
         if (w->type != GGML_TYPE_F16) w = ggml_cast(ctx, w, GGML_TYPE_F16);
         int k = hubert_kernels[i - 1];
         int s = hubert_strides[i - 1];
-        int pad = (k - 1) / 2;
-        x = ggml_conv_1d(ctx, w, ggml_reshape_3d(ctx, x, x->ne[0], x->ne[1], 1), s, pad, 1);
+        x = ggml_conv_1d(ctx, w, ggml_reshape_3d(ctx, x, x->ne[0], x->ne[1], 1), s, 0, 1);
         x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1]);
-        x = ggml_gelu(ctx, x);
+        x = ggml_gelu_erf(ctx, x);
         x = ggml_cont(ctx, x);
     }
     // Final transpose to [C, T] for downstream mul_mat / LayerNorm
@@ -1523,33 +1601,37 @@ static struct ggml_tensor *hubert_attention_graph(
 }
 
 // =====================================================================
-// HuBERT encoder layer (post-LN: x = x + attn(LN(x)), x = x + ffn(LN(x)))
+// HuBERT encoder layer (Post-LN: x = LN(x + attn(x)), x = LN(x + FFN(x)))
 // =====================================================================
 
 static struct ggml_tensor *hubert_encoder_layer_graph(
     struct ggml_context *ctx, struct ggml_tensor *x,
     const HubertLayerWeights &l, int n_head, int head_dim)
 {
-    // x layout: [H, T] (ne0=H, ne1=T), biases are 1D [H] — broadcast works.
+    // x layout: [H, T] (ne0=H, ne1=T).
+    // HF HuBERT uses Post-LN (do_stable_layer_norm=false):
+    //   x = x + attn(x)  →  LN
+    //   x = x + FFN(x)   →  LN
 
-    // Self-attention with pre-norm
-    struct ggml_tensor *ln_x = ggml_norm(ctx, x, 1e-5f);
-    if (l.ln_attn_w) ln_x = ggml_mul(ctx, ln_x, l.ln_attn_w);
-    if (l.ln_attn_b) ln_x = ggml_add(ctx, ln_x, l.ln_attn_b);
-    struct ggml_tensor *attn_out = hubert_attention_graph(ctx, ln_x, l.attn, n_head, head_dim);
-    x = ggml_add(ctx, x, attn_out);
+    // Attention with post-norm
+    struct ggml_tensor *residual = x;
+    struct ggml_tensor *attn_out = hubert_attention_graph(ctx, x, l.attn, n_head, head_dim);
+    x = ggml_add(ctx, residual, attn_out);
+    x = ggml_norm(ctx, x, 1e-5f);
+    if (l.ln_attn_w) x = ggml_mul(ctx, x, l.ln_attn_w);
+    if (l.ln_attn_b) x = ggml_add(ctx, x, l.ln_attn_b);
 
-    // FFN with pre-norm
-    struct ggml_tensor *ln_x2 = ggml_norm(ctx, x, 1e-5f);
-    if (l.ln_ffn_w) ln_x2 = ggml_mul(ctx, ln_x2, l.ln_ffn_w);
-    if (l.ln_ffn_b) ln_x2 = ggml_add(ctx, ln_x2, l.ln_ffn_b);
-    // FFN weights were transposed at conversion time [out,in]→[in,out].
-    struct ggml_tensor *ffn = ggml_mul_mat(ctx, l.ffn.w1_w, ln_x2);
+    // FFN with post-norm
+    residual = x;
+    struct ggml_tensor *ffn = ggml_mul_mat(ctx, l.ffn.w1_w, x);
     if (l.ffn.w1_b) ffn = ggml_add(ctx, ffn, l.ffn.w1_b);
-    ffn = ggml_gelu(ctx, ffn);
+    ffn = ggml_gelu_erf(ctx, ffn);
     ffn = ggml_mul_mat(ctx, l.ffn.w2_w, ffn);
     if (l.ffn.w2_b) ffn = ggml_add(ctx, ffn, l.ffn.w2_b);
-    x = ggml_add(ctx, x, ffn);
+    x = ggml_add(ctx, residual, ffn);
+    x = ggml_norm(ctx, x, 1e-5f);
+    if (l.ln_ffn_w) x = ggml_mul(ctx, x, l.ln_ffn_w);
+    if (l.ln_ffn_b) x = ggml_add(ctx, x, l.ln_ffn_b);
 
     return x;
 }
@@ -1563,7 +1645,9 @@ static struct ggml_tensor *semantic_encoder_graph(
     const SemanticEncoderWeights &sem_enc)
 {
     // x is [H, T] (ne0=H, ne1=T). All conv ops need [T, H, 1] input.
-    // We transpose before conv_1d and transpose back afterward.
+    // Reference sem_enc_build_graph expects [T, 768] T-first input/output.
+    // We transpose before conv_1d and transpose back afterward, keeping the
+    // rest of the pipeline in C-first layout.
     if (!sem_enc.c1w) return x;
 
     auto conv_in = [&](struct ggml_tensor *f) -> struct ggml_tensor * {
@@ -1571,7 +1655,7 @@ static struct ggml_tensor *semantic_encoder_graph(
                                 f->ne[1], f->ne[0], 1);
     };
 
-    // conv1d k=3, pad=1 (same padding, preserves T — mirrors reference sem_enc_build_graph)
+    // initial conv1d: 768 -> 768, k=3, pad=1, NO bias
     {
         struct ggml_tensor *w = sem_enc.c1w;
         if (w->type != GGML_TYPE_F16) w = ggml_cast(ctx, w, GGML_TYPE_F16);
@@ -1581,48 +1665,34 @@ static struct ggml_tensor *semantic_encoder_graph(
         x = ggml_cont(ctx, x);
     }
 
-    // 2 conv_blocks, each with conv1d + 2 res_units
-    // Pad rule: pad = dilation * (k-1) / 2 for "same" output length
-    auto same_pad = [](int k, int dilation) { return dilation * (k - 1) / 2; };
-
+    // 2 blocks, each: 2 res_units (ELU->conv->ELU->conv+skip) -> post-block conv (with bias).
+    // No block-level residual. Mirrors reference sem_enc_build_graph.
     for (int i = 0; i < 2; i++) {
         if (!sem_enc.blk[i].cw) continue;
-        struct ggml_tensor *skip = x;
 
-        // conv1d, same channels
-        {
-            struct ggml_tensor *bw = sem_enc.blk[i].cw;
-            int k = (int)bw->ne[0];
-            int pad = same_pad(k, 1);
-            if (bw->type != GGML_TYPE_F16) bw = ggml_cast(ctx, bw, GGML_TYPE_F16);
-            x = ggml_conv_1d(ctx, bw, conv_in(x), 1, pad, 1);
-            x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1]);
-            x = feat_to_ct(ctx, x);
-            if (sem_enc.blk[i].cb) x = ggml_add(ctx, x, sem_enc.blk[i].cb);
-            x = ggml_cont(ctx, x);
-        }
-
-        // 2 res_units (conv1d with same channels, no activation/norm)
+        // 2 res_units: ELU -> conv1(k=3, dil=1, no bias) -> ELU -> conv2(k=1, no bias) + skip
         for (int r = 0; r < 2; r++) {
             if (!sem_enc.blk[i].ru[r].c1w) continue;
             struct ggml_tensor *ru_skip = x;
 
-            struct ggml_tensor *r1w = sem_enc.blk[i].ru[r].c1w;
+            // ELU -> conv1 (k=3, pad=dilation, dilation, no bias)
+            x = ggml_elu(ctx, x);
             {
-                int k = (int)r1w->ne[0];
-                int pad = same_pad(k, 1);
+                struct ggml_tensor *r1w = sem_enc.blk[i].ru[r].c1w;
+                int dil = 1;
+                int pad = dil;  // (k-1)*dil/2 = 1 for k=3
                 if (r1w->type != GGML_TYPE_F16) r1w = ggml_cast(ctx, r1w, GGML_TYPE_F16);
-                x = ggml_conv_1d(ctx, r1w, conv_in(x), 1, pad, 1);
+                x = ggml_conv_1d(ctx, r1w, conv_in(x), 1, pad, dil);
                 x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1]);
                 x = feat_to_ct(ctx, x);
             }
 
-            struct ggml_tensor *r2w = sem_enc.blk[i].ru[r].c2w;
+            // ELU -> conv2 (k=1, pad=0, no bias)
+            x = ggml_elu(ctx, x);
             {
-                int k = (int)r2w->ne[0];
-                int pad = same_pad(k, 1);
+                struct ggml_tensor *r2w = sem_enc.blk[i].ru[r].c2w;
                 if (r2w->type != GGML_TYPE_F16) r2w = ggml_cast(ctx, r2w, GGML_TYPE_F16);
-                x = ggml_conv_1d(ctx, r2w, conv_in(x), 1, pad, 1);
+                x = ggml_conv_1d(ctx, r2w, conv_in(x), 1, 0, 1);
                 x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1]);
                 x = feat_to_ct(ctx, x);
             }
@@ -1630,8 +1700,19 @@ static struct ggml_tensor *semantic_encoder_graph(
             x = ggml_add(ctx, ru_skip, x);
             x = ggml_cont(ctx, x);
         }
-        x = ggml_add(ctx, skip, x);
-        x = ggml_cont(ctx, x);
+
+        // Post-block conv: k=3, pad=1, WITH bias
+        {
+            struct ggml_tensor *bw = sem_enc.blk[i].cw;
+            int k = (int)bw->ne[0];
+            int pad = (k - 1) / 2;  // same padding
+            if (bw->type != GGML_TYPE_F16) bw = ggml_cast(ctx, bw, GGML_TYPE_F16);
+            x = ggml_conv_1d(ctx, bw, conv_in(x), 1, pad, 1);
+            x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1]);
+            x = feat_to_ct(ctx, x);
+            if (sem_enc.blk[i].cb) x = ggml_add(ctx, x, sem_enc.blk[i].cb);
+            x = ggml_cont(ctx, x);
+        }
     }
     return x;
 }
@@ -1681,8 +1762,7 @@ static struct ggml_tensor *dac_encoder_graph(
             {
                 int pad1 = 3 * ru.dilation;
                 struct ggml_tensor *w = ru.c1w;
-                if (w->type != GGML_TYPE_F16) w = ggml_cast(ctx, w, GGML_TYPE_F16);
-                x = ggml_conv_1d(ctx, w, ggml_reshape_3d(ctx, x, x->ne[0], x->ne[1], 1), 1, pad1, ru.dilation);
+                x = conv_1d_f32(ctx, w, ggml_reshape_3d(ctx, x, x->ne[0], x->ne[1], 1), 1, pad1, ru.dilation);
                 x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1]);
                 if (ru.c1b) x = ggml_add(ctx, x, bias_1d_to_2d(ctx, ru.c1b));
                 x = ggml_cont(ctx, x);
@@ -1699,7 +1779,7 @@ static struct ggml_tensor *dac_encoder_graph(
             {
                 struct ggml_tensor *w = ru.c2w;
                 if (w->type != GGML_TYPE_F16) w = ggml_cast(ctx, w, GGML_TYPE_F16);
-                x = ggml_conv_1d(ctx, w, ggml_reshape_3d(ctx, x, x->ne[0], x->ne[1], 1), 1, 0, 1);
+                x = conv_1d_f32(ctx, w, ggml_reshape_3d(ctx, x, x->ne[0], x->ne[1], 1), 1, 0, 1);
                 x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1]);
                 if (ru.c2b) x = ggml_add(ctx, x, bias_1d_to_2d(ctx, ru.c2b));
             }
@@ -1722,13 +1802,12 @@ static struct ggml_tensor *dac_encoder_graph(
             int pad = (b.stride + 1) / 2;
             struct ggml_tensor *w = b.cw;
             if (w->type != GGML_TYPE_F16) w = ggml_cast(ctx, w, GGML_TYPE_F16);
-            x = ggml_conv_1d(ctx, w, ggml_reshape_3d(ctx, x, x->ne[0], x->ne[1], 1), b.stride, pad, 1);
+            x = conv_1d_f32(ctx, w, ggml_reshape_3d(ctx, x, x->ne[0], x->ne[1], 1), b.stride, pad, 1);
             x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1]);
             if (b.cb) x = ggml_add(ctx, x, bias_1d_to_2d(ctx, b.cb));
             x = ggml_cont(ctx, x);
         }
     }
-
     // Final snake + conv2
     if (enc.s_final.a && !enc.s_final.inv_b.empty()) {
         int C_alpha = (int)ggml_nelements(enc.s_final.a);
@@ -1739,7 +1818,7 @@ static struct ggml_tensor *dac_encoder_graph(
         struct ggml_tensor *w = enc.c2w;
         if (w->type != GGML_TYPE_F16) w = ggml_cast(ctx, w, GGML_TYPE_F16);
         // pad=1 matches reference dac_enc_build_graph (k=3, pad=1 preserves T)
-        x = ggml_conv_1d(ctx, w, ggml_reshape_3d(ctx, x, x->ne[0], x->ne[1], 1), 1, 1, 1);
+        x = conv_1d_f32(ctx, w, ggml_reshape_3d(ctx, x, x->ne[0], x->ne[1], 1), 1, 1, 1);
         x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1]);
         if (enc.c2b) x = ggml_add(ctx, x, bias_1d_to_2d(ctx, enc.c2b));
         x = ggml_cont(ctx, x);
@@ -1868,7 +1947,7 @@ std::vector<int32_t> OmniVoiceModel::EncodeReferenceAudio(const float *audio_24k
 
             // Trim trailing sample (k even, T_out = T+1 -> T)
             y = ggml_cont(gctx, ggml_view_2d(gctx, y, T, HUBERT_HIDDEN, y->nb[1], 0));
-            y = ggml_gelu(gctx, y);
+            y = ggml_gelu_erf(gctx, y);
 
             // Transpose back to C-first [768, T] and add as residual
             struct ggml_tensor *pos = ggml_cont(gctx, ggml_transpose(gctx, y));
@@ -1945,6 +2024,21 @@ std::vector<int32_t> OmniVoiceModel::EncodeReferenceAudio(const float *audio_24k
                                 semantic_feat.size() * sizeof(float));
         ggml_backend_buffer_free(buf);
         ggml_free(gctx);
+
+        // Diagnostic: semantic feature statistics
+        {
+            double sum = 0, sq = 0;
+            float mn = semantic_feat[0], mx = semantic_feat[0];
+            for (size_t i = 0; i < semantic_feat.size(); i++) {
+                float v = semantic_feat[i];
+                sum += v; sq += (double)v * v;
+                if (v < mn) mn = v; if (v > mx) mx = v;
+            }
+            double mean = sum / semantic_feat.size();
+            double std = sqrt(sq / semantic_feat.size() - mean * mean);
+            RS_LOG_INFO("OmniVoice DIAG semantic_feat: min=%.4f max=%.4f mean=%.4f std=%.4f rms=%.4f",
+                        mn, mx, mean, std, sqrt(sq / semantic_feat.size()));
+        }
     }
 
     RS_LOG_INFO("OmniVoice: HuBERT -> %d frames x 768", T_s);
@@ -2047,6 +2141,21 @@ std::vector<int32_t> OmniVoiceModel::EncodeReferenceAudio(const float *audio_24k
                                 acoustic_feat.size() * sizeof(float));
         ggml_backend_buffer_free(buf);
         ggml_free(gctx);
+
+        // Diagnostic: acoustic feature statistics
+        {
+            double sum = 0, sq = 0;
+            float mn = acoustic_feat[0], mx = acoustic_feat[0];
+            for (size_t i = 0; i < acoustic_feat.size(); i++) {
+                float v = acoustic_feat[i];
+                sum += v; sq += (double)v * v;
+                if (v < mn) mn = v; if (v > mx) mx = v;
+            }
+            double mean = sum / acoustic_feat.size();
+            double std = sqrt(sq / acoustic_feat.size() - mean * mean);
+            RS_LOG_INFO("OmniVoice DIAG acoustic_feat: min=%.4f max=%.4f mean=%.4f std=%.4f rms=%.4f",
+                        mn, mx, mean, std, sqrt(sq / acoustic_feat.size()));
+        }
     }
 
     RS_LOG_INFO("OmniVoice: DAC encoder -> %d frames x %zu", T_a, acoustic_feat.size() / std::max(1, T_a));
@@ -2070,18 +2179,39 @@ std::vector<int32_t> OmniVoiceModel::EncodeReferenceAudio(const float *audio_24k
 
     // fc projection on CPU: fc_w [C_out, C_in] @ combined [C_in, T_s] -> [C_out, T_s]
     int C_in = C_a + C_s;
-    // fc_w in GGML: ne0=C_out, ne1=C_in. Memory layout: element (o,i) at offset i*C_out+o.
-    int C_out = (fc_w_) ? (int)fc_w_->ne[0] : C_in;
+    // fc_w in GGML: ne0=C_in, ne1=C_out. PT element fc_weight[out=o, in=i] stored at
+    // flat position i + o*C_in (ggml convention: ne0 varies fastest, ne0=in dimension).
+    int C_out = (fc_w_) ? (int)fc_w_->ne[1] : C_in;
+
+    // Diagnostic: combined features before fc
+    {
+        double sum = 0, sq = 0;
+        float mn = combined[0], mx = combined[0];
+        for (size_t i = 0; i < combined.size(); i++) {
+            float v = combined[i];
+            sum += v; sq += (double)v * v;
+            if (v < mn) mn = v; if (v > mx) mx = v;
+        }
+        double mean = sum / combined.size();
+        double std = sqrt(sq / combined.size() - mean * mean);
+        RS_LOG_INFO("OmniVoice DIAG combined(pre-fc): min=%.4f max=%.4f mean=%.4f std=%.4f rms=%.4f",
+                    mn, mx, mean, std, sqrt(sq / combined.size()));
+    }
 
     std::vector<float> projected;
-    if (fc_w_ && C_in == (int)fc_w_->ne[1]) {
-        C_out = (int)fc_w_->ne[0];
+    if (fc_w_ && C_in == (int)fc_w_->ne[0]) {
+        C_out = (int)fc_w_->ne[1];
         projected.resize((size_t)T_s * C_out, 0.0f);
 
         // Read fc_w, converting from F16 if needed
         size_t n_weights = (size_t)C_in * C_out;
         size_t type_sz = ggml_type_size(fc_w_->type);
         std::vector<float> fc_w_cpu(n_weights);
+
+        // The fc weight has acoustic column RMS ~7.6x larger than semantic columns
+        // (verified against original PyTorch safetensors). This partially compensates
+        // for the acoustic feature scale (~15611) being much larger than semantic (~0.3),
+        // but acoustic features still dominate the projection by ~6500x.
         if (type_sz == sizeof(float)) {
             ggml_backend_tensor_get(fc_w_, fc_w_cpu.data(), 0, n_weights * sizeof(float));
         } else if (type_sz == sizeof(uint16_t)) {
@@ -2109,12 +2239,12 @@ std::vector<int32_t> OmniVoiceModel::EncodeReferenceAudio(const float *audio_24k
             }
         }
 
-        // fc_w_cpu has ggml layout: element at (o,i) is fc_w_cpu[i*C_out + o]
+        // fc_w in ggml ne0=C_in: fc_weight[out=o, in=i] at flat i + o*C_in
         for (int t = 0; t < T_s; t++) {
             for (int o = 0; o < C_out; o++) {
                 float s = fc_b_cpu.empty() ? 0.0f : fc_b_cpu[o];
                 for (int i = 0; i < C_in; i++)
-                    s += fc_w_cpu[(size_t)i * C_out + o] * combined[(size_t)t * C_in + i];
+                    s += fc_w_cpu[(size_t)o * C_in + i] * combined[(size_t)t * C_in + i];
                 projected[(size_t)t * C_out + o] = s;
             }
         }
@@ -2126,9 +2256,52 @@ std::vector<int32_t> OmniVoiceModel::EncodeReferenceAudio(const float *audio_24k
 
     RS_LOG_INFO("OmniVoice: projected -> %d frames x %d", T_s, C_out);
 
+    // Diagnostic: projected features after fc
+    {
+        double sum = 0, sq = 0;
+        float mn = projected[0], mx = projected[0];
+        for (size_t i = 0; i < projected.size(); i++) {
+            float v = projected[i];
+            sum += v; sq += (double)v * v;
+            if (v < mn) mn = v; if (v > mx) mx = v;
+        }
+        double mean = sum / projected.size();
+        double std = sqrt(sq / projected.size() - mean * mean);
+        RS_LOG_INFO("OmniVoice DIAG projected(post-fc): min=%.4f max=%.4f mean=%.4f std=%.4f rms=%.4f",
+                    mn, mx, mean, std, sqrt(sq / projected.size()));
+    }
+
     // === Phase 4: RVQ encode ===
     std::vector<int32_t> codes;
     if (!rvq_encode_cpu(rvq_, projected.data(), T_s, codes)) return {};
+
+    // Diagnostic: RVQ code distribution per codebook
+    {
+        std::string cdist;
+        for (int k = 0; k < rvq_.num_codebooks && k < 8; k++) {
+            std::vector<int> hist(rvq_.codebook_size, 0);
+            for (int t = 0; t < T_s; t++) {
+                int c = codes[k * T_s + t];
+                if (c >= 0 && c < rvq_.codebook_size) hist[c]++;
+            }
+            // count non-zero bins and top-5 codes
+            int nz = 0;
+            std::vector<std::pair<int,int>> top;
+            for (int j = 0; j < rvq_.codebook_size; j++) {
+                if (hist[j] > 0) { nz++; top.push_back({hist[j], j}); }
+            }
+            std::sort(top.begin(), top.end(), std::greater<>());
+            char buf[256];
+            snprintf(buf, sizeof(buf), " cb%d:nz=%d", k, nz);
+            cdist += buf;
+            int show = std::min(5, (int)top.size());
+            for (int j = 0; j < show; j++) {
+                snprintf(buf, sizeof(buf), " #%d=%d", top[j].second, top[j].first);
+                cdist += buf;
+            }
+        }
+        RS_LOG_INFO("OmniVoice DIAG RVQ codes: T=%d%s", T_s, cdist.c_str());
+    }
 
     RS_LOG_INFO("OmniVoice: encoded reference audio %d samples -> T_s=%d T_a=%d -> %zu codes",
                 n_samples, T_s, T_a, codes.size());
@@ -2332,6 +2505,24 @@ bool OmniVoiceModel::BuildPrompt(OmniVoiceState &state, OmniVoicePrompt &prompt)
         std::string td = "text_ids:";
         for (int n = 0; n < N2; n++) td += " " + std::to_string(text_ids[n]);
         RS_LOG_INFO("%s", td.c_str());
+    }
+    // Diagnostic: reference code statistics
+    if (Sref > 0) {
+        std::string ref_info = "ref_codes:";
+        for (int k = 0; k < K; k++) {
+            int mn = 99999, mx = -1;
+            size_t nonzero = 0;
+            for (int t = 0; t < Sref; t++) {
+                int32_t v = prompt.input_ids[((size_t)0 * K + k) * c_len + (ref_start + t)];
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+                if (v != 0 && v != audio_mask_id_) nonzero++;
+            }
+            char buf[128];
+            snprintf(buf, sizeof(buf), " cb%d:[%d,%d] nz=%zu/%d", k, mn, mx, nonzero, Sref);
+            ref_info += buf;
+        }
+        RS_LOG_INFO("%s", ref_info.c_str());
     }
     return true;
 }
