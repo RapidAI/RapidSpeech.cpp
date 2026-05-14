@@ -395,7 +395,7 @@ private:
 
     // Internal methods
     bool LoadLM(const std::unique_ptr<rs_context_t> &ctx);
-    bool LoadCodec();
+    bool LoadCodec(struct ggml_context *gguf_data);
     bool LoadEncoderWeights();
     bool MapTensors(std::map<std::string, struct ggml_tensor *> &tensors);
 

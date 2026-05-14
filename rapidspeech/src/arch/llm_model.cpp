@@ -599,6 +599,9 @@ bool llm_model::load_hparams(struct gguf_context *ctx_gguf) {
   } else if (arch_str == "omnivoice-lm") {
     hparams_.arch = LLM_ARCH_QWEN3;
     arch_key = "omnivoice-lm";
+  } else if (arch_str == "OmniVoice") {
+    hparams_.arch = LLM_ARCH_QWEN3;
+    arch_key = "omnivoice-lm";
   } else if (arch_str == "llama") {
     hparams_.arch = LLM_ARCH_LLAMA;
     arch_key = "llama";
@@ -660,6 +663,11 @@ bool llm_model::load_hparams(struct gguf_context *ctx_gguf) {
 
   hparams_.rope_freq_base = (int32_t)get_f32("%s.rope.freq_base", 10000.0f);
   hparams_.rope_freq_scale = get_f32("%s.rope.freq_scale", 1.0f);
+
+  LLM_LOG_INFO("DEBUG: n_vocab=%d n_embd=%d n_layer=%d arch=%s arch_key=%s",
+               hparams_.n_vocab, hparams_.n_embd, hparams_.n_layer,
+               hparams_.arch == LLM_ARCH_QWEN3 ? "qwen3" : "unknown",
+               arch_key.c_str());
 
   if (!hparams_.is_valid()) {
     LLM_LOG_ERROR("Invalid hyperparameters");
@@ -808,7 +816,11 @@ bool llm_model::map_tensors_qwen3(
     if (suffix.find("model.") == 0) {
       full_name = arch_prefix + "." + suffix.substr(6); // skip "model."
       it = tensors.find(full_name);
+      if (it != tensors.end())
+        return it->second;
     }
+    // Try raw safetensors name (no prefix) — for merged GGUF files
+    it = tensors.find(suffix);
     return (it != tensors.end()) ? it->second : nullptr;
   };
 
@@ -838,6 +850,11 @@ bool llm_model::map_tensors_qwen3(
       if (it != tensors.end())
         return it->second;
       name = layer_prefix_ovo + suffix;
+      it = tensors.find(name);
+      if (it != tensors.end())
+        return it->second;
+      // Try raw safetensors name: "model.layers.N.xxx"
+      name = "model.layers." + std::to_string(il) + "." + suffix;
       it = tensors.find(name);
       return (it != tensors.end()) ? it->second : nullptr;
     };

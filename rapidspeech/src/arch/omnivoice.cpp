@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <random>
 #include <unordered_set>
 
@@ -246,26 +247,44 @@ bool OmniVoiceBPETokenizer::load_from_gguf(const char *gguf_path) {
 
     int n_tokens = (int)gguf_get_arr_n(ctx, tok_key);
     int n_merges = (int)gguf_get_arr_n(ctx, mrg_key);
+
+    // Use the raw token count from the GGUF array (may include empty-string
+    // padding entries to cover the model vocab size including added special
+    // tokens).  vocab.size() is smaller when multiple entries share the same
+    // string (e.g. empty-string padding).
+    n_vocab = n_tokens;
+    id_to_str.resize(n_vocab);
     for (int i = 0; i < n_tokens; i++) {
-        vocab[std::string(gguf_get_arr_str(ctx, tok_key, i))] = i;
+        std::string s = std::string(gguf_get_arr_str(ctx, tok_key, i));
+        id_to_str[i] = s;
+        vocab[s] = i;
     }
     for (int i = 0; i < n_merges; i++) {
         merges[std::string(gguf_get_arr_str(ctx, mrg_key, i))] = i;
     }
-    gguf_free(ctx);
-
-    n_vocab = (int)vocab.size();
-    id_to_str.resize(n_vocab);
-    for (auto &kv : vocab) {
-        if (kv.second >= 0 && kv.second < n_vocab)
-            id_to_str[kv.second] = kv.first;
-    }
-
     auto eos_it = vocab.find("<|endoftext|>");
     eos_id = (eos_it != vocab.end()) ? eos_it->second : -1;
     if (eos_id >= 0) specials.emplace_back("<|endoftext|>", eos_id);
 
-    fprintf(stderr, "[BPE] Loaded: %d vocab, %d merges, eos_id=%d\n", n_vocab, n_merges, eos_id);
+    // Read OmniVoice special token IDs from the same GGUF context
+    static const char *special_keys[] = {
+        "omnivoice.special.denoise", "omnivoice.special.lang_start",
+        "omnivoice.special.lang_end", "omnivoice.special.instruct_start",
+        "omnivoice.special.instruct_end", "omnivoice.special.text_start",
+        "omnivoice.special.text_end",
+    };
+    for (int i = 0; i < 7; i++) {
+        int64_t k = gguf_find_key(ctx, special_keys[i]);
+        if (k < 0) continue;
+        int id = (int)gguf_get_val_u32(ctx, k);
+        if (id >= 0 && id < n_vocab)
+            specials.emplace_back(id_to_str[id], id);
+    }
+
+    gguf_free(ctx);
+
+    fprintf(stderr, "[BPE] Loaded: %d vocab, %d merges, eos_id=%d specials=%zu\n",
+            n_vocab, n_merges, eos_id, specials.size());
     return true;
 }
 
@@ -526,51 +545,12 @@ bool OmniVoiceModel::Load(const std::unique_ptr<rs_context_t> &ctx, ggml_backend
 
     if (!LoadLM(ctx)) return false;
 
-    // Auto-detect codec path from LM model path if not explicitly set
-    if (codec_path_.empty() && ctx->params.model_path) {
-        std::string lm_path = ctx->params.model_path;
-        // Try pattern: replace "-base-" with "-tokenizer-"
-        size_t base_pos = lm_path.find("-base-");
-        if (base_pos != std::string::npos) {
-            std::string candidate = lm_path.substr(0, base_pos) + "-tokenizer-" +
-                                    lm_path.substr(base_pos + 6); // skip "-base-"
-            FILE *f = fopen(candidate.c_str(), "rb");
-            if (f) {
-                fclose(f);
-                codec_path_ = candidate;
-                RS_LOG_INFO("OmniVoice: auto-detected codec: %s", codec_path_.c_str());
-            }
-        }
-        // Try same directory with different name patterns
-        if (codec_path_.empty()) {
-            size_t last_slash = lm_path.rfind('/');
-            std::string dir = (last_slash != std::string::npos) ? lm_path.substr(0, last_slash + 1) : "";
-            const char *candidates[] = {
-                "omnivoice-tokenizer-F32.gguf",
-                "omnivoice-tokenizer-Q8_0.gguf",
-            };
-            for (const char *cand : candidates) {
-                std::string path = dir + cand;
-                FILE *f = fopen(path.c_str(), "rb");
-                if (f) {
-                    fclose(f);
-                    codec_path_ = path;
-                    RS_LOG_INFO("OmniVoice: auto-detected codec: %s", codec_path_.c_str());
-                    break;
-                }
-            }
-        }
-    }
-
-    if (!codec_path_.empty()) {
-        if (!LoadCodec()) {
-            RS_LOG_WARN("OmniVoice: codec load failed, only acoustic token generation available");
-            codec_loaded_ = false;
-        } else {
-            codec_loaded_ = true;
-        }
+    // Load codec tensors from the merged GGUF (now in ctx->gguf_data)
+    if (!LoadCodec(ctx->gguf_data)) {
+        RS_LOG_WARN("OmniVoice: codec load failed, only acoustic token generation available");
+        codec_loaded_ = false;
     } else {
-        RS_LOG_WARN("OmniVoice: no codec path found, only acoustic token generation available");
+        codec_loaded_ = true;
     }
 
     RS_LOG_INFO("OmniVoice: model loaded successfully (codec=%s)", codec_loaded_ ? "yes" : "no");
@@ -630,32 +610,6 @@ bool OmniVoiceModel::LoadLM(const std::unique_ptr<rs_context_t> &ctx) {
     meta_.n_mels = 0;
     meta_.vocab_size = hparams_.text_vocab_size;
 
-    // Try to get codec path from GGUF metadata, then auto-detect
-    int codec_path_idx = gguf_find_key(ctx_gguf, "omnivoice.codec_path");
-    if (codec_path_idx >= 0) {
-        codec_path_ = gguf_get_val_str(ctx_gguf, codec_path_idx);
-    }
-    if (codec_path_.empty() && ctx->params.model_path) {
-        // Auto-detect tokenizer GGUF next to the LM model:
-        //   omnivoice-base-F32.gguf -> omnivoice-tokenizer-F32.gguf
-        std::string lm_path(ctx->params.model_path);
-        auto slash = lm_path.rfind('/');
-        std::string dir = (slash != std::string::npos) ? lm_path.substr(0, slash + 1) : "";
-        std::string filename = lm_path.substr(slash + 1);
-        auto base_pos = filename.find("-base-");
-        if (base_pos != std::string::npos) {
-            std::string tokenizer_name =
-                filename.substr(0, base_pos) + "-tokenizer-" + filename.substr(base_pos + 6);
-            std::string candidate = dir + tokenizer_name;
-            FILE *f = fopen(candidate.c_str(), "rb");
-            if (f) {
-                fclose(f);
-                codec_path_ = candidate;
-                RS_LOG_INFO("OmniVoice: auto-detected codec: %s", codec_path_.c_str());
-            }
-        }
-    }
-
     RS_LOG_INFO("OmniVoice LM: layers=%d embd=%d heads=%d/%d hdim=%d ff=%d codebooks=%d",
                 hparams_.n_layer, hparams_.n_embd, hparams_.n_head,
                 hparams_.n_head_kv, hparams_.head_dim, hparams_.n_ff, hparams_.n_codebooks);
@@ -713,8 +667,6 @@ bool OmniVoiceModel::LoadLM(const std::unique_ptr<rs_context_t> &ctx) {
     if (!model_path.empty()) {
         if (!bpe_.load_from_gguf(model_path.c_str())) {
             RS_LOG_WARN("OmniVoice: BPE tokenizer load failed, falling back to llm_vocab");
-        } else {
-            bpe_.load_omnivoice_specials(model_path.c_str());
         }
     }
 
@@ -723,8 +675,29 @@ bool OmniVoiceModel::LoadLM(const std::unique_ptr<rs_context_t> &ctx) {
 
 bool OmniVoiceModel::MapTensors(std::map<std::string, struct ggml_tensor *> &tensors) {
     try {
-        text_embd_ = tensors.at("llm.embed_tokens.weight");
-        output_norm_ = tensors.at("llm.norm.weight");
+        // Try multiple naming conventions for text embeddings
+        const char *text_embd_names[] = {
+            "llm.embed_tokens.weight",         // OmniVoice GGUF convention
+            "model.embed_tokens.weight",       // raw safetensors name
+            "llm.model.embed_tokens.weight",   // standard Qwen3 GGUF
+            nullptr
+        };
+        for (int i = 0; text_embd_names[i]; ++i) {
+            auto it = tensors.find(text_embd_names[i]);
+            if (it != tensors.end()) { text_embd_ = it->second; break; }
+        }
+
+        // Try multiple naming conventions for output norm
+        const char *output_norm_names[] = {
+            "llm.norm.weight",                 // OmniVoice GGUF convention
+            "model.norm.weight",               // raw safetensors name
+            "llm.model.norm.weight",           // standard Qwen3 GGUF
+            nullptr
+        };
+        for (int i = 0; output_norm_names[i]; ++i) {
+            auto it = tensors.find(output_norm_names[i]);
+            if (it != tensors.end()) { output_norm_ = it->second; break; }
+        }
 
         // Try per-codebook head tensors first
         bool has_per_codebook = false;
@@ -781,50 +754,77 @@ bool OmniVoiceModel::MapTensors(std::map<std::string, struct ggml_tensor *> &ten
     }
 }
 
-bool OmniVoiceModel::LoadCodec() {
-    if (codec_path_.empty()) return false;
+bool OmniVoiceModel::LoadCodec(struct ggml_context *gguf_data) {
+    if (!gguf_data) return false;
 
-    // Open codec GGUF and auto-create ggml_context with all tensors
-    struct ggml_context *codec_ggml = nullptr;
-    struct gguf_init_params gp = { /*no_alloc=*/true, &codec_ggml};
-    struct gguf_context *codec_gguf = gguf_init_from_file(codec_path_.c_str(), gp);
-    if (!codec_gguf || !codec_ggml) {
-        RS_LOG_ERR("OmniVoice: failed to open codec GGUF: %s", codec_path_.c_str());
-        if (codec_gguf) gguf_free(codec_gguf);
-        if (codec_ggml) ggml_free(codec_ggml);
-        return false;
-    }
+    // Create a local CPU ggml_context for codec tensors.
+    // The main gguf_data tensors are on the primary backend (GPU), but the
+    // DAC vocoder runs on CPU where many small conv ops are much faster.
+    // Use no_alloc=true (heap alloc for tensor structs) — the actual tensor
+    // data is allocated later via ggml_backend_alloc_ctx_tensors on cpu_backend_.
+    const size_t local_ctx_size = ggml_tensor_overhead() * 1024 + (1 << 20);
+    struct ggml_init_params lp = { local_ctx_size, nullptr, true };
+    struct ggml_context *local_ctx = ggml_init(lp);
+    if (!local_ctx) return false;
 
-    // Load metadata
+    // Helper: look up tensor in gguf_data and duplicate it into local_ctx.
+    // Returns the local-ctx tensor (or nullptr if not found in gguf_data).
+    auto dup = [&](const char *name) -> struct ggml_tensor* {
+        struct ggml_tensor *src = ggml_get_tensor(gguf_data, name);
+        if (!src) return nullptr;
+        struct ggml_tensor *dst = nullptr;
+        int nd = ggml_n_dims(src);
+        if (nd == 1)
+            dst = ggml_new_tensor_1d(local_ctx, src->type, src->ne[0]);
+        else if (nd == 2)
+            dst = ggml_new_tensor_2d(local_ctx, src->type, src->ne[0], src->ne[1]);
+        else if (nd == 3)
+            dst = ggml_new_tensor_3d(local_ctx, src->type, src->ne[0], src->ne[1], src->ne[2]);
+        else
+            dst = ggml_new_tensor_4d(local_ctx, src->type, src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+        ggml_set_name(dst, name);
+        return dst;
+    };
+
+    // Load codec metadata from main ggml_context
     rvq_.num_codebooks = 8;
-    int cs_key = gguf_find_key(codec_gguf, "omnivoice.codebook_size");
-    if (cs_key >= 0) rvq_.codebook_size = (int)gguf_get_val_u32(codec_gguf, cs_key);
-    else rvq_.codebook_size = 1025;
+    rvq_.codebook_dim = 64;
+    // Read actual codebook_size from the embed tensor.
+    // After conversion transpose, embed is [dim, vocab_size] in ggml (ne[0]=dim, ne[1]=vocab).
+    {
+        struct ggml_tensor *emb0 = ggml_get_tensor(gguf_data, "quantizer.quantizers.0.codebook.embed");
+        if (emb0 && ggml_n_dims(emb0) == 2) {
+            // ne[0] is the smaller dim (embedding dim), ne[1] is vocab size
+            rvq_.codebook_dim  = (int)emb0->ne[0];
+            rvq_.codebook_size = (int)emb0->ne[1];
+        } else {
+            rvq_.codebook_size = 1024;
+        }
+    }
+    // RVQ codebook_size is number of real tokens (excludes mask token).
+    // The LLM audio vocab includes mask token: V = codebook_size + 1, mask_id = codebook_size.
+    audio_vocab_size_ = rvq_.codebook_size + 1;
+    audio_mask_id_ = rvq_.codebook_size;
 
-    int cd_key = gguf_find_key(codec_gguf, "omnivoice.codebook_dim");
-    if (cd_key >= 0) rvq_.codebook_dim = (int)gguf_get_val_u32(codec_gguf, cd_key);
-    else rvq_.codebook_dim = 64;
-
-    // Map tensor pointers from the auto-created ggml_context
     char tname[256];
 
     // RVQ codebooks
     for (int k = 0; k < rvq_.num_codebooks; k++) {
         snprintf(tname, sizeof(tname), "quantizer.quantizers.%d.codebook.embed", k);
-        rvq_.cb[k].embed = ggml_get_tensor(codec_ggml, tname);
+        rvq_.cb[k].embed = dup(tname);
         snprintf(tname, sizeof(tname), "quantizer.quantizers.%d.project_out.weight", k);
-        rvq_.cb[k].project_out_w = ggml_get_tensor(codec_ggml, tname);
+        rvq_.cb[k].project_out_w = dup(tname);
         snprintf(tname, sizeof(tname), "quantizer.quantizers.%d.project_out.bias", k);
-        rvq_.cb[k].project_out_b = ggml_get_tensor(codec_ggml, tname);
+        rvq_.cb[k].project_out_b = dup(tname);
     }
 
     // fc2 (1024 -> 256)
-    fc2_w_ = ggml_get_tensor(codec_ggml, "fc2.weight");
-    fc2_b_ = ggml_get_tensor(codec_ggml, "fc2.bias");
+    fc2_w_ = dup("fc2.weight");
+    fc2_b_ = dup("fc2.bias");
 
     // DAC decoder conv1
-    dac_.c1w = ggml_get_tensor(codec_ggml, "acoustic_decoder.conv1.weight");
-    dac_.c1b = ggml_get_tensor(codec_ggml, "acoustic_decoder.conv1.bias");
+    dac_.c1w = dup("acoustic_decoder.conv1.weight");
+    dac_.c1b = dup("acoustic_decoder.conv1.bias");
 
     static const int strides[] = {8, 5, 4, 2, 3};
     static const int in_chs[]  = {1024, 512, 256, 128, 64};
@@ -840,54 +840,54 @@ bool OmniVoiceModel::LoadCodec() {
 
         std::string pfx = "acoustic_decoder.block." + std::to_string(i);
         snprintf(tname, sizeof(tname), "%s.snake1.alpha", pfx.c_str());
-        b.s1.a = ggml_get_tensor(codec_ggml, tname);
+        b.s1.a = dup(tname);
         snprintf(tname, sizeof(tname), "%s.conv_t1.weight", pfx.c_str());
-        b.ctw = ggml_get_tensor(codec_ggml, tname);
+        b.ctw = dup(tname);
         snprintf(tname, sizeof(tname), "%s.conv_t1.bias", pfx.c_str());
-        b.ctb = ggml_get_tensor(codec_ggml, tname);
+        b.ctb = dup(tname);
 
         for (int r = 0; r < DAC_RES_UNITS; r++) {
             DACResUnitWeights &ru = b.ru[r];
             ru.dilation = dilations[r];
             std::string rp = pfx + ".res_unit" + std::to_string(r + 1);
             snprintf(tname, sizeof(tname), "%s.snake1.alpha", rp.c_str());
-            ru.s1.a = ggml_get_tensor(codec_ggml, tname);
+            ru.s1.a = dup(tname);
             snprintf(tname, sizeof(tname), "%s.conv1.weight", rp.c_str());
-            ru.c1w = ggml_get_tensor(codec_ggml, tname);
+            ru.c1w = dup(tname);
             snprintf(tname, sizeof(tname), "%s.conv1.bias", rp.c_str());
-            ru.c1b = ggml_get_tensor(codec_ggml, tname);
+            ru.c1b = dup(tname);
             snprintf(tname, sizeof(tname), "%s.snake2.alpha", rp.c_str());
-            ru.s2.a = ggml_get_tensor(codec_ggml, tname);
+            ru.s2.a = dup(tname);
             snprintf(tname, sizeof(tname), "%s.conv2.weight", rp.c_str());
-            ru.c2w = ggml_get_tensor(codec_ggml, tname);
+            ru.c2w = dup(tname);
             snprintf(tname, sizeof(tname), "%s.conv2.bias", rp.c_str());
-            ru.c2b = ggml_get_tensor(codec_ggml, tname);
+            ru.c2b = dup(tname);
         }
     }
 
-    dac_.s_final.a = ggml_get_tensor(codec_ggml, "acoustic_decoder.snake1.alpha");
-    dac_.c2w = ggml_get_tensor(codec_ggml, "acoustic_decoder.conv2.weight");
-    dac_.c2b = ggml_get_tensor(codec_ggml, "acoustic_decoder.conv2.bias");
+    dac_.s_final.a = dup("acoustic_decoder.snake1.alpha");
+    dac_.c2w = dup("acoustic_decoder.conv2.weight");
+    dac_.c2b = dup("acoustic_decoder.conv2.bias");
 
     // --- Load encoder-side weights ---
     // RVQ project_in (encode path)
     for (int k = 0; k < rvq_.num_codebooks; k++) {
         snprintf(tname, sizeof(tname), "quantizer.quantizers.%d.project_in.weight", k);
-        rvq_.cb[k].project_in_w = ggml_get_tensor(codec_ggml, tname);
+        rvq_.cb[k].project_in_w = dup(tname);
         snprintf(tname, sizeof(tname), "quantizer.quantizers.%d.project_in.bias", k);
-        rvq_.cb[k].project_in_b = ggml_get_tensor(codec_ggml, tname);
+        rvq_.cb[k].project_in_b = dup(tname);
     }
 
     // fc (encode path: 1024 -> 1024)
-    fc_w_ = ggml_get_tensor(codec_ggml, "fc.weight");
-    fc_b_ = ggml_get_tensor(codec_ggml, "fc.bias");
+    fc_w_ = dup("fc.weight");
+    fc_b_ = dup("fc.bias");
 
     // DAC encoder
-    dac_enc_.c1w = ggml_get_tensor(codec_ggml, "acoustic_encoder.conv1.weight");
-    dac_enc_.c1b = ggml_get_tensor(codec_ggml, "acoustic_encoder.conv1.bias");
-    dac_enc_.c2w = ggml_get_tensor(codec_ggml, "acoustic_encoder.conv2.weight");
-    dac_enc_.c2b = ggml_get_tensor(codec_ggml, "acoustic_encoder.conv2.bias");
-    dac_enc_.s_final.a = ggml_get_tensor(codec_ggml, "acoustic_encoder.snake1.alpha");
+    dac_enc_.c1w = dup("acoustic_encoder.conv1.weight");
+    dac_enc_.c1b = dup("acoustic_encoder.conv1.bias");
+    dac_enc_.c2w = dup("acoustic_encoder.conv2.weight");
+    dac_enc_.c2b = dup("acoustic_encoder.conv2.bias");
+    dac_enc_.s_final.a = dup("acoustic_encoder.snake1.alpha");
 
     static const int enc_strides[] = {8, 5, 4, 2, 3};
     static const int enc_in_chs[]  = {64, 128, 256, 512, 1024};
@@ -899,157 +899,291 @@ bool OmniVoiceModel::LoadCodec() {
         b.pad = (b.stride + 1) / 2;
         std::string pfx = "acoustic_encoder.block." + std::to_string(i);
         snprintf(tname, sizeof(tname), "%s.snake1.alpha", pfx.c_str());
-        b.s1.a = ggml_get_tensor(codec_ggml, tname);
+        b.s1.a = dup(tname);
         snprintf(tname, sizeof(tname), "%s.conv1.weight", pfx.c_str());
-        b.cw = ggml_get_tensor(codec_ggml, tname);
+        b.cw = dup(tname);
         snprintf(tname, sizeof(tname), "%s.conv1.bias", pfx.c_str());
-        b.cb = ggml_get_tensor(codec_ggml, tname);
+        b.cb = dup(tname);
         for (int r = 0; r < DAC_RES_UNITS; r++) {
             DACResUnitWeights &ru = b.ru[r];
             ru.dilation = dilations[r];
             std::string rp = pfx + ".res_unit" + std::to_string(r + 1);
             snprintf(tname, sizeof(tname), "%s.snake1.alpha", rp.c_str());
-            ru.s1.a = ggml_get_tensor(codec_ggml, tname);
+            ru.s1.a = dup(tname);
             snprintf(tname, sizeof(tname), "%s.conv1.weight", rp.c_str());
-            ru.c1w = ggml_get_tensor(codec_ggml, tname);
+            ru.c1w = dup(tname);
             snprintf(tname, sizeof(tname), "%s.conv1.bias", rp.c_str());
-            ru.c1b = ggml_get_tensor(codec_ggml, tname);
+            ru.c1b = dup(tname);
             snprintf(tname, sizeof(tname), "%s.snake2.alpha", rp.c_str());
-            ru.s2.a = ggml_get_tensor(codec_ggml, tname);
+            ru.s2.a = dup(tname);
             snprintf(tname, sizeof(tname), "%s.conv2.weight", rp.c_str());
-            ru.c2w = ggml_get_tensor(codec_ggml, tname);
+            ru.c2w = dup(tname);
             snprintf(tname, sizeof(tname), "%s.conv2.bias", rp.c_str());
-            ru.c2b = ggml_get_tensor(codec_ggml, tname);
+            ru.c2b = dup(tname);
         }
     }
 
     // HuBERT feature extractor (semantic_model prefix)
     for (int i = 0; i < 7; i++) {
         snprintf(tname, sizeof(tname), "semantic_model.feature_extractor.conv_layers.%d.conv.weight", i);
-        hubert_feat_.conv[i].conv_w = ggml_get_tensor(codec_ggml, tname);
+        hubert_feat_.conv[i].conv_w = dup(tname);
         if (i == 0) {
             snprintf(tname, sizeof(tname), "semantic_model.feature_extractor.conv_layers.%d.layer_norm.weight", i);
-            hubert_feat_.conv[i].ln_w = ggml_get_tensor(codec_ggml, tname);
+            hubert_feat_.conv[i].ln_w = dup(tname);
             snprintf(tname, sizeof(tname), "semantic_model.feature_extractor.conv_layers.%d.layer_norm.bias", i);
-            hubert_feat_.conv[i].ln_b = ggml_get_tensor(codec_ggml, tname);
+            hubert_feat_.conv[i].ln_b = dup(tname);
         }
     }
 
     // HuBERT feature projection
-    hubert_proj_.ln_w   = ggml_get_tensor(codec_ggml, "semantic_model.feature_projection.layer_norm.weight");
-    hubert_proj_.ln_b   = ggml_get_tensor(codec_ggml, "semantic_model.feature_projection.layer_norm.bias");
-    hubert_proj_.proj_w = ggml_get_tensor(codec_ggml, "semantic_model.feature_projection.projection.weight");
-    hubert_proj_.proj_b = ggml_get_tensor(codec_ggml, "semantic_model.feature_projection.projection.bias");
+    hubert_proj_.ln_w   = dup("semantic_model.feature_projection.layer_norm.weight");
+    hubert_proj_.ln_b   = dup("semantic_model.feature_projection.layer_norm.bias");
+    hubert_proj_.proj_w = dup("semantic_model.feature_projection.projection.weight");
+    hubert_proj_.proj_b = dup("semantic_model.feature_projection.projection.bias");
 
     // HuBERT encoder init (pos_conv_embed + first LayerNorm)
-    hubert_enc_init_.pos_conv_w = ggml_get_tensor(codec_ggml, "semantic_model.encoder.pos_conv_embed.conv.weight");
-    hubert_enc_init_.pos_conv_b = ggml_get_tensor(codec_ggml, "semantic_model.encoder.pos_conv_embed.conv.bias");
-    hubert_enc_init_.ln_w = ggml_get_tensor(codec_ggml, "semantic_model.encoder.layer_norm.weight");
-    hubert_enc_init_.ln_b = ggml_get_tensor(codec_ggml, "semantic_model.encoder.layer_norm.bias");
+    hubert_enc_init_.pos_conv_w = dup("semantic_model.encoder.pos_conv_embed.conv.weight");
+    hubert_enc_init_.pos_conv_b = dup("semantic_model.encoder.pos_conv_embed.conv.bias");
+    if (hubert_enc_init_.pos_conv_w) {
+        RS_LOG_INFO("Codec encoder: pos_conv_w ne=(%lld,%lld,%lld) type=%d",
+                    (long long)hubert_enc_init_.pos_conv_w->ne[0],
+                    (long long)hubert_enc_init_.pos_conv_w->ne[1],
+                    (long long)hubert_enc_init_.pos_conv_w->ne[2],
+                    (int)hubert_enc_init_.pos_conv_w->type);
+    }
+    hubert_enc_init_.ln_w = dup("semantic_model.encoder.layer_norm.weight");
+    hubert_enc_init_.ln_b = dup("semantic_model.encoder.layer_norm.bias");
 
     // HuBERT encoder layers (12 layers)
     for (int i = 0; i < HUBERT_NUM_LAYERS; i++) {
         HubertLayerWeights &l = hubert_layers_[i];
         char pfx[64]; snprintf(pfx, sizeof(pfx), "semantic_model.encoder.layers.%d", i);
         snprintf(tname, sizeof(tname), "%s.layer_norm.weight", pfx);
-        l.ln_attn_w = ggml_get_tensor(codec_ggml, tname);
+        l.ln_attn_w = dup(tname);
         snprintf(tname, sizeof(tname), "%s.layer_norm.bias", pfx);
-        l.ln_attn_b = ggml_get_tensor(codec_ggml, tname);
+        l.ln_attn_b = dup(tname);
         snprintf(tname, sizeof(tname), "%s.attention.q_proj.weight", pfx);
-        l.attn.q_w = ggml_get_tensor(codec_ggml, tname);
+        l.attn.q_w = dup(tname);
         snprintf(tname, sizeof(tname), "%s.attention.q_proj.bias", pfx);
-        l.attn.q_b = ggml_get_tensor(codec_ggml, tname);
+        l.attn.q_b = dup(tname);
         snprintf(tname, sizeof(tname), "%s.attention.k_proj.weight", pfx);
-        l.attn.k_w = ggml_get_tensor(codec_ggml, tname);
+        l.attn.k_w = dup(tname);
         snprintf(tname, sizeof(tname), "%s.attention.k_proj.bias", pfx);
-        l.attn.k_b = ggml_get_tensor(codec_ggml, tname);
+        l.attn.k_b = dup(tname);
         snprintf(tname, sizeof(tname), "%s.attention.v_proj.weight", pfx);
-        l.attn.v_w = ggml_get_tensor(codec_ggml, tname);
+        l.attn.v_w = dup(tname);
         snprintf(tname, sizeof(tname), "%s.attention.v_proj.bias", pfx);
-        l.attn.v_b = ggml_get_tensor(codec_ggml, tname);
+        l.attn.v_b = dup(tname);
         snprintf(tname, sizeof(tname), "%s.attention.out_proj.weight", pfx);
-        l.attn.o_w = ggml_get_tensor(codec_ggml, tname);
+        l.attn.o_w = dup(tname);
         snprintf(tname, sizeof(tname), "%s.attention.out_proj.bias", pfx);
-        l.attn.o_b = ggml_get_tensor(codec_ggml, tname);
+        l.attn.o_b = dup(tname);
         snprintf(tname, sizeof(tname), "%s.final_layer_norm.weight", pfx);
-        l.ln_ffn_w = ggml_get_tensor(codec_ggml, tname);
+        l.ln_ffn_w = dup(tname);
         snprintf(tname, sizeof(tname), "%s.final_layer_norm.bias", pfx);
-        l.ln_ffn_b = ggml_get_tensor(codec_ggml, tname);
+        l.ln_ffn_b = dup(tname);
         snprintf(tname, sizeof(tname), "%s.feed_forward.intermediate_dense.weight", pfx);
-        l.ffn.w1_w = ggml_get_tensor(codec_ggml, tname);
+        l.ffn.w1_w = dup(tname);
         snprintf(tname, sizeof(tname), "%s.feed_forward.intermediate_dense.bias", pfx);
-        l.ffn.w1_b = ggml_get_tensor(codec_ggml, tname);
+        l.ffn.w1_b = dup(tname);
         snprintf(tname, sizeof(tname), "%s.feed_forward.output_dense.weight", pfx);
-        l.ffn.w2_w = ggml_get_tensor(codec_ggml, tname);
+        l.ffn.w2_w = dup(tname);
         snprintf(tname, sizeof(tname), "%s.feed_forward.output_dense.bias", pfx);
-        l.ffn.w2_b = ggml_get_tensor(codec_ggml, tname);
+        l.ffn.w2_b = dup(tname);
     }
 
     // Semantic encoder (encoder_semantic)
-    sem_enc_.c1w = ggml_get_tensor(codec_ggml, "encoder_semantic.conv.weight");
+    sem_enc_.c1w = dup("encoder_semantic.conv.weight");
     for (int i = 0; i < 2; i++) {
         char pfx[64]; snprintf(pfx, sizeof(pfx), "encoder_semantic.conv_blocks.%d", i);
         snprintf(tname, sizeof(tname), "%s.conv.weight", pfx);
-        sem_enc_.blk[i].cw = ggml_get_tensor(codec_ggml, tname);
+        sem_enc_.blk[i].cw = dup(tname);
         snprintf(tname, sizeof(tname), "%s.conv.bias", pfx);
-        sem_enc_.blk[i].cb = ggml_get_tensor(codec_ggml, tname);
+        sem_enc_.blk[i].cb = dup(tname);
         for (int r = 0; r < 2; r++) {
             snprintf(tname, sizeof(tname), "%s.res_units.%d.conv1.weight", pfx, r);
-            sem_enc_.blk[i].ru[r].c1w = ggml_get_tensor(codec_ggml, tname);
+            sem_enc_.blk[i].ru[r].c1w = dup(tname);
             snprintf(tname, sizeof(tname), "%s.res_units.%d.conv2.weight", pfx, r);
-            sem_enc_.blk[i].ru[r].c2w = ggml_get_tensor(codec_ggml, tname);
+            sem_enc_.blk[i].ru[r].c2w = dup(tname);
         }
     }
 
-    // Store the ggml_context for cleanup
-    dac_.weight_ctx = codec_ggml;
+    // Store the local ggml_context for cleanup
+    dac_.weight_ctx = local_ctx;
+
+    // ggml_new_tensor_* with no_alloc=true heap-allocates tensor data.
+    // ggml_backend_alloc_ctx_tensors only allocates tensors where data==NULL.
+    // Clear the heap pointers so the backend buffer is allocated correctly.
+    for (struct ggml_tensor *t = ggml_get_first_tensor(local_ctx);
+         t != nullptr; t = ggml_get_next_tensor(local_ctx, t)) {
+        if (t->data != nullptr) {
+            free(t->data);
+            t->data = nullptr;
+        }
+    }
 
     // Allocate weights on CPU backend — vocoder runs on CPU for speed
-    dac_.weight_buf = ggml_backend_alloc_ctx_tensors(codec_ggml, cpu_backend_);
+    dac_.weight_buf = ggml_backend_alloc_ctx_tensors(local_ctx, cpu_backend_);
     if (!dac_.weight_buf) {
         RS_LOG_ERR("OmniVoice: failed to allocate codec weight buffer");
-        ggml_free(codec_ggml); dac_.weight_ctx = nullptr;
-        gguf_free(codec_gguf);
+        ggml_free(local_ctx); dac_.weight_ctx = nullptr;
         return false;
     }
 
-    // Load tensor data from file
-    FILE *f = fopen(codec_path_.c_str(), "rb");
-    if (!f) {
-        ggml_free(codec_ggml); dac_.weight_ctx = nullptr;
-        gguf_free(codec_gguf);
-        return false;
-    }
+    // Copy tensor data from main gguf_data (GPU) to local_ctx (CPU)
+    {
+        std::vector<char> rbuf;
 
-    size_t data_off = gguf_get_data_offset(codec_gguf);
-    int64_t n_tensors = gguf_get_n_tensors(codec_gguf);
-    std::vector<char> rbuf;
-    for (int64_t i = 0; i < n_tensors; i++) {
-        const char *name = gguf_get_tensor_name(codec_gguf, i);
-        struct ggml_tensor *t = ggml_get_tensor(codec_ggml, name);
-        if (t) {
-            size_t off = gguf_get_tensor_offset(codec_gguf, i);
-            size_t sz = ggml_nbytes(t);
-            if (sz > 0) {
-                if (rbuf.size() < sz) rbuf.resize(sz);
-                fseek(f, (long)(data_off + off), SEEK_SET);
-                if (fread(rbuf.data(), 1, sz, f) == sz)
-                    ggml_backend_tensor_set(t, rbuf.data(), 0, sz);
+        // Build the list of tensor names to copy — same names we just mapped above.
+        // We re-generate the name list rather than store pointers because some
+        // tensors may be nullptr (skipped during mapping).
+        std::vector<std::string> names;
+
+        auto add_name = [&](const char *name) {
+            if (ggml_get_tensor(local_ctx, name))
+                names.push_back(name);
+        };
+
+        // RVQ codebooks (8 codebooks, decode + encode paths)
+        for (int k = 0; k < rvq_.num_codebooks; k++) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "quantizer.quantizers.%d.codebook.embed", k); add_name(buf);
+            snprintf(buf, sizeof(buf), "quantizer.quantizers.%d.project_out.weight", k); add_name(buf);
+            snprintf(buf, sizeof(buf), "quantizer.quantizers.%d.project_out.bias", k); add_name(buf);
+            snprintf(buf, sizeof(buf), "quantizer.quantizers.%d.project_in.weight", k); add_name(buf);
+            snprintf(buf, sizeof(buf), "quantizer.quantizers.%d.project_in.bias", k); add_name(buf);
+        }
+
+        // fc / fc2
+        add_name("fc.weight"); add_name("fc.bias");
+        add_name("fc2.weight"); add_name("fc2.bias");
+
+        // DAC decoder (conv1, conv2, snake final, 5 blocks × 3 res_units)
+        add_name("acoustic_decoder.conv1.weight"); add_name("acoustic_decoder.conv1.bias");
+        add_name("acoustic_decoder.conv2.weight"); add_name("acoustic_decoder.conv2.bias");
+        add_name("acoustic_decoder.snake1.alpha");
+        for (int b = 0; b < DAC_NUM_BLOCKS; b++) {
+            char pfx[64], buf[128];
+            snprintf(pfx, sizeof(pfx), "acoustic_decoder.block.%d", b);
+            snprintf(buf, sizeof(buf), "%s.snake1.alpha", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.conv_t1.weight", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.conv_t1.bias", pfx); add_name(buf);
+            for (int r = 0; r < DAC_RES_UNITS; r++) {
+                snprintf(buf, sizeof(buf), "%s.res_unit%d.snake1.alpha", pfx, r+1); add_name(buf);
+                snprintf(buf, sizeof(buf), "%s.res_unit%d.conv1.weight", pfx, r+1); add_name(buf);
+                snprintf(buf, sizeof(buf), "%s.res_unit%d.conv1.bias", pfx, r+1); add_name(buf);
+                snprintf(buf, sizeof(buf), "%s.res_unit%d.snake2.alpha", pfx, r+1); add_name(buf);
+                snprintf(buf, sizeof(buf), "%s.res_unit%d.conv2.weight", pfx, r+1); add_name(buf);
+                snprintf(buf, sizeof(buf), "%s.res_unit%d.conv2.bias", pfx, r+1); add_name(buf);
             }
         }
-    }
-    fclose(f);
-    gguf_free(codec_gguf);
 
-    // Precompute inv_b for all snake activations (stored as float vectors)
+        // DAC encoder (conv1, conv2, snake final, 5 blocks × 3 res_units)
+        add_name("acoustic_encoder.conv1.weight"); add_name("acoustic_encoder.conv1.bias");
+        add_name("acoustic_encoder.conv2.weight"); add_name("acoustic_encoder.conv2.bias");
+        add_name("acoustic_encoder.snake1.alpha");
+        for (int b = 0; b < DAC_NUM_BLOCKS; b++) {
+            char pfx[64], buf[128];
+            snprintf(pfx, sizeof(pfx), "acoustic_encoder.block.%d", b);
+            snprintf(buf, sizeof(buf), "%s.snake1.alpha", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.conv1.weight", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.conv1.bias", pfx); add_name(buf);
+            for (int r = 0; r < DAC_RES_UNITS; r++) {
+                snprintf(buf, sizeof(buf), "%s.res_unit%d.snake1.alpha", pfx, r+1); add_name(buf);
+                snprintf(buf, sizeof(buf), "%s.res_unit%d.conv1.weight", pfx, r+1); add_name(buf);
+                snprintf(buf, sizeof(buf), "%s.res_unit%d.conv1.bias", pfx, r+1); add_name(buf);
+                snprintf(buf, sizeof(buf), "%s.res_unit%d.snake2.alpha", pfx, r+1); add_name(buf);
+                snprintf(buf, sizeof(buf), "%s.res_unit%d.conv2.weight", pfx, r+1); add_name(buf);
+                snprintf(buf, sizeof(buf), "%s.res_unit%d.conv2.bias", pfx, r+1); add_name(buf);
+            }
+        }
+
+        // HuBERT feature extractor (7 conv layers, layer 0 has norm)
+        for (int i = 0; i < 7; i++) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "semantic_model.feature_extractor.conv_layers.%d.conv.weight", i); add_name(buf);
+            if (i == 0) {
+                snprintf(buf, sizeof(buf), "semantic_model.feature_extractor.conv_layers.%d.layer_norm.weight", i); add_name(buf);
+                snprintf(buf, sizeof(buf), "semantic_model.feature_extractor.conv_layers.%d.layer_norm.bias", i); add_name(buf);
+            }
+        }
+
+        // HuBERT feature projection, encoder init
+        add_name("semantic_model.feature_projection.layer_norm.weight");
+        add_name("semantic_model.feature_projection.layer_norm.bias");
+        add_name("semantic_model.feature_projection.projection.weight");
+        add_name("semantic_model.feature_projection.projection.bias");
+        add_name("semantic_model.encoder.pos_conv_embed.conv.weight");
+        add_name("semantic_model.encoder.pos_conv_embed.conv.bias");
+        add_name("semantic_model.encoder.layer_norm.weight");
+        add_name("semantic_model.encoder.layer_norm.bias");
+
+        // HuBERT encoder layers (12 layers)
+        for (int i = 0; i < HUBERT_NUM_LAYERS; i++) {
+            char pfx[64], buf[128];
+            snprintf(pfx, sizeof(pfx), "semantic_model.encoder.layers.%d", i);
+            snprintf(buf, sizeof(buf), "%s.layer_norm.weight", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.layer_norm.bias", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.attention.q_proj.weight", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.attention.q_proj.bias", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.attention.k_proj.weight", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.attention.k_proj.bias", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.attention.v_proj.weight", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.attention.v_proj.bias", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.attention.out_proj.weight", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.attention.out_proj.bias", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.final_layer_norm.weight", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.final_layer_norm.bias", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.feed_forward.intermediate_dense.weight", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.feed_forward.intermediate_dense.bias", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.feed_forward.output_dense.weight", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.feed_forward.output_dense.bias", pfx); add_name(buf);
+        }
+
+        // Semantic encoder
+        add_name("encoder_semantic.conv.weight");
+        for (int i = 0; i < 2; i++) {
+            char pfx[64], buf[128];
+            snprintf(pfx, sizeof(pfx), "encoder_semantic.conv_blocks.%d", i);
+            snprintf(buf, sizeof(buf), "%s.conv.weight", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.conv.bias", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.res_units.0.conv1.weight", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.res_units.0.conv2.weight", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.res_units.1.conv1.weight", pfx); add_name(buf);
+            snprintf(buf, sizeof(buf), "%s.res_units.1.conv2.weight", pfx); add_name(buf);
+        }
+
+        // Single copy loop
+        for (const auto &name : names) {
+            struct ggml_tensor *src = ggml_get_tensor(gguf_data, name.c_str());
+            struct ggml_tensor *dst = ggml_get_tensor(local_ctx, name.c_str());
+            if (!src || !dst) continue;
+            size_t sz_src = ggml_nbytes(src);
+            if (sz_src == 0) continue;
+            if (rbuf.size() < sz_src) rbuf.resize(sz_src);
+            ggml_backend_tensor_get(src, rbuf.data(), 0, sz_src);
+            ggml_backend_tensor_set(dst, rbuf.data(), 0, sz_src);
+        }
+    }
+
+    // Precompute inv_b for all snake activations (handle F16 and F32)
     auto compute_inv_b = [&](struct ggml_tensor *alpha, std::vector<float> &inv_b) {
         if (!alpha) return;
+        size_t elem_sz = ggml_type_size(alpha->type);
+        int n_elems = (int)(ggml_nbytes(alpha) / elem_sz);
         int C = (int)alpha->ne[1];
+        if (C <= 1 && n_elems > 1) C = n_elems;
         inv_b.resize(C);
-        std::vector<float> alpha_vals(C);
-        ggml_backend_tensor_get(alpha, alpha_vals.data(), 0, C * sizeof(float));
-        for (int i = 0; i < C; i++)
-            inv_b[i] = 1.0f / (alpha_vals[i] + 1e-9f);
+        std::vector<char> buf(n_elems * elem_sz);
+        ggml_backend_tensor_get(alpha, buf.data(), 0, n_elems * elem_sz);
+        for (int i = 0; i < C; i++) {
+            float val;
+            if (alpha->type == GGML_TYPE_F16)
+                val = ggml_fp16_to_fp32(((ggml_fp16_t *)buf.data())[i]);
+            else
+                val = ((float *)buf.data())[i];
+            inv_b[i] = 1.0f / (val + 1e-9f);
+        }
     };
 
     for (int i = 0; i < DAC_NUM_BLOCKS; i++) {
@@ -1090,17 +1224,26 @@ bool OmniVoiceModel::LoadCodec() {
     compute_inv_b(dac_enc_.s_final.a, dac_enc_.s_final.inv_b);
 
     // Precompute RVQ embed_sq (||embed[:,j]||^2 for each codebook entry)
+    // embed is [dim, vocab] in GGUF after conversion transpose (ne[0]=dim, ne[1]=vocab)
     for (int k = 0; k < rvq_.num_codebooks; k++) {
         if (!rvq_.cb[k].embed) continue;
         int cb_dim = rvq_.codebook_dim;
         int cb_size = rvq_.codebook_size;
+        size_t elem_size = ggml_type_size(rvq_.cb[k].embed->type);
         rvq_.cb[k].embed_sq_cpu.resize(cb_size);
-        std::vector<float> emb(cb_dim * cb_size);
-        ggml_backend_tensor_get(rvq_.cb[k].embed, emb.data(), 0, cb_dim * cb_size * sizeof(float));
+        std::vector<char> emb_raw(cb_dim * cb_size * elem_size);
+        ggml_backend_tensor_get(rvq_.cb[k].embed, emb_raw.data(), 0, emb_raw.size());
         for (int j = 0; j < cb_size; j++) {
             float s = 0;
-            for (int d = 0; d < cb_dim; d++)
-                s += emb[j * cb_dim + d] * emb[j * cb_dim + d];
+            for (int d = 0; d < cb_dim; d++) {
+                float val;
+                // After transpose, embed[j,d] is at flat offset d*cb_size + j
+                if (rvq_.cb[k].embed->type == GGML_TYPE_F16)
+                    val = ggml_fp16_to_fp32(((ggml_fp16_t *)emb_raw.data())[d * cb_size + j]);
+                else
+                    val = ((float *)emb_raw.data())[d * cb_size + j];
+                s += val * val;
+            }
             rvq_.cb[k].embed_sq_cpu[j] = s;
         }
     }
@@ -1163,29 +1306,44 @@ static bool rvq_encode_cpu(const RVQCodec &rvq, const float *embeddings,
         const auto &cb = rvq.cb[k];
         if (!cb.embed || !cb.project_in_w || cb.embed_sq_cpu.empty()) return false;
 
+        // Helper: read tensor data as F32, handling F16→F32 conversion
+        auto get_as_f32 = [](const struct ggml_tensor *t, std::vector<float> &dst) {
+            size_t n = dst.size();
+            size_t ts = ggml_type_size(t->type);
+            if (ts == sizeof(float)) {
+                ggml_backend_tensor_get(t, dst.data(), 0, n * sizeof(float));
+            } else if (ts == sizeof(uint16_t)) {
+                std::vector<uint16_t> buf(n);
+                ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(uint16_t));
+                for (size_t i = 0; i < n; i++)
+                    dst[i] = ggml_fp16_to_fp32(buf[i]);
+            }
+        };
+
         // Download weights to CPU
         std::vector<float> proj_w(H * D), proj_b(D), emb(D * V);
-        ggml_backend_tensor_get(cb.project_in_w, proj_w.data(), 0, H * D * sizeof(float));
-        ggml_backend_tensor_get(cb.project_in_b, proj_b.data(), 0, D * sizeof(float));
-        ggml_backend_tensor_get(cb.embed, emb.data(), 0, D * V * sizeof(float));
+        get_as_f32(cb.project_in_w, proj_w);
+        get_as_f32(cb.project_in_b, proj_b);
+        get_as_f32(cb.embed, emb);
 
         // Download project_out weights (for decoding back to residual space)
         std::vector<float> out_w, out_b;
         if (k + 1 < K && cb.project_out_w) {
-            out_w.resize(H * D);  // project_out_w: [D, H] in GGML (ne0=D, ne1=H)
-            ggml_backend_tensor_get(cb.project_out_w, out_w.data(), 0, H * D * sizeof(float));
+            // project_out_w is [dim, hidden] after transpose
+            out_w.resize(D * H);
+            get_as_f32(cb.project_out_w, out_w);
         }
         if (k + 1 < K && cb.project_out_b) {
             out_b.resize(H);
-            ggml_backend_tensor_get(cb.project_out_b, out_b.data(), 0, H * sizeof(float));
+            get_as_f32(cb.project_out_b, out_b);
         }
 
         for (int t = 0; t < T; t++) {
             const float *r = residual.data() + t * H;
 
             // Project residual to codebook dim: proj = proj_w^T @ r + proj_b
-            // proj_w layout: [D, H] in GGML → ne0=D, ne1=H → row-major [H*D]
-            // proj_w[h*D + d] is weight[d, h]
+            // proj_w after transpose: [H, D] in ggml (ne0=H, ne1=D), row-major flat [H*D]
+            // proj_w[h*D + d] = weight[d, h]
             std::vector<float> proj(D, 0);
             for (int d = 0; d < D; d++) {
                 float s = proj_b[d];
@@ -1197,12 +1355,13 @@ static bool rvq_encode_cpu(const RVQCodec &rvq, const float *embeddings,
             // Find nearest codebook entry by Euclidean distance
             // ||proj - emb[j]||^2 = ||proj||^2 + ||emb[j]||^2 - 2*proj·emb[j]
             // embed_sq_cpu[j] = ||emb[j]||^2 (precomputed)
+            // After transpose, embed[j,d] is at flat offset d*V + j
             int best_j = 0;
             float best_dist = 1e30f;
             for (int j = 0; j < V; j++) {
                 float dist = cb.embed_sq_cpu[j];
                 for (int d = 0; d < D; d++)
-                    dist -= 2.0f * proj[d] * emb[j * D + d];
+                    dist -= 2.0f * proj[d] * emb[d * V + j];
                 if (dist < best_dist) { best_dist = dist; best_j = j; }
             }
             codes[k * T + t] = best_j;
@@ -1212,17 +1371,16 @@ static bool rvq_encode_cpu(const RVQCodec &rvq, const float *embeddings,
         if (k + 1 < K) {
             for (int t = 0; t < T; t++) {
                 int code = codes[k * T + t];
-                const float *q_emb = emb.data() + code * D;  // [D] codebook entry
+                // After transpose, embed[code, d] is at offset d*V + code
                 float *r = residual.data() + t * H;
 
                 if (!out_w.empty()) {
                     // Decode: decoded = project_out_w @ q_emb + project_out_b
-                    // project_out_w layout: [D, H] in GGML → ne0=D, ne1=H
-                    // decoded[h] = sum_d(out_w[h*D + d] * q_emb[d]) + out_b[h]
+                    // project_out_w after transpose: [D, H] in ggml, weight[h,d]=out_w[d*H+h]
                     for (int h = 0; h < H; h++) {
                         float s = out_b.empty() ? 0.0f : out_b[h];
                         for (int d = 0; d < D; d++)
-                            s += out_w[h * D + d] * q_emb[d];
+                            s += out_w[d * H + h] * emb[d * V + code];
                         r[h] -= s;
                     }
                 } else {
@@ -1326,7 +1484,7 @@ static struct ggml_tensor *hubert_attention_graph(
     int H = (int)x->ne[0];
     int T = (int)x->ne[1];
 
-    // Q/K/V projections: [H, H] @ [H, T] -> [H, T]
+    // Q/K/V projections: weight was transposed at conversion time [out,in]→[in,out].
     struct ggml_tensor *q = ggml_mul_mat(ctx, attn.q_w, x);
     if (attn.q_b) q = ggml_add(ctx, q, attn.q_b);
     struct ggml_tensor *k = ggml_mul_mat(ctx, attn.k_w, x);
@@ -1358,7 +1516,7 @@ static struct ggml_tensor *hubert_attention_graph(
     attn_out = ggml_cont(ctx, ggml_permute(ctx, attn_out, 1, 2, 0, 3));  // [n_head, head_dim, T]
     attn_out = ggml_reshape_2d(ctx, attn_out, H, T);  // [H, T]
 
-    // Output projection: [H, H] @ [H, T] -> [H, T]
+    // Output projection: weight was transposed at conversion time [out,in]→[in,out].
     attn_out = ggml_mul_mat(ctx, attn.o_w, attn_out);
     if (attn.o_b) attn_out = ggml_add(ctx, attn_out, attn.o_b);
     return attn_out;
@@ -1385,6 +1543,7 @@ static struct ggml_tensor *hubert_encoder_layer_graph(
     struct ggml_tensor *ln_x2 = ggml_norm(ctx, x, 1e-5f);
     if (l.ln_ffn_w) ln_x2 = ggml_mul(ctx, ln_x2, l.ln_ffn_w);
     if (l.ln_ffn_b) ln_x2 = ggml_add(ctx, ln_x2, l.ln_ffn_b);
+    // FFN weights were transposed at conversion time [out,in]→[in,out].
     struct ggml_tensor *ffn = ggml_mul_mat(ctx, l.ffn.w1_w, ln_x2);
     if (l.ffn.w1_b) ffn = ggml_add(ctx, ffn, l.ffn.w1_b);
     ffn = ggml_gelu(ctx, ffn);
@@ -1412,11 +1571,11 @@ static struct ggml_tensor *semantic_encoder_graph(
                                 f->ne[1], f->ne[0], 1);
     };
 
-    // conv1d k=3, pad=0 (valid conv, reduces T by 2)
+    // conv1d k=3, pad=1 (same padding, preserves T — mirrors reference sem_enc_build_graph)
     {
         struct ggml_tensor *w = sem_enc.c1w;
         if (w->type != GGML_TYPE_F16) w = ggml_cast(ctx, w, GGML_TYPE_F16);
-        x = ggml_conv_1d(ctx, w, conv_in(x), 1, 0, 1);
+        x = ggml_conv_1d(ctx, w, conv_in(x), 1, 1, 1);
         x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1]);
         x = feat_to_ct(ctx, x);
         x = ggml_cont(ctx, x);
@@ -1579,7 +1738,8 @@ static struct ggml_tensor *dac_encoder_graph(
     if (enc.c2w) {
         struct ggml_tensor *w = enc.c2w;
         if (w->type != GGML_TYPE_F16) w = ggml_cast(ctx, w, GGML_TYPE_F16);
-        x = ggml_conv_1d(ctx, w, ggml_reshape_3d(ctx, x, x->ne[0], x->ne[1], 1), 1, 3, 1);
+        // pad=1 matches reference dac_enc_build_graph (k=3, pad=1 preserves T)
+        x = ggml_conv_1d(ctx, w, ggml_reshape_3d(ctx, x, x->ne[0], x->ne[1], 1), 1, 1, 1);
         x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1]);
         if (enc.c2b) x = ggml_add(ctx, x, bias_1d_to_2d(ctx, enc.c2b));
         x = ggml_cont(ctx, x);
@@ -1656,26 +1816,63 @@ std::vector<int32_t> OmniVoiceModel::EncodeReferenceAudio(const float *audio_24k
         struct ggml_tensor *sem = ggml_norm(gctx, feat, 1e-5f);
         if (hubert_proj_.ln_w) sem = ggml_mul(gctx, sem, hubert_proj_.ln_w);
         if (hubert_proj_.ln_b) sem = ggml_add(gctx, sem, hubert_proj_.ln_b);
+        // proj_w was transposed at conversion time [out,in]→[in,out].
         sem = ggml_mul_mat(gctx, hubert_proj_.proj_w, sem);
         if (hubert_proj_.proj_b) sem = ggml_add(gctx, sem, hubert_proj_.proj_b);
         sem = ggml_cont(gctx, sem);
 
-        // pos_conv_embed (grouped conv - skip for now, may need special ggml handling)
-        if (false && hubert_enc_init_.pos_conv_w) {
+        // pos_conv_embed: grouped conv1d (mirrors reference hubert_pos_conv_build_graph).
+        // 16 groups, each a 48→48 conv with k=128, pad=64.
+        if (hubert_enc_init_.pos_conv_w && hubert_enc_init_.pos_conv_b) {
+            const int POS_K = 128, POS_IC_PG = 48, POS_OC_PG = 48;
+            const int POS_GROUPS = 16, POS_PAD = 64;
+            int T = (int)sem->ne[1];  // C-first: ne0=ch=768, ne1=time
+
+            // Transpose to T-first [T, 768]
+            struct ggml_tensor *xt = ggml_cont(gctx, ggml_transpose(gctx, sem));
+            // Reshape to [T, 48, 16] — 16 groups of 48 channels
+            struct ggml_tensor *x3 = ggml_reshape_3d(gctx, xt, T, POS_IC_PG, POS_GROUPS);
+
             struct ggml_tensor *pw = hubert_enc_init_.pos_conv_w;
+            struct ggml_tensor *pb = hubert_enc_init_.pos_conv_b;
             if (pw->type != GGML_TYPE_F16) pw = ggml_cast(gctx, pw, GGML_TYPE_F16);
-            int k_pec = (int)pw->ne[0];
-            int pad_left = k_pec / 2;
-            struct ggml_tensor *pad_l = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, pad_left, sem->ne[1]);
-            ggml_set_zero(pad_l);
-            sem = ggml_concat(gctx, pad_l, sem, 0);
-            struct ggml_tensor *pad_r = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, k_pec - pad_left, sem->ne[1]);
-            ggml_set_zero(pad_r);
-            sem = ggml_concat(gctx, sem, pad_r, 0);
-            sem = ggml_conv_1d(gctx, pw, ggml_reshape_3d(gctx, sem, sem->ne[0], sem->ne[1], 1), 1, 0, 1);
-            sem = ggml_reshape_2d(gctx, sem, sem->ne[0], sem->ne[1]);
-            sem = ggml_gelu(gctx, sem);
-            if (hubert_enc_init_.pos_conv_b) sem = ggml_add(gctx, sem, hubert_enc_init_.pos_conv_b);
+
+            struct ggml_tensor *group_outs[POS_GROUPS];
+            for (int g = 0; g < POS_GROUPS; g++) {
+                // Slice input: [T, 48] at group g
+                size_t off_x = (size_t)g * x3->nb[2];
+                struct ggml_tensor *xg = ggml_view_2d(gctx, x3, T, POS_IC_PG, x3->nb[1], off_x);
+
+                // Slice weight: [128, 48, 48] at group g
+                size_t off_w = (size_t)g * (size_t)POS_OC_PG * pw->nb[2];
+                struct ggml_tensor *wg = ggml_view_3d(gctx, pw, POS_K, POS_IC_PG, POS_OC_PG,
+                                                       pw->nb[1], pw->nb[2], off_w);
+
+                // Slice bias: [48] at group g
+                size_t off_b = (size_t)g * POS_OC_PG * sizeof(float);
+                struct ggml_tensor *bg = ggml_view_1d(gctx, pb, POS_OC_PG, off_b);
+
+                // conv1d: [T, 48, 1] -> [T+1, 48, 1] (k=128 even, pad=64 -> T_out=T+1)
+                struct ggml_tensor *cg = ggml_conv_1d(gctx, wg,
+                    ggml_reshape_3d(gctx, xg, T, POS_IC_PG, 1), 1, POS_PAD, 1);
+                cg = ggml_reshape_2d(gctx, cg, cg->ne[0], POS_OC_PG);
+                // bias_1d_to_2d broadcast
+                cg = ggml_add(gctx, cg, ggml_reshape_2d(gctx, bg, 1, POS_OC_PG));
+                group_outs[g] = cg;
+            }
+
+            // Concat 16 outputs on channel axis -> [T+1, 768]
+            struct ggml_tensor *y = group_outs[0];
+            for (int g = 1; g < POS_GROUPS; g++)
+                y = ggml_concat(gctx, y, group_outs[g], 1);
+
+            // Trim trailing sample (k even, T_out = T+1 -> T)
+            y = ggml_cont(gctx, ggml_view_2d(gctx, y, T, HUBERT_HIDDEN, y->nb[1], 0));
+            y = ggml_gelu(gctx, y);
+
+            // Transpose back to C-first [768, T] and add as residual
+            struct ggml_tensor *pos = ggml_cont(gctx, ggml_transpose(gctx, y));
+            sem = ggml_add(gctx, sem, pos);
             sem = ggml_cont(gctx, sem);
         }
 
@@ -1686,12 +1883,33 @@ std::vector<int32_t> OmniVoiceModel::EncodeReferenceAudio(const float *audio_24k
             sem = ggml_cont(gctx, sem);
         }
 
+        // Capture 13 hidden states for mean-pool (mirrors reference:
+        // post enc_init + post layer 0..11).
+        const int n_states = HUBERT_NUM_LAYERS + 1;
+        std::vector<struct ggml_tensor *> states(n_states);
+        states[0] = sem;
         for (int i = 0; i < HUBERT_NUM_LAYERS; i++) {
             sem = hubert_encoder_layer_graph(gctx, sem, hubert_layers_[i],
                                               HUBERT_NUM_HEADS, HUBERT_HIDDEN / HUBERT_NUM_HEADS);
+            states[i + 1] = sem;
         }
 
-        sem = semantic_encoder_graph(gctx, sem, sem_enc_);
+        // Mean-pool the 13 states
+        struct ggml_tensor *sum = states[0];
+        for (int i = 1; i < n_states; i++)
+            sum = ggml_add(gctx, sum, states[i]);
+        struct ggml_tensor *mean = ggml_scale(gctx, sum, 1.0f / (float)n_states);
+
+        // Downsample time axis by 2 (semantic_downsample_factor)
+        // mean is [C, T_h] (ne0=channels, ne1=time). Strided view picks
+        // every other column starting at 0, then cont for host copy.
+        int T_h = (int)mean->ne[1];
+        int T_ds = T_h / 2;
+        struct ggml_tensor *strided = ggml_view_2d(gctx, mean, HUBERT_HIDDEN, T_ds,
+                                                    2 * mean->nb[1], 0);
+        struct ggml_tensor *features = ggml_cont(gctx, strided);
+
+        sem = semantic_encoder_graph(gctx, features, sem_enc_);
         // sem is [C, T] layout: ne0=channels, ne1=time
         T_s = (int)sem->ne[1];
         ggml_set_name(sem, "semantic_out");
@@ -1732,6 +1950,34 @@ std::vector<int32_t> OmniVoiceModel::EncodeReferenceAudio(const float *audio_24k
     RS_LOG_INFO("OmniVoice: HuBERT -> %d frames x 768", T_s);
 
     // === Phase 2: DAC encoder acoustic features ===
+    // Mirror reference: conditionally pad audio when DAC output length != T_s.
+    // Without padding, temporal misalignment degrades RVQ code quality.
+    const float *dac_audio = audio_24k;
+    int dac_n_samples = n_samples;
+    std::vector<float> dac_audio_padded;
+    {
+        // Compute analytical DAC output length (mirrors compute_dac_output_length)
+        auto dac_output_len = [](int n) -> int {
+            const int K[5] = {16, 10, 8, 4, 6};
+            const int S[5] = {8, 5, 4, 2, 3};
+            const int P[5] = {4, 3, 2, 1, 2};
+            int T = n;
+            for (int i = 0; i < 5; i++)
+                T = (T + 2 * P[i] - K[i]) / S[i] + 1;
+            return T;
+        };
+        int T_a_expected = dac_output_len(n_samples);
+        if (T_a_expected != T_s) {
+            int p = hparams_.hop_length / 2;  // 480
+            dac_audio_padded.resize(n_samples + 2 * p, 0.0f);
+            memcpy(dac_audio_padded.data() + p, audio_24k, n_samples * sizeof(float));
+            dac_audio = dac_audio_padded.data();
+            dac_n_samples = (int)dac_audio_padded.size();
+            RS_LOG_INFO("OmniVoice: DAC pad %d samples (T_a_expected=%d != T_s=%d)",
+                        dac_n_samples, T_a_expected, T_s);
+        }
+    }
+
     std::vector<float> acoustic_feat;
     {
         struct ggml_init_params gparams = {
@@ -1741,7 +1987,7 @@ std::vector<int32_t> OmniVoiceModel::EncodeReferenceAudio(const float *audio_24k
         struct ggml_context *gctx = ggml_init(gparams);
         if (!gctx) return {};
 
-        struct ggml_tensor *x_dac = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, n_samples);
+        struct ggml_tensor *x_dac = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, dac_n_samples);
         ggml_set_input(x_dac);
         ggml_set_name(x_dac, "audio_24k");
 
@@ -1757,8 +2003,8 @@ std::vector<int32_t> OmniVoiceModel::EncodeReferenceAudio(const float *audio_24k
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(gctx, cpu_backend_);
         if (!buf) { ggml_free(gctx); return {}; }
 
-        ggml_backend_tensor_set(ggml_get_tensor(gctx, "audio_24k"), audio_24k, 0,
-                                n_samples * sizeof(float));
+        ggml_backend_tensor_set(ggml_get_tensor(gctx, "audio_24k"), dac_audio, 0,
+                                dac_n_samples * sizeof(float));
 
         // Set snake inv_b tensors
         auto set_enc_inv_b = [&](const std::vector<float> &data, const char *name) {
@@ -1832,13 +2078,35 @@ std::vector<int32_t> OmniVoiceModel::EncodeReferenceAudio(const float *audio_24k
         C_out = (int)fc_w_->ne[0];
         projected.resize((size_t)T_s * C_out, 0.0f);
 
-        std::vector<float> fc_w_cpu((size_t)C_in * C_out);
-        ggml_backend_tensor_get(fc_w_, fc_w_cpu.data(), 0, fc_w_cpu.size() * sizeof(float));
+        // Read fc_w, converting from F16 if needed
+        size_t n_weights = (size_t)C_in * C_out;
+        size_t type_sz = ggml_type_size(fc_w_->type);
+        std::vector<float> fc_w_cpu(n_weights);
+        if (type_sz == sizeof(float)) {
+            ggml_backend_tensor_get(fc_w_, fc_w_cpu.data(), 0, n_weights * sizeof(float));
+        } else if (type_sz == sizeof(uint16_t)) {
+            std::vector<uint16_t> f16_buf(n_weights);
+            ggml_backend_tensor_get(fc_w_, f16_buf.data(), 0, n_weights * sizeof(uint16_t));
+            for (size_t i = 0; i < n_weights; i++)
+                fc_w_cpu[i] = ggml_fp16_to_fp32(f16_buf[i]);
+        } else {
+            RS_LOG_ERR("OmniVoice: fc_w unsupported type size %zu", type_sz);
+            return {};
+        }
 
         std::vector<float> fc_b_cpu;
         if (fc_b_) {
             fc_b_cpu.resize(C_out);
-            ggml_backend_tensor_get(fc_b_, fc_b_cpu.data(), 0, C_out * sizeof(float));
+            // fc_b is typically F32 (1D tensor), but handle F16 defensively
+            size_t b_type_sz = ggml_type_size(fc_b_->type);
+            if (b_type_sz == sizeof(float)) {
+                ggml_backend_tensor_get(fc_b_, fc_b_cpu.data(), 0, C_out * sizeof(float));
+            } else if (b_type_sz == sizeof(uint16_t)) {
+                std::vector<uint16_t> f16_buf(C_out);
+                ggml_backend_tensor_get(fc_b_, f16_buf.data(), 0, C_out * sizeof(uint16_t));
+                for (size_t i = 0; i < (size_t)C_out; i++)
+                    fc_b_cpu[i] = ggml_fp16_to_fp32(f16_buf[i]);
+            }
         }
 
         // fc_w_cpu has ggml layout: element at (o,i) is fc_w_cpu[i*C_out + o]
@@ -1972,26 +2240,12 @@ bool OmniVoiceModel::BuildPrompt(OmniVoiceState &state, OmniVoicePrompt &prompt)
         style_ids = llm_model_->vocab().tokenize(style_text, false);
     }
 
-    // Build text with non-verbal tag tokenization (matching reference).
-    // Skip ref_text combination when languages differ (e.g. CJK ref + Latin target)
-    // to avoid confusing the model with mixed-language text in the prompt.
-    std::string effective_ref_text = state.ref_text;
-    if (!effective_ref_text.empty() && !state.text_original.empty()) {
-        bool ref_has_cjk = false, tgt_has_latin = false;
-        for (size_t i = 0; i < effective_ref_text.size() && !ref_has_cjk; ) {
-            uint32_t cp; int n = prompt_utf8_decode(effective_ref_text.data()+i, effective_ref_text.size()-i, &cp);
-            if (n && prompt_is_cjk(cp)) ref_has_cjk = true; else i += n ? n : 1;
-        }
-        for (size_t i = 0; i < state.text_original.size() && !tgt_has_latin; ) {
-            uint32_t cp; int n = prompt_utf8_decode(state.text_original.data()+i, state.text_original.size()-i, &cp);
-            if (n && ((cp>='A'&&cp<='Z')||(cp>='a'&&cp<='z'))) tgt_has_latin = true; else i += n ? n : 1;
-        }
-        if (ref_has_cjk && tgt_has_latin) {
-            RS_LOG_INFO("OmniVoice: cross-lingual VC detected, skipping ref_text in prompt");
-            effective_ref_text.clear();
-        }
-    }
-    std::string full_text = prompt_combine_text(state.text_original, effective_ref_text);
+    // Do NOT combine ref_text with target text for voice cloning.
+    // Combining causes prompt speech leakage where reference audio content
+    // bleeds into synthesized target audio (model generates tokens for both
+    // ref_text and target_text in the target window).
+    // For pure TTS (no ref), ref_text is empty so combining would be a no-op.
+    std::string full_text = state.text_original;
     std::string wrapped = "<|text_start|>" + full_text + "<|text_end|>";
 
     std::vector<int> text_ids;
@@ -2158,10 +2412,9 @@ std::vector<float> OmniVoiceModel::RunLLMForwardBatched(
     }
 
     // Custom embed
+    // text_embd_ and audio_embeddings/heads are already in ggml layout from conversion.
     struct ggml_tensor *text_embeds_flat = ggml_get_rows(gctx, text_embd_, t_text_ids);
     struct ggml_tensor *audio_embeds_flat = nullptr;
-    // If we have the monolithic combined tensor, split it into embeddings (first
-    // K*V cols) and heads (last K*V cols) in the graph context.
     struct ggml_tensor *embd_table = combined_audio_embeddings_;
     struct ggml_tensor *head_table = combined_audio_heads_;
     if (!embd_table && !head_table && combined_codebook_weights_) {
@@ -2485,12 +2738,7 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
 
     MaskgitConfig mg_cfg;
     mg_cfg.num_step = n_steps;
-    // Adaptive CFG for voice cloning: texts with ≥4 tokens need stronger
-    // guidance to overcome reference dominance during diffusion.
-    float cfg_scale = 2.0f;
-    if (state.n_prompt_frames > 0 && (int)state.text_tokens.size() >= 4)
-        cfg_scale = 4.0f;
-    mg_cfg.guidance_scale = cfg_scale;
+    mg_cfg.guidance_scale = 2.0f;  // reference always uses 2.0
     mg_cfg.t_shift = tau;
 
     uint32_t ctr_lo = 0;
@@ -2665,9 +2913,10 @@ bool OmniVoiceModel::Encode(const std::vector<float> &input_frames,
         return false;
     }
 
-    // Duration estimation — mirrors omnivoice/utils/duration.py
-    // Reference estimator: when ref_text + ref_audio_tokens are available,
-    // use ref-based speed_factor, otherwise fall back to "Nice to meet you." anchor.
+    // Duration estimation — byte-perfect mirror of duration_estimate_tokens()
+    // in omnivoice/utils/duration.py. Uses ref-based speed factor when both
+    // ref_text and ref_audio_tokens are available; falls back to the canonical
+    // anchor "Nice to meet you." at 25 tokens otherwise.
     auto char_weight = [](uint32_t cp) -> float {
         if (cp >= 0x4E00 && cp <= 0x9FFF) return 3.0f;          // CJK
         if (cp >= 0x3400 && cp <= 0x4DBF) return 3.0f;          // CJK Ext-A
@@ -2694,9 +2943,22 @@ bool OmniVoiceModel::Encode(const std::vector<float> &input_frames,
         return w;
     };
 
-    // Use anchored speed_factor. Ref-based estimation is unreliable for
-    // cross-lingual VC (CJK vs Latin weight/frame ratio differs ~4x).
-    float speed_factor = 16.9f / 25.0f;  // "Nice to meet you." anchor
+    // Mirror duration_estimate_tokens(): use ref_text + ref_audio_tokens when
+    // available, otherwise fall back to anchor.
+    std::string est_ref_text;
+    int est_ref_duration;
+    if (s.n_prompt_frames > 0 && !s.ref_text.empty()) {
+        est_ref_text = s.ref_text;
+        est_ref_duration = s.n_prompt_frames;
+    } else {
+        est_ref_text = "Nice to meet you.";
+        est_ref_duration = 25;
+    }
+
+    float ref_weight = text_weight(est_ref_text);
+    float speed_factor = (ref_weight > 0.0f && est_ref_duration > 0)
+        ? ref_weight / (float)est_ref_duration
+        : 16.9f / 25.0f;
 
     float target_weight = text_weight(s.text_original);
     float estimated = (target_weight > 0.0f) ? target_weight / speed_factor : 16.0f;
@@ -2711,22 +2973,9 @@ bool OmniVoiceModel::Encode(const std::vector<float> &input_frames,
     }
     s.n_target_frames = std::max(1, (int)estimated);
 
-    // Voice cloning: 2x frame expansion with ref_frames minimum.
-    // The reference audio dominates early target positions during diffusion;
-    // extra frames and higher CFG give the model room to transition.
-    if (s.n_prompt_frames > 0) {
-        float vc_estimated = estimated * 2.0f;
-        int vc_frames = std::max(s.n_prompt_frames, (int)vc_estimated);
-        if (s.n_target_frames < vc_frames) {
-            RS_LOG_INFO("OmniVoice: VC boosting target frames %d -> %d (est=%.1f x2=%.1f ref=%d)",
-                        s.n_target_frames, vc_frames, estimated, vc_estimated, s.n_prompt_frames);
-            s.n_target_frames = vc_frames;
-        }
-    }
-
-    RS_LOG_INFO("OmniVoice: encoding '%s' weight=%.1f speed=%.4f -> %d target frames (ref_frames=%d)",
+    RS_LOG_INFO("OmniVoice: encoding '%s' weight=%.1f speed=%.4f -> %d target frames (ref_frames=%d ref='%s')",
                 s.text_original.c_str(), target_weight, speed_factor, s.n_target_frames,
-                s.n_prompt_frames);
+                s.n_prompt_frames, est_ref_text.c_str());
 
     return RunDiffusionDecode(s, sched);
 }
@@ -2747,6 +2996,10 @@ static struct ggml_tensor *dac_snake_graph(struct ggml_context *ctx,
                                            const std::vector<float> &inv_b_data,
                                            const char *name) {
     int64_t T = x->ne[0], C = x->ne[1];
+
+    // Ensure alpha is F32 for binary ops (may be F16 from GGUF)
+    if (alpha->type != GGML_TYPE_F32)
+        alpha = ggml_cast(ctx, alpha, GGML_TYPE_F32);
 
     struct ggml_tensor *t = ggml_mul(ctx, x, alpha);      // [T, C] * [1, C] -> [T, C]
     t = ggml_sin(ctx, t);
@@ -2795,14 +3048,15 @@ bool OmniVoiceModel::RunVocoder(OmniVoiceState &state, ggml_backend_sched_t sche
     for (int c = 0; c < std::min(K, rvq_.num_codebooks); c++) {
         struct ggml_tensor *cb_tokens = ggml_view_1d(ctx, tokens_inp, T,
             (size_t)c * T * sizeof(int32_t));
+        // Embed table already in ggml [dim, vocab_size] = [64, 1024] from conversion
         struct ggml_tensor *emb = ggml_get_rows(ctx, rvq_.cb[c].embed, cb_tokens);
         if (rvq_.cb[c].project_out_w) {
+            // project_out_w already in ggml [in=64, out=1024] from conversion
             struct ggml_tensor *proj = ggml_mul_mat(ctx, rvq_.cb[c].project_out_w, emb);
             if (rvq_.cb[c].project_out_b)
                 proj = ggml_add(ctx, proj, rvq_.cb[c].project_out_b);
             rvq_out = (c == 0) ? proj : ggml_add(ctx, rvq_out, proj);
         } else {
-            // Fallback: just embeddings summed
             rvq_out = (c == 0) ? emb : ggml_add(ctx, rvq_out, emb);
         }
     }
@@ -2812,8 +3066,11 @@ bool OmniVoiceModel::RunVocoder(OmniVoiceState &state, ggml_backend_sched_t sche
         ggml_free(ctx);
         return false;
     }
+    ggml_set_name(rvq_out, "rvq_out");
+    ggml_set_output(rvq_out);
 
     // --- fc2: 1024 -> 256 ---
+    // fc2_w_ already in ggml [in=1024, out=256] from conversion
     struct ggml_tensor *fc2_out = rvq_out;
     if (fc2_w_) {
         fc2_out = ggml_mul_mat(ctx, fc2_w_, fc2_out);
@@ -2831,7 +3088,6 @@ bool OmniVoiceModel::RunVocoder(OmniVoiceState &state, ggml_backend_sched_t sche
         if (dac_.c1w->type != GGML_TYPE_F16)
             c1w_f16 = ggml_cast(ctx, dac_.c1w, GGML_TYPE_F16);
         cur = ggml_conv_1d(ctx, c1w_f16, ggml_reshape_3d(ctx, cur, cur->ne[0], cur->ne[1], 1), 1, 3, 1);
-        cur = ggml_reshape_2d(ctx, cur, cur->ne[0], cur->ne[1]);
         if (dac_.c1b) {
             struct ggml_tensor *b2d = ggml_reshape_2d(ctx, dac_.c1b, 1, dac_.c1b->ne[0]);
             cur = ggml_add(ctx, cur, b2d);
@@ -2928,6 +3184,7 @@ bool OmniVoiceModel::RunVocoder(OmniVoiceState &state, ggml_backend_sched_t sche
 
             cur = ggml_add(ctx, skip, cur);
         }
+
     }
 
     // Final snake + conv2: 32 -> 1
@@ -2936,7 +3193,6 @@ bool OmniVoiceModel::RunVocoder(OmniVoiceState &state, ggml_backend_sched_t sche
         struct ggml_tensor *alpha = ggml_reshape_2d(ctx, dac_.s_final.a, 1, C_alpha);
         cur = dac_snake_graph(ctx, cur, alpha, dac_.s_final.inv_b, "inv_b_sfinal");
     }
-
     if (dac_.c2w) {
         struct ggml_tensor *c2w_f16 = dac_.c2w;
         if (dac_.c2w->type != GGML_TYPE_F16)
@@ -2948,8 +3204,8 @@ bool OmniVoiceModel::RunVocoder(OmniVoiceState &state, ggml_backend_sched_t sche
             cur = ggml_add(ctx, cur, b2d);
         }
     }
-
-    // Output: [T_out, 1] -> flat audio
+    // Output: [T_out, 1] -> flat audio, apply tanh as in reference DAC decode()
+    cur = ggml_tanh(ctx, cur);
     cur = ggml_cont(ctx, ggml_view_1d(ctx, cur, ggml_nelements(cur), 0));
     ggml_set_name(cur, "audio_out");
     ggml_set_output(cur);
@@ -2992,6 +3248,7 @@ bool OmniVoiceModel::RunVocoder(OmniVoiceState &state, ggml_backend_sched_t sche
     for (int k = 0; k < K; k++)
         for (int t = 0; t < T; t++)
             tokens_data[(size_t)t + k * T] = state.acoustic_tokens[(size_t)k * T + t];
+
     ggml_backend_tensor_set(tokens_inp, tokens_data.data(), 0, tokens_data.size() * sizeof(int32_t));
 
     // Compute vocoder graph on CPU
@@ -3033,6 +3290,7 @@ bool OmniVoiceModel::RunVocoder(OmniVoiceState &state, ggml_backend_sched_t sche
                     n_samples, (double)n_samples / hparams_.audio_sample_rate, hparams_.audio_sample_rate,
                     a_min, a_max, a_rms,
                     hf_sum / std::max(lf_sum, 1e-30));
+
     }
 
     ggml_backend_buffer_free(voc_buf);

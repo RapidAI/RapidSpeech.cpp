@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
 """
-Convert OmniVoice TTS model (k2-fsa/OmniVoice) to GGUF format.
+Convert OmniVoice TTS model (k2-fsa/OmniVoice) to single GGUF file.
 
-OmniVoice architecture:
-  Text Tokenizer (Qwen3 vocab) ──┐
-                                 ├→ Bidirectional Transformer (Qwen3-0.6B)
-  Acoustic Tokens (8 codebooks) ──┘   ↓
-                                 8× Codebook-Specific Prediction Heads
-                                     ↓  32-step iterative diffusion
-                                 Audio Tokenizer Decoder (Higgs)
-                                     ↓
-                                 24 kHz waveform
+Merges both the LLM backbone (model.safetensors) and audio tokenizer
+(audio_tokenizer/model.safetensors) into one GGUF file.
 
 Usage:
   python convert_omnivoice_to_gguf.py \
@@ -18,11 +11,8 @@ Usage:
     --output omnivoice.gguf \
     [--f16] [--q8]
 
-If the official model isn't available yet, this script supports converting
-from a directory containing PyTorch checkpoint files.
-
 Requirements:
-  pip install torch transformers numpy
+  pip install safetensors numpy
 """
 
 import argparse
@@ -35,7 +25,7 @@ from pathlib import Path
 import numpy as np
 
 # GGUF constants
-GGUF_MAGIC = 0x46475547  # "GGUF"
+GGUF_MAGIC = 0x46554747  # "GGUF" in little-endian
 GGUF_VERSION = 3
 GGML_TYPE_F32 = 0
 GGML_TYPE_F16 = 1
@@ -45,14 +35,14 @@ GGML_TYPE_Q8_0 = 8
 DEFAULT_N_LAYER = 28
 DEFAULT_N_EMBD = 1024
 DEFAULT_N_HEAD = 16
-DEFAULT_N_HEAD_KV = 4
+DEFAULT_N_HEAD_KV = 8
 DEFAULT_HEAD_DIM = 128
 DEFAULT_N_CODEBOOKS = 8
 DEFAULT_AUDIO_SR = 24000
 DEFAULT_DIFF_STEPS = 32
 DEFAULT_ROPE_THETA = 1000000.0
 DEFAULT_TEXT_VOCAB_SIZE = 151936
-DEFAULT_CODEBOOK_SIZE = 2048  # per codebook vocab size (Higgs tokenizer)
+DEFAULT_CODEBOOK_SIZE = 1025
 
 
 class GGUFWriter:
@@ -68,8 +58,14 @@ class GGUFWriter:
     def add_int32(self, key: str, value: int):
         self.kv_data.append(("int32", key, value))
 
+    def add_uint32(self, key: str, value: int):
+        self.kv_data.append(("uint32", key, value))
+
     def add_float32(self, key: str, value: float):
         self.kv_data.append(("float32", key, value))
+
+    def add_string_array(self, key: str, values: list):
+        self.kv_data.append(("string_array", key, values))
 
     def _write_string(self, f, s: str):
         encoded = s.encode("utf-8")
@@ -97,14 +93,27 @@ class GGUFWriter:
                     self._write_string(f, kv[1])
                     f.write(struct.pack("<I", 8))
                     self._write_string(f, kv[2])
+                # ggml GGUF type codes: UINT32=4, INT32=5
+                elif kv[0] == "uint32":
+                    self._write_string(f, kv[1])
+                    f.write(struct.pack("<I", 4))  # GGUF_TYPE_UINT32
+                    f.write(struct.pack("<I", kv[2]))
                 elif kv[0] == "int32":
                     self._write_string(f, kv[1])
-                    f.write(struct.pack("<I", 4))
+                    f.write(struct.pack("<I", 5))  # GGUF_TYPE_INT32
                     f.write(struct.pack("<i", kv[2]))
                 elif kv[0] == "float32":
                     self._write_string(f, kv[1])
                     f.write(struct.pack("<I", 6))
                     f.write(struct.pack("<f", kv[2]))
+                elif kv[0] == "string_array":
+                    # GGUF_TYPE_ARRAY(9) with element type GGUF_TYPE_STRING(8)
+                    self._write_string(f, kv[1])
+                    f.write(struct.pack("<I", 9))  # type: array
+                    f.write(struct.pack("<I", 8))  # element type: string
+                    f.write(struct.pack("<Q", len(kv[2])))  # count
+                    for s in kv[2]:
+                        self._write_string(f, s)
 
             data_offset = 0
             tensor_offsets = []
@@ -151,13 +160,12 @@ def _quantize_q8_0(data: np.ndarray) -> np.ndarray:
             amax = np.float32(1.0)
         scale_f16 = np.float16(amax / 127.0)
         block_out = np.zeros(block_size, dtype=np.int8)
-        pad = block_size - (end - start)
         for i, val in enumerate(block):
             block_out[i] = max(-127, min(127, int(round(val / float(scale_f16)))))
         off = b * (2 + block_size)
         out[off:off + 2] = np.frombuffer(scale_f16.tobytes(), dtype=np.uint8)
         out[off + 2:off + 2 + block_size] = block_out.view(np.uint8)
-        if pad > 0:
+        if end - start < block_size:
             out[off + 2 + end - start:off + 2 + block_size] = 0
     return out
 
@@ -170,159 +178,242 @@ def _get_dtype(use_f16: bool, use_q8: bool):
     return GGML_TYPE_F32
 
 
-def _add_tensor_weighted(writer, name, data, dtype):
-    """Add tensor with dtype selection for weights."""
-    if dtype != GGML_TYPE_F32 and data.ndim >= 2:
-        writer.add_tensor(name, data, dtype)
+def _tensor_dtype(t: np.ndarray, default_dtype):
+    """Use F32 for biases and effectively-1-D tensors (e.g. [C] or [1,C,1]),
+       default_dtype for >=2-D weights."""
+    # Count dimensions with size > 1 (effective dimensionality)
+    eff_ndim = sum(1 for d in t.shape if d > 1)
+    if eff_ndim >= 2:
+        return default_dtype
+    return GGML_TYPE_F32
+
+
+# Tensor names in the tokenizer safetensors that are runtime state (not inference weights)
+SKIP_TOKENIZER_TENSORS = {
+    "cluster_size", "embed_avg", "inited",
+}
+
+# Pos-conv parametrization tensors that should be merged into a single weight
+POS_CONV_ORIGINAL0 = "semantic_model.encoder.pos_conv_embed.conv.parametrizations.weight.original0"
+POS_CONV_ORIGINAL1 = "semantic_model.encoder.pos_conv_embed.conv.parametrizations.weight.original1"
+POS_CONV_WEIGHT = "semantic_model.encoder.pos_conv_embed.conv.weight"
+
+
+def _should_skip_tokenizer_tensor(name: str) -> bool:
+    """Filter out runtime state tensors from the tokenizer checkpoint."""
+    for skip_kw in SKIP_TOKENIZER_TENSORS:
+        if skip_kw in name:
+            return True
+    # Skip parametrization tensors (merged into single weight)
+    if "parametrizations" in name:
+        return True
+    return False
+
+
+def convert_from_safetensors(model_dir: Path, writer: GGUFWriter, dtype):
+    """
+    Load both model.safetensors and audio_tokenizer/model.safetensors,
+    merge into a single GGUF with all tensors.
+    """
+    converted = 0
+
+    # --- Load main model (LLM backbone + codebook heads + acoustic embeddings) ---
+    main_path = model_dir / "model.safetensors"
+    if not main_path.exists():
+        print(f"Error: model.safetensors not found in {model_dir}")
+        sys.exit(1)
+
+    import safetensors.torch
+    print(f"  Loading {main_path.name} ...")
+    main_state = safetensors.torch.load_file(str(main_path), device="cpu")
+
+    for name, tensor in main_state.items():
+        t = tensor.cpu().numpy()
+        # Reorder weight matrices for ggml memory layout (ne0 varies fastest).
+        # Numpy C-order has last dim fastest; ggml has first dim fastest.
+        # The raw bytes of PT tensors are already correct for ggml:
+        #   PT [OC,IC,K] C-order: K fastest → ggml [K,IC,OC] reads K fastest ✓
+        #   PT [out,in] C-order: in fastest → ggml [in,out] reads in fastest ✓
+        # We just need to change the declared shape via ravel().reshape().
+        if t.ndim == 2 and (
+            name.startswith("llm.layers.") or
+            name in ("llm.embed_tokens.weight", "llm.norm.weight", "lm_head.weight",
+                      "audio_embeddings.weight", "audio_heads.weight")
+        ):
+            t = t.ravel().reshape(t.shape[1], t.shape[0])
+        elif t.ndim == 3:
+            t = t.ravel().reshape(t.shape[2], t.shape[1], t.shape[0])
+        dt = _tensor_dtype(t, dtype)
+        writer.add_tensor(name, t, dt)
+        converted += 1
+
+    # Load config.json for audio_codebook_weights metadata
+    config_path = model_dir / "config.json"
+    codebook_weights_info = None
+    if config_path.exists():
+        with open(config_path) as f:
+            config = json.load(f)
+        codebook_weights_info = config.get("audio_codebook_weights", None)
+
+    # --- Load audio tokenizer (codec: RVQ + DAC + HuBERT + SemanticEncoder) ---
+    tokenizer_path = model_dir / "audio_tokenizer" / "model.safetensors"
+    if tokenizer_path.exists():
+        print(f"  Loading {tokenizer_path.name} from audio_tokenizer/ ...")
+        tok_state = safetensors.torch.load_file(str(tokenizer_path), device="cpu")
+
+        # Separate pos_conv parametrization tensors for merging
+        pos_conv_0 = None
+        pos_conv_1 = None
+
+        for name, tensor in tok_state.items():
+            if _should_skip_tokenizer_tensor(name):
+                if name == POS_CONV_ORIGINAL0:
+                    pos_conv_0 = tensor.cpu().numpy()
+                elif name == POS_CONV_ORIGINAL1:
+                    pos_conv_1 = tensor.cpu().numpy()
+                continue
+
+            t = tensor.cpu().numpy()
+            # Reorder weight matrices for ggml memory layout (ne0 varies fastest).
+            # PT C-order has last dim fastest; ggml has first dim fastest.
+            # rav el().reshape() changes the declared shape while keeping
+            # the same raw bytes (which already have the correct layout).
+            if t.ndim == 2 and (name.endswith(".weight") or name.endswith(".embed")):
+                t = t.ravel().reshape(t.shape[1], t.shape[0])
+            elif t.ndim == 3:
+                t = t.ravel().reshape(t.shape[2], t.shape[1], t.shape[0])
+            dt = _tensor_dtype(t, dtype)
+            writer.add_tensor(name, t, dt)
+            converted += 1
+
+        # Merge pos_conv parametrization: weight = original0 * original1
+        if pos_conv_0 is not None and pos_conv_1 is not None:
+            # original0: [1, 1, 128], original1: [768, 48, 128]
+            # Broadcasting: [1,1,128] * [768,48,128] -> [768,48,128]
+            # Result is PyTorch [OC, IC, K]; reorder to ggml [K, IC, OC]
+            merged = pos_conv_0 * pos_conv_1
+            merged = merged.ravel().reshape(merged.shape[2], merged.shape[1], merged.shape[0])
+            dt = _tensor_dtype(merged, dtype)
+            writer.add_tensor(POS_CONV_WEIGHT, merged, dt)
+            converted += 1
+            print(f"  Merged pos_conv_embed: {pos_conv_0.shape} * {pos_conv_1.shape} -> {merged.shape}")
+        elif pos_conv_0 is not None or pos_conv_1 is not None:
+            print("  WARNING: only one pos_conv parametrization tensor found, skipping merge")
     else:
-        writer.add_tensor(name, data, GGML_TYPE_F32)
-
-
-def convert_hf_omnivoice(writer, model, dtype):
-    """
-    Convert HuggingFace OmniVoice model to GGUF tensors.
-
-    Expected HF model structure:
-      - model.embed_tokens.weight          (text embedding, shared with Qwen3)
-      - model.layers.{i}.input_layernorm.weight
-      - model.layers.{i}.self_attn.q_proj.weight / k_proj.weight / v_proj.weight / o_proj.weight
-      - model.layers.{i}.post_attention_layernorm.weight
-      - model.layers.{i}.mlp.gate_proj.weight / up_proj.weight / down_proj.weight
-      - model.norm.weight                  (final layer norm)
-      - codebook_heads.{c}.weight / bias    (per-codebook prediction heads)
-      - acoustic_embeddings.{c}.weight      (per-codebook acoustic embeddings)
-      - vocoder.decoder.conv1.weight / bias (Higgs decoder)
-      - ...
-    """
-    converted = 0
-    state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
-
-    # --- Qwen3 backbone (via qwen3.blk naming) ---
-    token_embd = state_dict.get("model.embed_tokens.weight")
-    if token_embd is not None:
-        writer.add_tensor("qwen3.model.embed_tokens.weight",
-                          token_embd.numpy(), GGML_TYPE_F32)
-        converted += 1
-
-    output_norm = state_dict.get("model.norm.weight")
-    if output_norm is not None:
-        writer.add_tensor("output_norm.weight", output_norm.numpy(), GGML_TYPE_F32)
-        converted += 1
-
-    # Transformer layers
-    for i in range(DEFAULT_N_LAYER):
-        prefix_hf = f"model.layers.{i}."
-        prefix_gguf = f"qwen3.blk.{i}."
-        layer_mappings = [
-            ("input_layernorm.weight", "input_layernorm.weight"),
-            ("input_layernorm.bias", "input_layernorm.bias"),
-            ("self_attn.q_proj.weight", "self_attn.q_proj.weight"),
-            ("self_attn.q_proj.bias", "self_attn.q_proj.bias"),
-            ("self_attn.k_proj.weight", "self_attn.k_proj.weight"),
-            ("self_attn.k_proj.bias", "self_attn.k_proj.bias"),
-            ("self_attn.v_proj.weight", "self_attn.v_proj.weight"),
-            ("self_attn.v_proj.bias", "self_attn.v_proj.bias"),
-            ("self_attn.o_proj.weight", "self_attn.o_proj.weight"),
-            ("post_attention_layernorm.weight", "post_attention_layernorm.weight"),
-            ("post_attention_layernorm.bias", "post_attention_layernorm.bias"),
-            ("mlp.gate_proj.weight", "mlp.gate_proj.weight"),
-            ("mlp.up_proj.weight", "mlp.up_proj.weight"),
-            ("mlp.down_proj.weight", "mlp.down_proj.weight"),
-        ]
-        for hf_suffix, gguf_suffix in layer_mappings:
-            tensor = state_dict.get(prefix_hf + hf_suffix)
-            if tensor is not None:
-                t_dtype = dtype if "weight" in hf_suffix and tensor.ndim >= 2 else GGML_TYPE_F32
-                writer.add_tensor(prefix_gguf + gguf_suffix, tensor.numpy(), t_dtype)
-                converted += 1
-
-    # --- Codebook prediction heads ---
-    for c in range(DEFAULT_N_CODEBOOKS):
-        head_w = state_dict.get(f"codebook_heads.{c}.weight")
-        if head_w is not None:
-            writer.add_tensor(f"codebook_head.{c}.weight", head_w.numpy(), dtype)
-            converted += 1
-        head_b = state_dict.get(f"codebook_heads.{c}.bias")
-        if head_b is not None:
-            writer.add_tensor(f"codebook_head.{c}.bias", head_b.numpy(), GGML_TYPE_F32)
-            converted += 1
-
-    # --- Acoustic codebook embeddings ---
-    for c in range(DEFAULT_N_CODEBOOKS):
-        emb_w = state_dict.get(f"acoustic_embeddings.{c}.weight")
-        if emb_w is not None:
-            writer.add_tensor(f"acoustic_embd.{c}.weight", emb_w.numpy(), GGML_TYPE_F32)
-            converted += 1
-
-    # --- Vocoder (Higgs decoder) ---
-    vocoder_mappings = [
-        ("vocoder.decoder.conv1.weight", "vocoder.decoder.conv1.weight"),
-        ("vocoder.decoder.conv1.bias", "vocoder.decoder.conv1.bias"),
-        ("vocoder.decoder.conv2.weight", "vocoder.decoder.conv2.weight"),
-        ("vocoder.decoder.conv2.bias", "vocoder.decoder.conv2.bias"),
-        ("vocoder.decoder.conv3.weight", "vocoder.decoder.conv3.weight"),
-        ("vocoder.decoder.conv3.bias", "vocoder.decoder.conv3.bias"),
-        ("vocoder.decoder.conv_post.weight", "vocoder.decoder.conv_post.weight"),
-        ("vocoder.decoder.conv_post.bias", "vocoder.decoder.conv_post.bias"),
-    ]
-    for hf_name, gguf_name in vocoder_mappings:
-        tensor = state_dict.get(hf_name)
-        if tensor is not None:
-            t_dtype = dtype if "weight" in hf_name and tensor.ndim >= 2 else GGML_TYPE_F32
-            writer.add_tensor(gguf_name, tensor.numpy(), t_dtype)
-            converted += 1
-
-    # --- Upsample weights (if present) ---
-    for k, v in state_dict.items():
-        if k.startswith("vocoder.decoder.upsamples."):
-            t_dtype = dtype if v.ndim >= 2 else GGML_TYPE_F32
-            writer.add_tensor(k, v.numpy(), t_dtype)
-            converted += 1
-        if k.startswith("vocoder.decoder.resblocks."):
-            t_dtype = dtype if v.ndim >= 2 else GGML_TYPE_F32
-            writer.add_tensor(k, v.numpy(), t_dtype)
-            converted += 1
+        print(f"  WARNING: audio_tokenizer/model.safetensors not found in {model_dir}")
+        print(f"  Only LLM backbone tensors will be included (no vocoder/codec).")
 
     return converted
 
 
-def convert_pytorch_checkpoints(writer, model_dir: Path, dtype):
-    """Convert from raw PyTorch checkpoint files."""
-    converted = 0
-    ckpt_files = sorted(model_dir.glob("*.pt")) + sorted(model_dir.glob("*.pth"))
-    if not ckpt_files:
-        ckpt_files = sorted(model_dir.glob("*.bin")) + sorted(model_dir.glob("*.safetensors"))
+def load_tokenizer_data(model_dir: Path, writer: GGUFWriter):
+    """Load BPE tokenizer data from tokenizer.json and add as GGUF metadata."""
+    tokenizer_path = model_dir / "tokenizer.json"
+    if not tokenizer_path.exists():
+        print(f"  WARNING: tokenizer.json not found, BPE tokenizer will not be available")
+        return
 
-    for ckpt in ckpt_files:
-        print(f"  Loading {ckpt.name} ...")
-        if ckpt.suffix == ".safetensors":
-            import safetensors.torch
-            state_dict = safetensors.torch.load_file(str(ckpt))
+    import json
+    with open(tokenizer_path) as f:
+        tok = json.load(f)
+
+    model = tok.get("model", {})
+    vocab = model.get("vocab", {})
+    merges = model.get("merges", [])
+
+    if not vocab:
+        print(f"  WARNING: empty vocab in tokenizer.json")
+        return
+
+    # Build sorted token list (by ID)
+    max_id = max(vocab.values())
+    tokens = [""] * (max_id + 1)
+    for token_str, tid in vocab.items():
+        tokens[tid] = token_str
+
+    # Read config to determine the actual model vocab size
+    config_path = model_dir / "config.json"
+    llm_vocab_size = len(tokens)
+    if config_path.exists():
+        with open(config_path) as f:
+            cfg = json.load(f)
+        llm_config = cfg.get("llm_config", {})
+        llm_vocab_size = llm_config.get("vocab_size", len(tokens))
+
+    # Extend tokens array to cover full model vocab (includes added special tokens)
+    if llm_vocab_size > len(tokens):
+        tokens.extend([""] * (llm_vocab_size - len(tokens)))
+        print(f"  Extended token list from {max_id+1} to {llm_vocab_size} entries")
+
+    # Map extra special token strings to GGUF metadata key suffixes
+    special_key_map = {
+        "<|denoise|>": "denoise",
+        "<|lang_start|>": "lang_start",
+        "<|lang_end|>": "lang_end",
+        "<|instruct_start|>": "instruct_start",
+        "<|instruct_end|>": "instruct_end",
+        "<|text_start|>": "text_start",
+        "<|text_end|>": "text_end",
+    }
+
+    # Determine special token IDs and insert their strings into tokens array
+    tok_cfg_path = model_dir / "tokenizer_config.json"
+    if tok_cfg_path.exists():
+        with open(tok_cfg_path) as f:
+            tok_cfg = json.load(f)
+        extra_specials = tok_cfg.get("extra_special_tokens", [])
+        if extra_specials:
+            try:
+                from tokenizers import Tokenizer
+                hf_tok = Tokenizer.from_file(str(tokenizer_path))
+                for sp in extra_specials:
+                    tid = hf_tok.token_to_id(sp)
+                    if tid is not None and tid < len(tokens):
+                        tokens[tid] = sp  # set the token string at its ID
+                        key = special_key_map.get(sp, sp.strip("<>").replace("|", "_"))
+                        writer.add_uint32(f"omnivoice.special.{key}", tid)
+                        print(f"  Added omnivoice.special.{key}={tid}")
+            except ImportError:
+                print(f"  WARNING: tokenizers library not available, estimating special token IDs")
+                base_vocab_size = max_id + 1
+                for i, sp in enumerate(extra_specials):
+                    tid = base_vocab_size + i
+                    if tid < len(tokens):
+                        tokens[tid] = sp
+                    key = special_key_map.get(sp, sp.strip("<>").replace("|", "_"))
+                    writer.add_uint32(f"omnivoice.special.{key}", tid)
+                    print(f"  Estimated omnivoice.special.{key}={tid}")
+    else:
+        print(f"  WARNING: tokenizer_config.json not found, special tokens not added")
+
+    # Now write tokenizer.ggml.tokens (after extending and adding special token strings)
+    writer.add_string_array("tokenizer.ggml.tokens", tokens)
+    print(f"  Added tokenizer.ggml.tokens ({len(tokens)} tokens)")
+
+    # Add tokenizer.ggml.merges (convert from list format ["a","b"] to string "a b")
+    merge_strings = []
+    for m in merges:
+        if isinstance(m, list):
+            merge_strings.append(" ".join(m))
         else:
-            import torch
-            state_dict = torch.load(str(ckpt), map_location="cpu", weights_only=True)
+            merge_strings.append(str(m))
+    writer.add_string_array("tokenizer.ggml.merges", merge_strings)
+    print(f"  Added tokenizer.ggml.merges ({len(merge_strings)} merges)")
 
-        for name, tensor in state_dict.items():
-            t = tensor.cpu().numpy() if hasattr(tensor, "numpy") else np.array(tensor)
-            use_dtype = dtype if t.ndim >= 2 else GGML_TYPE_F32
-            writer.add_tensor(name, t, use_dtype)
-            converted += 1
-
-    return converted
+    # Update vocab size to match the actual model vocab
+    writer.add_uint32("tokenizer.vocab_size", llm_vocab_size)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Convert OmniVoice TTS to GGUF")
     parser.add_argument("--model-dir", type=str, required=True,
-                        help="Path to HuggingFace model or checkpoint directory")
+                        help="Path to directory containing model.safetensors + audio_tokenizer/")
     parser.add_argument("--output", type=str, default="omnivoice.gguf",
                         help="Output GGUF file path")
     parser.add_argument("--f16", action="store_true",
                         help="Store large weights in float16")
     parser.add_argument("--q8", action="store_true",
                         help="Store large weights in Q8_0 quantized format")
-    parser.add_argument("--hf", action="store_true",
-                        help="Load as HuggingFace transformers model")
     parser.add_argument("--n-layer", type=int, default=DEFAULT_N_LAYER)
     parser.add_argument("--n-embd", type=int, default=DEFAULT_N_EMBD)
     parser.add_argument("--n-head", type=int, default=DEFAULT_N_HEAD)
@@ -353,42 +444,58 @@ def main():
     writer.add_string("general.description",
                       "OmniVoice: Omnilingual Zero-Shot TTS with Diffusion Language Models")
 
-    # --- OmniVoice hyperparameters ---
-    writer.add_int32("omnivoice.block_count", args.n_layer)
-    writer.add_int32("omnivoice.embedding_length", args.n_embd)
-    writer.add_int32("omnivoice.attention.head_count", args.n_head)
-    writer.add_int32("omnivoice.attention.head_count_kv", args.n_head_kv)
-    writer.add_int32("omnivoice.attention.key_length", args.head_dim)
-    writer.add_int32("omnivoice.codebook_count", args.n_codebooks)
-    writer.add_float32("omnivoice.rope.freq_base", args.rope_theta)
-    writer.add_int32("omnivoice.audio_sample_rate", args.audio_sr)
-    writer.add_int32("omnivoice.diffusion_steps", args.diff_steps)
+    # Auto-detect vocab size from model config
+    text_vocab_size = args.text_vocab_size
+    config_path = model_dir / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            cfg = json.load(f)
+        llm_cfg = cfg.get("llm_config", {})
+        detected_vocab = llm_cfg.get("vocab_size", 0)
+        if detected_vocab > 0:
+            if args.text_vocab_size == DEFAULT_TEXT_VOCAB_SIZE:
+                text_vocab_size = detected_vocab
+                print(f"Auto-detected vocab_size={text_vocab_size} from config.json")
+            elif args.text_vocab_size != detected_vocab:
+                print(f"WARNING: --text-vocab-size={args.text_vocab_size} but config says {detected_vocab}")
+
+    # OmniVoice LLM hyperparameters (keys expected by LoadLM in omnivoice.cpp)
+    # Use uint32 to match gguf_get_val_u32() on C++ side
+    writer.add_uint32("omnivoice-lm.block_count", args.n_layer)
+    writer.add_uint32("omnivoice-lm.embedding_length", args.n_embd)
+    writer.add_uint32("omnivoice-lm.attention.head_count", args.n_head)
+    writer.add_uint32("omnivoice-lm.attention.head_count_kv", args.n_head_kv)
+    writer.add_uint32("omnivoice-lm.attention.key_length", args.head_dim)
+    writer.add_uint32("omnivoice-lm.feed_forward_length", 3072)
+    writer.add_float32("omnivoice-lm.rope.freq_base", args.rope_theta)
+    writer.add_float32("omnivoice-lm.attention.layer_norm_rms_epsilon", 1e-6)
+    writer.add_uint32("omnivoice-lm.vocab_size", text_vocab_size)
+
+    # Audio codec metadata
+    writer.add_uint32("omnivoice.num_audio_codebook", args.n_codebooks)
+    writer.add_uint32("omnivoice.audio_vocab_size", args.codebook_size)
+    writer.add_uint32("omnivoice.audio_mask_id", args.codebook_size - 1)
+    writer.add_uint32("omnivoice.audio_sample_rate", args.audio_sr)
+    writer.add_uint32("omnivoice.diffusion_steps", args.diff_steps)
     writer.add_float32("omnivoice.diffusion_tau", 0.1)
 
-    # Codebook sizes
-    for c in range(args.n_codebooks):
-        writer.add_int32(f"omnivoice.codebook.{c}.size", args.codebook_size)
+    # Codec parameters
+    writer.add_uint32("omnivoice.codebook_size", args.codebook_size)
+    writer.add_uint32("omnivoice.codebook_dim", 64)
 
-    # Tokenizer
-    writer.add_int32("tokenizer.vocab_size", args.text_vocab_size)
+    # Codebook sizes (per-codebook)
+    for c in range(args.n_codebooks):
+        writer.add_uint32(f"omnivoice.codebook.{c}.size", args.codebook_size)
+
+    # Load tokenizer data (BPE tokens + merges + special token IDs)
+    # This also sets tokenizer.vocab_size so don't set it separately
+    load_tokenizer_data(model_dir, writer)
 
     # --- Convert weights ---
     print(f"Model directory: {model_dir}")
-    print(f"Load method: {'HuggingFace' if args.hf else 'raw checkpoints'}")
+    print(f"Output: {output_path}")
 
-    if args.hf:
-        try:
-            import torch
-            from transformers import AutoModel
-        except ImportError:
-            print("Error: for --hf mode, install transformers: pip install transformers torch")
-            sys.exit(1)
-
-        print(f"Loading HuggingFace model from {model_dir} ...")
-        model = AutoModel.from_pretrained(str(model_dir), trust_remote_code=True)
-        n_converted = convert_hf_omnivoice(writer, model, dtype)
-    else:
-        n_converted = convert_pytorch_checkpoints(writer, model_dir, dtype)
+    n_converted = convert_from_safetensors(model_dir, writer, dtype)
 
     print(f"Converted {n_converted} tensors (dtype={dtype_name})")
     writer.write(str(output_path))
