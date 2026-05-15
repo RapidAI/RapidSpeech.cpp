@@ -2549,6 +2549,7 @@ struct OmniVoiceModel::DiffusionGraphState {
     struct ggml_tensor *logits_flat = nullptr;
 
     int S = 0, K = 0, V = 0, B_prime = 0, T_audio = 0;
+    int graph_b = 0;  // actual B' this graph was built for (1 or 2)
     bool allocated = false;
 };
 
@@ -2559,6 +2560,7 @@ bool OmniVoiceModel::BuildDiffusionGraph(DiffusionGraphState &gs,
                                           const OmniVoicePrompt &prompt,
                                           ggml_backend_sched_t sched, int T_audio) {
     gs.B_prime = prompt.B_prime;
+    gs.graph_b = prompt.B_prime;
     gs.K = prompt.K;
     gs.S = prompt.S_max;
     gs.V = audio_vocab_size_;
@@ -2721,19 +2723,30 @@ bool OmniVoiceModel::BuildDiffusionGraph(DiffusionGraphState &gs,
     hidden = ggml_rms_norm(gctx, hidden, hparams_.eps);
     hidden = ggml_mul(gctx, hidden, to_f32(output_norm_));
 
-    gs.logits_flat = nullptr;
-    for (int c = 0; c < K; c++) {
-        struct ggml_tensor *head_w = codebook_head_weight_[c];
-        struct ggml_tensor *head_b = codebook_head_bias_[c];
-        if (!head_w && head_table) {
-            head_w = ggml_view_2d(gctx, head_table, head_table->ne[0], V,
-                                  head_table->nb[1], c * V * head_table->nb[1]);
+    // Fused codebook head: single matmul instead of K separate ones.
+    // head_table has shape [H, K*V]; matmul produces [K*V, S*B'] reshaped to [V, K, S, B'].
+    bool has_any_head_bias = false;
+    for (int c = 0; c < K && !has_any_head_bias; c++)
+        if (codebook_head_bias_[c]) has_any_head_bias = true;
+
+    if (head_table && !has_any_head_bias) {
+        struct ggml_tensor *all_logits = ggml_mul_mat(gctx, head_table, hidden);
+        gs.logits_flat = ggml_reshape_4d(gctx, all_logits, V, K, S, B_prime);
+    } else {
+        gs.logits_flat = nullptr;
+        for (int c = 0; c < K; c++) {
+            struct ggml_tensor *head_w = codebook_head_weight_[c];
+            struct ggml_tensor *head_b = codebook_head_bias_[c];
+            if (!head_w && head_table) {
+                head_w = ggml_view_2d(gctx, head_table, head_table->ne[0], V,
+                                      head_table->nb[1], c * V * head_table->nb[1]);
+            }
+            struct ggml_tensor *head_logits = ggml_mul_mat(gctx, head_w, hidden);
+            if (head_b)
+                head_logits = ggml_add(gctx, head_logits, head_b);
+            head_logits = ggml_reshape_4d(gctx, head_logits, V, 1, S, B_prime);
+            gs.logits_flat = (c == 0) ? head_logits : ggml_concat(gctx, gs.logits_flat, head_logits, 1);
         }
-        struct ggml_tensor *head_logits = ggml_mul_mat(gctx, head_w, hidden);
-        if (head_b)
-            head_logits = ggml_add(gctx, head_logits, head_b);
-        head_logits = ggml_reshape_4d(gctx, head_logits, V, 1, S, B_prime);
-        gs.logits_flat = (c == 0) ? head_logits : ggml_concat(gctx, gs.logits_flat, head_logits, 1);
     }
 
     if (T_audio > 0 && T_audio < S) {
@@ -3255,7 +3268,6 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
     mg_cfg.num_step = n_steps;
     mg_cfg.guidance_scale = 2.0f;
     mg_cfg.t_shift = tau;
-
     // Build attention mask (constant across steps) before building the graph
     std::vector<uint16_t> attn_f16;
     if (!prompt.attention_mask.empty()) {
@@ -3274,8 +3286,16 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
     if (gs.t_attn && !attn_f16.empty())
         ggml_backend_tensor_set(gs.t_attn, attn_f16.data(), 0, attn_f16.size() * sizeof(uint16_t));
 
-    uint32_t ctr_lo = 0;
     RS_LOG_INFO("MaskGIT: T=%d K=%d S=%d V=%d steps=%d", T, K, S, V, n_steps);
+
+    // Pre-allocate host buffers reused across diffusion steps
+    size_t per_audio = (size_t)V * K * T;
+    std::vector<float> c_log(per_audio);
+    std::vector<float> u_log(per_audio);
+    std::vector<float> log_probs(per_audio);
+    std::vector<int32_t> pred_tokens((size_t)K * T);
+    std::vector<float> confidence((size_t)K * T);
+    std::vector<int> idx(K * T);
 
     for (int step = 0; step < n_steps; step++) {
         int k_demask = demask_sched[step];
@@ -3287,7 +3307,6 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
         std::vector<float> logits_full = RunDiffusionGraph(gs, prompt, sched);
         if (logits_full.empty()) { FreeDiffusionGraph(gs, sched); return false; }
 
-        size_t per_audio = (size_t)V * K * T;
         if (logits_full.size() != 2 * per_audio) {
             RS_LOG_ERR("MaskGIT: expected %zu logits, got %zu", 2 * per_audio, logits_full.size());
             FreeDiffusionGraph(gs, sched);
@@ -3311,8 +3330,6 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
         }
 
         // Extract cond and uncond logits, layout [K, T, V]
-        std::vector<float> c_log((size_t)K * T * V);
-        std::vector<float> u_log((size_t)K * T * V);
         float *src_cond = logits_full.data();
         float *src_uncond = logits_full.data() + per_audio;
         for (int k = 0; k < K; k++) {
@@ -3325,7 +3342,6 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
         }
 
         // CFG + log_softmax
-        std::vector<float> log_probs((size_t)K * T * V);
         for (int k = 0; k < K; k++) {
             for (int t = 0; t < T; t++) {
                 size_t off = ((size_t)k * T + t) * V;
@@ -3348,8 +3364,6 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
         }
 
         // Predict tokens and confidence
-        std::vector<int32_t> pred_tokens((size_t)K * T);
-        std::vector<float> confidence((size_t)K * T);
         for (int k = 0; k < K; k++) {
             for (int t = 0; t < T; t++) {
                 size_t off = ((size_t)k * T + t) * V;
@@ -3378,7 +3392,6 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
 
         // Top-k selection
         int N = K * T;
-        std::vector<int> idx(N);
         for (int i = 0; i < N; i++) idx[i] = i;
         std::partial_sort(idx.begin(), idx.begin() + k_demask, idx.end(),
                          [&](int a, int b) { return confidence[a] > confidence[b]; });
@@ -3396,6 +3409,10 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
         }
 
         int remaining = (int)std::count(state.acoustic_tokens.begin(), state.acoustic_tokens.end(), mask_id);
+        if (remaining == 0) {
+            RS_LOG_INFO("MaskGIT: all tokens unmasked at step %d/%d, early stop", step + 1, n_steps);
+            break;
+        }
     }
 
     // Safety net: force-demask any residual mask tokens (use persistent graph)
