@@ -181,6 +181,14 @@ target_include_directories(rapidspeech-core PUBLIC
 # Define RAPIDSPEECH_BUILD for proper symbol export
 target_compile_definitions(rapidspeech-core PRIVATE RAPIDSPEECH_BUILD)
 
+# MSVC portability: _USE_MATH_DEFINES enables M_PI from <cmath>,
+# _CRT_SECURE_NO_WARNINGS suppresses getenv deprecation warning,
+# /wd4244 suppresses int64→int truncation warnings from ggml API.
+if (MSVC)
+    target_compile_definitions(rapidspeech-core PRIVATE _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(rapidspeech-core PRIVATE /wd4244)
+endif()
+
 # Set library version (skip SOVERSION for Python wheels to avoid auditwheel issues)
 if (NOT RS_ENABLE_PYTHON)
     set_target_properties(rapidspeech-core PROPERTIES
