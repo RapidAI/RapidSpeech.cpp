@@ -87,6 +87,12 @@ add_compile_definitions(GGML_MAX_NAME=128)
 
 add_subdirectory(${GGML_PATH} ggml)
 
+# Suppress implicit integer-to-enum and pointer-to-id conversion warnings in
+# third-party ggml Metal code (MTLGPUFamilyMetal*_GGML are defined as integers).
+if (TARGET ggml-metal)
+    target_compile_options(ggml-metal PRIVATE -Wno-int-conversion)
+endif()
+
 # Remove SONAME versioning from ggml targets for Python wheel packaging.
 # ggml explicitly sets SOVERSION on its targets, which creates versioned symlinks
 # (libggml.so.0 -> libggml.so.0.10.0) that aren't preserved in wheels, causing
