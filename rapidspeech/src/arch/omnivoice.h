@@ -5,6 +5,7 @@
 #include "llm_graph.h"
 #include "llm_model.h"
 #include <map>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -27,6 +28,10 @@
 #define OMNIVOICE_N_COEBOOKS 8
 #define OMNIVOICE_DEFAULT_N_STEPS 32
 #define OMNIVOICE_MAX_NODES 16384
+
+#ifdef RS_USE_METAL_DAC
+class DACMetalDecoder;
+#endif
 
 // =====================================================================
 // GPT-2 Byte-Level BPE Tokenizer (for OmniVoice)
@@ -335,7 +340,7 @@ public:
                             int sample_rate, ggml_backend_sched_t sched) override;
     bool PushReferenceText(RSState &state, const char *ref_text) override;
     int GetAudioOutput(RSState &state, float **out_data) override;
-    void SetDiffusionSteps(int n_steps) { n_diff_steps_ = n_steps; }
+    void SetDiffusionSteps(int n_steps) override { n_diff_steps_ = n_steps; }
 
 private:
     RSModelMeta meta_;
@@ -392,6 +397,11 @@ private:
     // ops where GPU kernel launch overhead dominates, making CPU ~300x faster)
     ggml_backend_t backend_ = nullptr;
     ggml_backend_t cpu_backend_ = nullptr;
+
+#ifdef RS_USE_METAL_DAC
+    // Optional Metal GPU backend for DAC vocoder (fused kernels, faster than CPU)
+    std::unique_ptr<DACMetalDecoder> dac_metal_;
+#endif
 
     // Internal methods
     bool LoadLM(const std::unique_ptr<rs_context_t> &ctx);

@@ -1,5 +1,8 @@
 #include "omnivoice.h"
 #include "core/rs_context.h"
+#ifdef RS_USE_METAL_DAC
+#include "dac_metal.h"
+#endif
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -7,7 +10,7 @@
 #include "llm_graph.h"
 #include "llm_model.h"
 #include "utils/rs_log.h"
-
+#include <climits>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -551,6 +554,16 @@ bool OmniVoiceModel::Load(const std::unique_ptr<rs_context_t> &ctx, ggml_backend
         codec_loaded_ = false;
     } else {
         codec_loaded_ = true;
+
+#ifdef RS_USE_METAL_DAC
+        // Try to initialize the Metal GPU backend for DAC vocoder (fused kernels).
+        // Falls back to the CPU ggml path automatically if init fails.
+        dac_metal_.reset(new DACMetalDecoder());
+        if (!dac_metal_->init(dac_, fc2_w_, fc2_b_, rvq_)) {
+            RS_LOG_WARN("OmniVoice: DAC Metal init failed, using CPU vocoder path");
+            dac_metal_.reset();
+        }
+#endif
     }
 
     RS_LOG_INFO("OmniVoice: model loaded successfully (codec=%s)", codec_loaded_ ? "yes" : "no");
@@ -649,10 +662,6 @@ bool OmniVoiceModel::LoadLM(const std::unique_ptr<rs_context_t> &ctx) {
         RS_LOG_INFO("L0 norms: attn_norm=%p q_norm=%p k_norm=%p ffn_norm=%p",
                     (void*)l0.attn_norm, (void*)l0.attn_q_norm,
                     (void*)l0.attn_k_norm, (void*)l0.ffn_norm);
-        if (l0.wq && l0.wq->data) {
-            float *wq0 = (float*)l0.wq->data;
-            RS_LOG_INFO("L0 wq[0..3]: %.6f %.6f %.6f %.6f", wq0[0], wq0[1], wq0[2], wq0[3]);
-        }
     }
 
     // Map audio-specific tensors
@@ -3581,7 +3590,18 @@ bool OmniVoiceModel::RunVocoder(OmniVoiceState &state, ggml_backend_sched_t sche
         }
     }
 
-    // Build vocoder graph
+    // Metal accelerated path (fused compute kernels, ~30 dispatches vs ggml's ~300)
+#ifdef RS_USE_METAL_DAC
+    if (dac_metal_ && dac_metal_->is_valid()) {
+        if (dac_metal_->decode(state.acoustic_tokens.data(), T, K, state.audio_output)) {
+            state.vocoder_done = true;
+            return true;
+        }
+        RS_LOG_WARN("OmniVoice: Metal DAC decode failed, falling back to CPU");
+    }
+#endif
+
+    // CPU ggml path (fallback)
     struct ggml_init_params params = {
         (size_t)(OMNIVOICE_MAX_NODES / 2) * ggml_tensor_overhead() + (1 << 20),
         nullptr, true};
@@ -3763,11 +3783,25 @@ bool OmniVoiceModel::RunVocoder(OmniVoiceState &state, ggml_backend_sched_t sche
 
     ggml_build_forward_expand(gf, cur);
 
-    // Allocate intermediate tensors and schedule ops on the GPU scheduler.
-    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
-        RS_LOG_ERR("OmniVoice: vocoder sched_alloc_graph failed");
-        ggml_free(ctx);
-        return false;
+    // Default to GPU scheduler (CUDA/Vulkan). Set RS_DAC_BACKEND=cpu to force CPU.
+    // macOS Metal ggml path is slower for small ops, but the fused Metal DAC
+    // kernel runs above and returns early — this is only the fallback path.
+    const char *dac_backend_env = getenv("RS_DAC_BACKEND");
+    bool use_gpu_dac = !(dac_backend_env && strcmp(dac_backend_env, "cpu") == 0);
+    ggml_backend_buffer_t voc_buf = nullptr;
+    if (use_gpu_dac) {
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+            RS_LOG_ERR("OmniVoice: vocoder GPU sched_alloc_graph failed");
+            ggml_free(ctx);
+            return false;
+        }
+    } else {
+        voc_buf = ggml_backend_alloc_ctx_tensors(ctx, cpu_backend_);
+        if (!voc_buf) {
+            RS_LOG_ERR("OmniVoice: vocoder CPU alloc failed");
+            ggml_free(ctx);
+            return false;
+        }
     }
 
     // Set inv_b tensor data (precomputed snake activation parameters)
@@ -3799,12 +3833,22 @@ bool OmniVoiceModel::RunVocoder(OmniVoiceState &state, ggml_backend_sched_t sche
 
     ggml_backend_tensor_set(tokens_inp, tokens_data.data(), 0, tokens_data.size() * sizeof(int32_t));
 
-    // Compute vocoder graph on GPU via scheduler
-    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
-        RS_LOG_ERR("OmniVoice: vocoder GPU compute failed");
-        ggml_backend_sched_reset(sched);
-        ggml_free(ctx);
-        return false;
+    // Run vocoder — RS_DAC_BACKEND=gpu uses scheduler, default is CPU
+    if (use_gpu_dac) {
+        if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+            RS_LOG_ERR("OmniVoice: vocoder GPU compute failed");
+            ggml_backend_sched_reset(sched);
+            ggml_free(ctx);
+            return false;
+        }
+    } else {
+        ggml_backend_cpu_set_n_threads(cpu_backend_, 4);
+        if (ggml_backend_graph_compute(cpu_backend_, gf) != GGML_STATUS_SUCCESS) {
+            RS_LOG_ERR("OmniVoice: vocoder CPU compute failed");
+            ggml_backend_buffer_free(voc_buf);
+            ggml_free(ctx);
+            return false;
+        }
     }
 
     struct ggml_tensor *audio_out = ggml_get_tensor(ctx, "audio_out");
@@ -3812,38 +3856,17 @@ bool OmniVoiceModel::RunVocoder(OmniVoiceState &state, ggml_backend_sched_t sche
         int n_samples = (int)ggml_nelements(audio_out);
         state.audio_output.resize(n_samples);
         ggml_backend_tensor_get(audio_out, state.audio_output.data(), 0, ggml_nbytes(audio_out));
-
-        // Debug: audio statistics
-        float a_min = 0, a_max = 0, a_mean = 0, a_rms = 0;
-        double hf_sum = 0, lf_sum = 0;
-        if (n_samples > 0) {
-            a_min = a_max = state.audio_output[0];
-            for (int i = 0; i < n_samples; i++) {
-                float v = state.audio_output[i];
-                if (v < a_min) a_min = v;
-                if (v > a_max) a_max = v;
-                a_mean += v;
-                a_rms += (double)v * v;
-                if (i > 0) {
-                    double d = (double)v - state.audio_output[i-1];
-                    hf_sum += d * d;
-                }
-                lf_sum += (double)v * v;
-            }
-            a_mean /= n_samples;
-            a_rms = (float)sqrt(a_rms / n_samples);
-        }
-        RS_LOG_INFO("OmniVoice: vocoder output %d samples (%.2fs at %d Hz) [%.4f, %.4f] rms=%.4f hf/lf=%.4f",
-                    n_samples, (double)n_samples / hparams_.audio_sample_rate, hparams_.audio_sample_rate,
-                    a_min, a_max, a_rms,
-                    hf_sum / std::max(lf_sum, 1e-30));
-
     }
 
-    ggml_backend_sched_reset(sched);
+    if (use_gpu_dac) {
+        ggml_backend_sched_reset(sched);
+    } else {
+        ggml_backend_buffer_free(voc_buf);
+    }
     ggml_free(ctx);
     bool ok = !state.audio_output.empty();
     if (ok) state.vocoder_done = true;
+
     return ok;
 }
 

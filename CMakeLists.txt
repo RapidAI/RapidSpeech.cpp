@@ -215,13 +215,25 @@ if (RS_CUDA)
 endif()
 
 # 2. Metal Configuration (Apple Platforms)
+if (APPLE)
+    # Always link Metal + Foundation — used by our custom DAC vocoder shader.
+    # ggml-metal is not required for our Metal path (we use MTL API directly).
+    target_link_libraries(rapidspeech-core PRIVATE "-framework Foundation" "-framework Metal")
+
+    # Custom Metal DAC vocoder (fused compute kernels, bypasses ggml per-op overhead)
+    target_sources(rapidspeech-core PRIVATE rapidspeech/src/arch/dac_metal.mm)
+    set_source_files_properties(rapidspeech/src/arch/dac_metal.mm PROPERTIES
+        COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
+    target_compile_definitions(rapidspeech-core PRIVATE RS_USE_METAL_DAC)
+endif()
+
 if (RS_METAL AND APPLE)
     message(STATUS "RapidSpeech: Metal acceleration enabled.")
     target_compile_definitions(rapidspeech-core PRIVATE RS_USE_METAL)
     if (TARGET ggml-metal)
         target_link_libraries(rapidspeech-core PRIVATE ggml-metal)
     endif()
-    target_link_libraries(rapidspeech-core PRIVATE "-framework Foundation" "-framework Metal" "-framework MetalKit")
+    target_link_libraries(rapidspeech-core PRIVATE "-framework MetalKit")
 endif()
 
 # 3. Vulkan Configuration

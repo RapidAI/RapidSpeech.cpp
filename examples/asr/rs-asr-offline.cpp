@@ -429,10 +429,8 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // Normalize from int16 range to [-1, 1] for VAD
+  // load_wav_file already normalizes to [-1, 1], use as-is
   std::vector<float> pcm_normalized = pcm;
-  for (auto &s : pcm_normalized)
-    s /= 32768.f;
 
   // ── 3. VAD segmentation (if VAD model provided) ───────
   std::vector<SpeechSegment> segments;

@@ -1088,8 +1088,7 @@ int main(int argc, char **argv) {
     LOG_INFO("Loaded %zu samples @ %d Hz (%.2f s)", pcm_all.size(), wav_sr,
              (float)pcm_all.size() / wav_sr);
 
-    for (auto &s : pcm_all)
-      s /= 32768.f;
+    // load_wav_file already normalizes to [-1, 1]
 
     if (wav_sr != SAMPLE_RATE) {
       LOG_ERROR("WAV sample rate %d != expected %d", wav_sr, SAMPLE_RATE);
