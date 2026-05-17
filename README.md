@@ -52,6 +52,8 @@ While the open-source ecosystem already offers powerful cloud-side frameworks su
 - [ ] FireRedASR2
 
 **Text-to-Speech (TTS)**
+- [x] OpenVoice2 (MeloTTS + voice cloning)
+- [x] OmniVoice (single-stage non-autoregressive diffusion TTS, multilingual + voice cloning)
 - [ ] CosyVoice3
 - [ ] Qwen3-TTS
 
@@ -104,6 +106,7 @@ cmake --build build --config Release
 Build artifacts are located in the `build/` directory:
 - `rs-asr-offline` — Offline ASR command-line tool
 - `rs-asr-online` — Online (streaming) ASR command-line tool
+- `rs-tts-offline` — Offline TTS command-line tool
 - `rs-quantize` — Model quantization tool
 
 ### C++ CLI Usage
@@ -196,6 +199,58 @@ Parameters:
 | `--vad-threshold` | VAD speech detection threshold (0–1, lower = more sensitive) | 0.5 |
 | `--silence-ms` | Silence timeout for segment splitting (ms) | 600 |
 | `--two-pass` | Enable 2-pass mode: CTC decode + LLM rescore | off |
+| `--ctc-precheck` | CTC pre-check before LLM to skip silence (reduces hallucination, slightly increases RTF) | off |
+
+#### Text-to-Speech (rs-tts-offline)
+
+**Basic usage (OpenVoice2):**
+
+```bash
+./build/rs-tts-offline \
+  -m /path/to/openvoice2-base.gguf \
+  -t "Hello, welcome to RapidSpeech!" \
+  -o output.wav \
+  --threads 4
+```
+
+**OmniVoice diffusion TTS:**
+
+```bash
+./build/rs-tts-offline \
+  -m /path/to/omnivoice-f16.gguf \
+  -t "Hello, welcome to RapidSpeech!" \
+  --instruct "male, young adult, moderate pitch" \
+  --lang English \
+  --n-steps 32 \
+  -o output.wav
+```
+
+**Voice cloning (OmniVoice):**
+
+```bash
+./build/rs-tts-offline \
+  -m /path/to/omnivoice-f16.gguf \
+  -t "Hello, this is cloned voice." \
+  --ref /path/to/reference.wav \
+  --ref-text "transcript of the reference audio" \
+  -o output.wav
+```
+
+Parameters:
+
+| Flag | Description | Default |
+| --- | --- | --- |
+| `-m, --model` | Path to TTS GGUF model file (required) | — |
+| `-t, --text` | Text to synthesize (required) | — |
+| `-o, --output` | Output WAV file path | output.wav |
+| `--instruct` | Voice description, e.g. `male`, `female`, `young adult` (OmniVoice) | male |
+| `--lang` | Target language, e.g. `English`, `zh` (OmniVoice) | English |
+| `--seed` | Random seed (OmniVoice) | 42 |
+| `--n-steps` | Diffusion steps 1-128, fewer = faster but lower quality (OmniVoice) | 32 |
+| `--ref` | Reference audio WAV for voice cloning (OmniVoice) | — |
+| `--ref-text` | Transcript of the reference audio (OmniVoice) | — |
+| `--threads` | Number of CPU threads | 4 |
+| `--gpu` | Enable GPU acceleration (`true`/`false`) | true |
 
 #### Model Quantization (rs-quantize)
 
@@ -257,6 +312,32 @@ print(f"Result: {text}")
 
 See [python-api-examples/asr/asr-offline.py](python-api-examples/asr/asr-offline.py) for a complete example.
 
+**TTS Python API:**
+
+```python
+import rapidspeech
+import numpy as np
+
+# Initialize TTS synthesizer
+tts = rapidspeech.tts_synthesizer(
+    model_path="openvoice2-base.gguf",
+    n_threads=4,
+    use_gpu=True
+)
+
+# Synthesize text to audio (returns full PCM as numpy array)
+pcm = tts.synthesize("Hello, welcome to RapidSpeech!")
+
+# Streaming synthesis (returns list of numpy array chunks)
+chunks = tts.synthesize_streaming("Hello, welcome to RapidSpeech!")
+for chunk in chunks:
+    print(f"Chunk: {len(chunk)} samples")
+
+# Optional: set reference audio for voice cloning
+# reference_pcm = ...  # load reference audio
+# tts.set_reference(reference_pcm, sample_rate=16000)
+```
+
 ------
 
 ## 📊 Performance Benchmarks
@@ -298,6 +379,40 @@ python scripts/convert_silero_to_gguf.py \
 ```
 
 The converted VAD model is also available for direct download from [HuggingFace](https://huggingface.co/RapidAI/RapidSpeech) and [ModelScope](https://www.modelscope.cn/models/RapidAI/RapidSpeech).
+
+### TTS Model (OpenVoice2 → GGUF)
+
+Convert MeloTTS (OpenVoice2) base model and optional tone color converter to GGUF:
+
+```bash
+# Convert base TTS model
+python scripts/convert_openvoice2.py \
+  --base-model myshell-ai/MeloTTS-English \
+  --output-dir ./models \
+  --language EN
+
+# Convert with tone color converter for voice cloning
+python scripts/convert_openvoice2.py \
+  --base-model myshell-ai/MeloTTS-English \
+  --converter-model myshell-ai/OpenVoiceV2 \
+  --output-dir ./models
+```
+
+Outputs:
+- `openvoice2-base.gguf` — Text encoder + duration predictor + flow decoder + HiFi-GAN vocoder
+- `openvoice2-converter.gguf` — Tone color converter (optional, for voice cloning)
+
+### TTS Model (OmniVoice → GGUF)
+
+Merge OmniVoice PyTorch model (LLM + audio tokenizer) into a single GGUF:
+
+```bash
+python scripts/convert_omnivoice_to_gguf.py \
+  --model /path/to/omnivoice-model \
+  --tokenizer /path/to/omnivoice-audio-tokenizer \
+  --output /path/to/omnivoice-merged.gguf \
+  --outtype f16
+```
 
 ------
 

@@ -51,6 +51,8 @@
 - [ ] FireRedASR2
 
 **语音合成（TTS）**
+- [x] OpenVoice2（MeloTTS + 声音克隆）
+- [x] OmniVoice（单阶段非自回归扩散 TTS，多语种 + 声音克隆）
 - [ ] CosyVoice3
 - [ ] Qwen3-TTS
 
@@ -103,6 +105,7 @@ cmake --build build --config Release
 构建产物位于 `build/` 目录：
 - `rs-asr-offline` — 离线 ASR 命令行工具
 - `rs-asr-online` — 在线（流式）ASR 命令行工具
+- `rs-tts-offline` — 离线 TTS 命令行工具
 - `rs-quantize` — 模型量化工具
 
 ### C++ 命令行使用
@@ -195,6 +198,58 @@ cmake --build build --config Release
 | `--vad-threshold` | VAD 语音检测阈值（0~1，越低越灵敏） | 0.5 |
 | `--silence-ms` | 静默超时切分时长（ms） | 600 |
 | `--two-pass` | 启用两遍模式：CTC 解码 + LLM 重打分 | 关闭 |
+| `--ctc-precheck` | LLM 解码前 CTC 预检，跳过静音段（减少幻觉，略微增加实时率） | 关闭 |
+
+#### 语音合成（rs-tts-offline）
+
+**基本用法（OpenVoice2）：**
+
+```bash
+./build/rs-tts-offline \
+  -m /path/to/openvoice2-base.gguf \
+  -t "Hello, welcome to RapidSpeech!" \
+  -o output.wav \
+  --threads 4
+```
+
+**OmniVoice 扩散 TTS：**
+
+```bash
+./build/rs-tts-offline \
+  -m /path/to/omnivoice-f16.gguf \
+  -t "Hello, welcome to RapidSpeech!" \
+  --instruct "male, young adult, moderate pitch" \
+  --lang English \
+  --n-steps 32 \
+  -o output.wav
+```
+
+**声音克隆（OmniVoice）：**
+
+```bash
+./build/rs-tts-offline \
+  -m /path/to/omnivoice-f16.gguf \
+  -t "Hello, this is cloned voice." \
+  --ref /path/to/reference.wav \
+  --ref-text "transcript of the reference audio" \
+  -o output.wav
+```
+
+参数说明：
+
+| 参数 | 说明 | 默认值 |
+| --- | --- | --- |
+| `-m, --model` | TTS GGUF 模型文件路径（必填） | — |
+| `-t, --text` | 要合成的文本（必填） | — |
+| `-o, --output` | 输出 WAV 文件路径 | output.wav |
+| `--instruct` | 声音描述，如 `male`、`female`、`young adult`（OmniVoice） | male |
+| `--lang` | 目标语种，如 `English`、`zh`（OmniVoice） | English |
+| `--seed` | 随机种子（OmniVoice） | 42 |
+| `--n-steps` | 扩散步数 1-128，越少越快但音质可能下降（OmniVoice） | 32 |
+| `--ref` | 参考音频 WAV 文件路径，用于声音克隆（OmniVoice） | — |
+| `--ref-text` | 参考音频对应的文本转录（OmniVoice） | — |
+| `--threads` | CPU 线程数 | 4 |
+| `--gpu` | 是否启用 GPU 加速（`true`/`false`） | true |
 
 #### 模型量化（rs-quantize）
 
@@ -256,6 +311,32 @@ print(f"识别结果: {text}")
 
 完整示例参见 [python-api-examples/asr/asr-offline.py](python-api-examples/asr/asr-offline.py)。
 
+**TTS Python API：**
+
+```python
+import rapidspeech
+import numpy as np
+
+# 初始化 TTS 合成器
+tts = rapidspeech.tts_synthesizer(
+    model_path="openvoice2-base.gguf",
+    n_threads=4,
+    use_gpu=True
+)
+
+# 合成文本为音频（返回完整 PCM numpy 数组）
+pcm = tts.synthesize("你好，欢迎使用RapidSpeech！")
+
+# 流式合成（返回 numpy 数组列表）
+chunks = tts.synthesize_streaming("你好，欢迎使用RapidSpeech！")
+for chunk in chunks:
+    print(f"音频块: {len(chunk)} 采样点")
+
+# 可选：设置参考音频用于声音克隆
+# reference_pcm = ...  # 加载参考音频
+# tts.set_reference(reference_pcm, sample_rate=16000)
+```
+
 ------
 
 ## 📊 性能基准
@@ -297,6 +378,40 @@ python scripts/convert_silero_to_gguf.py \
 ```
 
 转换后的 VAD 模型也可直接从 [HuggingFace](https://huggingface.co/RapidAI/RapidSpeech) 或 [ModelScope](https://www.modelscope.cn/models/RapidAI/RapidSpeech) 下载。
+
+### TTS 模型（OpenVoice2 → GGUF）
+
+将 MeloTTS（OpenVoice2）基础模型和可选音色转换器转换为 GGUF 格式：
+
+```bash
+# 转换基础 TTS 模型
+python scripts/convert_openvoice2.py \
+  --base-model myshell-ai/MeloTTS-English \
+  --output-dir ./models \
+  --language EN
+
+# 包含音色转换器（用于声音克隆）
+python scripts/convert_openvoice2.py \
+  --base-model myshell-ai/MeloTTS-English \
+  --converter-model myshell-ai/OpenVoiceV2 \
+  --output-dir ./models
+```
+
+产物说明：
+- `openvoice2-base.gguf` — 文本编码器 + 时长预测器 + Flow解码器 + HiFi-GAN 声码器
+- `openvoice2-converter.gguf` — 音色转换器（可选，用于声音克隆）
+
+### TTS 模型（OmniVoice → GGUF）
+
+将 OmniVoice PyTorch 模型（LLM + audio tokenizer）合并转换为单一 GGUF：
+
+```bash
+python scripts/convert_omnivoice_to_gguf.py \
+  --model /path/to/omnivoice-model \
+  --tokenizer /path/to/omnivoice-audio-tokenizer \
+  --output /path/to/omnivoice-merged.gguf \
+  --outtype f16
+```
 
 ------
 
