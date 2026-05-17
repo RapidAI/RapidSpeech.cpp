@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RapidSpeech — WebAssembly ASR Demo</title>
+  <style>
+    :root {
+      --bg: #1a1a2e;
+      --card: #16213e;
+      --accent: #0f3460;
+      --highlight: #e94560;
+      --text: #eee;
+      --dim: #8892b0;
+      --green: #4ecca3;
+      --yellow: #f0a500;
+      --radius: 8px;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      padding: 20px;
+    }
+    .container {
+      max-width: 700px;
+      width: 100%;
+    }
+
+    /* Header */
+    .header {
+      text-align: center;
+      margin-bottom: 24px;
+    }
+    .header h1 {
+      font-size: 28px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+    }
+    .header h1 span { color: var(--highlight); }
+    .header p {
+      color: var(--dim);
+      font-size: 14px;
+      margin-top: 4px;
+    }
+
+    /* Card */
+    .card {
+      background: var(--card);
+      border-radius: var(--radius);
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    .card-title {
+      font-size: 14px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--dim);
+      margin-bottom: 12px;
+    }
+
+    /* Model input row */
+    .input-row {
+      display: flex;
+      gap: 8px;
+    }
+    .input-row input {
+      flex: 1;
+      padding: 10px 14px;
+      border: 1px solid var(--accent);
+      border-radius: var(--radius);
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      outline: none;
+    }
+    .input-row input:focus { border-color: var(--highlight); }
+
+    /* Buttons */
+    .btn-row { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+    .btn {
+      padding: 8px 18px;
+      border: none;
+      border-radius: var(--radius);
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.2s;
+    }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-load { background: var(--accent); color: var(--text); }
+    .btn-start { background: var(--green); color: var(--bg); }
+    .btn-stop { background: var(--highlight); color: var(--text); }
+    .btn-clear { background: transparent; border: 1px solid var(--dim); color: var(--dim); }
+
+    /* Progress bar */
+    .progress-container { display: none; margin-top: 10px; }
+    .progress-track {
+      width: 100%; height: 4px; background: var(--accent);
+      border-radius: 2px; overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%; width: 0%; background: var(--green);
+      transition: width 0.2s;
+    }
+
+    /* Status */
+    .status {
+      margin-top: 10px;
+      font-size: 13px;
+      padding: 6px 12px;
+      border-radius: 4px;
+      display: inline-block;
+    }
+    .status.idle { color: var(--dim); background: transparent; }
+    .status.loading { color: var(--yellow); background: rgba(240,165,0,0.1); }
+    .status.ready { color: var(--green); background: rgba(78,204,163,0.1); }
+    .status.listening { color: var(--green); background: rgba(78,204,163,0.1); }
+    .status.error { color: var(--highlight); background: rgba(233,69,96,0.1); }
+
+    /* VAD meter */
+    .vad-container { margin-top: 12px; }
+    .vad-track {
+      width: 100%; height: 6px; background: var(--accent);
+      border-radius: 3px; overflow: hidden;
+    }
+    .vad-fill {
+      height: 100%; width: 0%; background: var(--dim);
+      transition: width 0.1s, background 0.2s;
+      border-radius: 3px;
+    }
+    .vad-fill.speech { background: var(--green); }
+    .vad-meta { display: flex; justify-content: space-between; margin-top: 4px; }
+    .vad-label { font-size: 12px; color: var(--dim); text-transform: uppercase; }
+    .vad-label.speech { color: var(--green); font-weight: 600; }
+    .vad-info { font-size: 12px; color: var(--dim); }
+
+    /* Transcript */
+    .transcript {
+      background: var(--bg);
+      border-radius: var(--radius);
+      padding: 16px;
+      min-height: 200px;
+      max-height: 400px;
+      overflow-y: auto;
+      font-size: 15px;
+      line-height: 1.7;
+      word-break: break-all;
+    }
+    .transcript-line {
+      margin-bottom: 6px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+    }
+    .transcript-line .timestamp {
+      color: var(--dim);
+      font-size: 12px;
+      font-family: monospace;
+      margin-right: 8px;
+    }
+    .partial {
+      color: var(--dim);
+      font-style: italic;
+      padding: 8px 16px;
+      min-height: 24px;
+      font-size: 14px;
+    }
+
+    /* Footer */
+    .footer {
+      text-align: center;
+      margin-top: 20px;
+      font-size: 12px;
+      color: var(--dim);
+    }
+    .footer a { color: var(--highlight); text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="container">
+
+    <!-- Header -->
+    <div class="header">
+      <h1>Rapid<span>Speech</span></h1>
+      <p>Speech Recognition in the Browser — Powered by WebAssembly</p>
+    </div>
+
+    <!-- Model Loading -->
+    <div class="card">
+      <div class="card-title">Model</div>
+      <div class="input-row">
+        <input id="model-url" type="text"
+               placeholder="https://huggingface.co/.../sense-voice-small-q8_0.gguf"
+               value="">
+      </div>
+      <div class="progress-container" id="progress-container">
+        <div class="progress-track">
+          <div class="progress-fill" id="progress-bar"></div>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-load" id="load-btn">Load Model</button>
+      </div>
+      <div id="status" class="status idle">Enter a model URL and click Load.</div>
+    </div>
+
+    <!-- Controls + VAD -->
+    <div class="card">
+      <div class="card-title">Microphone</div>
+      <div class="btn-row">
+        <button class="btn btn-start" id="start-btn" disabled>Start</button>
+        <button class="btn btn-stop" id="stop-btn" disabled>Stop</button>
+        <button class="btn btn-clear" id="clear-btn">Clear</button>
+      </div>
+      <div class="vad-container">
+        <div class="vad-track">
+          <div class="vad-fill" id="vad-bar"></div>
+        </div>
+        <div class="vad-meta">
+          <span class="vad-label" id="vad-label">silence</span>
+          <span class="vad-info" id="info"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Transcript -->
+    <div class="card">
+      <div class="card-title">Transcript</div>
+      <div class="transcript" id="transcript"></div>
+      <div class="partial" id="partial"></div>
+    </div>
+
+    <!-- Footer -->
+    <div class="footer">
+      <a href="https://github.com/lovemefan/RapidSpeech.cpp" target="_blank">RapidSpeech.cpp</a>
+      &mdash; GGUF ASR models run locally in your browser.
+    </div>
+
+  </div>
+
+  <!-- Emscripten-generated WASM glue (build output) -->
+  <script src="rapidspeech-wasm.js"></script>
+  <!-- JS bridge layer -->
+  <script src="rapidspeech-bridge.js"></script>
+  <!-- App logic -->
+  <script src="app.js"></script>
+</body>
+</html>
