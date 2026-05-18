@@ -422,33 +422,63 @@ std::vector<int32_t> TextFrontend::TextToPhonemeIds(const std::string& text,
     if (out_tones) out_tones->assign(phonemes.size(), 0);
   }
 
-  // Convert phonemes to IDs
+  // Convert phonemes to IDs, interspersing blanks for Chinese
   std::vector<int32_t> ids;
-  // Add <sos>
-  auto sos_it = phoneme_to_id_.find("<sos>");
-  if (sos_it != phoneme_to_id_.end()) {
-    if (out_tones) out_tones->insert(out_tones->begin(), 0);
-    ids.push_back(sos_it->second);
-  }
+
+  // Get blank ID (used for interspersion in Chinese)
+  int32_t blank_id = 0;
+  auto blank_it = phoneme_to_id_.find("_");
+  if (blank_it != phoneme_to_id_.end()) blank_id = blank_it->second;
 
   int32_t unk_id = 3;  // default <unk> ID
   auto unk_it = phoneme_to_id_.find("<unk>");
   if (unk_it != phoneme_to_id_.end()) unk_id = unk_it->second;
 
-  for (const auto& ph : phonemes) {
-    auto it = phoneme_to_id_.find(ph);
-    if (it != phoneme_to_id_.end()) {
-      ids.push_back(it->second);
-    } else {
-      ids.push_back(unk_id);
+  // Prepare tone list for interspersed output
+  std::vector<int32_t> new_tones;
+
+  if (language == "zh" || language == "ZH") {
+    // MeloTTS Chinese: intersperse blank "_" between every phoneme:
+    //   _ p1 _ p2 _ p3 _ ... _ pN _
+    // with tone 0 for blanks, original tone for each phoneme
+    ids.push_back(blank_id);
+    if (out_tones) new_tones.push_back(0);
+
+    for (size_t i = 0; i < phonemes.size(); i++) {
+      auto it = phoneme_to_id_.find(phonemes[i]);
+      ids.push_back(it != phoneme_to_id_.end() ? it->second : unk_id);
+      ids.push_back(blank_id);
+      if (out_tones) {
+        int t = (i < out_tones->size()) ? (*out_tones)[i] : 0;
+        new_tones.push_back(t);
+        new_tones.push_back(0);
+      }
+    }
+    if (out_tones) *out_tones = std::move(new_tones);
+  } else {
+    // English: just map directly (no interspersion needed)
+    for (const auto& ph : phonemes) {
+      auto it = phoneme_to_id_.find(ph);
+      if (it != phoneme_to_id_.end()) {
+        ids.push_back(it->second);
+      } else {
+        ids.push_back(unk_id);
+      }
     }
   }
 
-  // Add <eos>
+  // Add <sos> at beginning
+  auto sos_it = phoneme_to_id_.find("<sos>");
+  if (sos_it != phoneme_to_id_.end()) {
+    ids.insert(ids.begin(), sos_it->second);
+    if (out_tones) out_tones->insert(out_tones->begin(), 0);
+  }
+
+  // Add <eos> at end
   auto eos_it = phoneme_to_id_.find("<eos>");
   if (eos_it != phoneme_to_id_.end()) {
-    if (out_tones) out_tones->push_back(0);
     ids.push_back(eos_it->second);
+    if (out_tones) out_tones->push_back(0);
   }
 
   return ids;
