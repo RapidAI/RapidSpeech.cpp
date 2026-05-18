@@ -1,4 +1,5 @@
 #include "common_quantize.h"
+#include "imatrix_collector.h"
 #include <climits>
 #include <cstring>
 #include <inttypes.h>
@@ -13,12 +14,27 @@
 // ============================================
 
 static const std::map<std::string, enum ggml_ftype> GGML_FTYPE_MAP = {
-    {"q4_0", GGML_FTYPE_MOSTLY_Q4_0},     {"q4_1", GGML_FTYPE_MOSTLY_Q4_1},
-    {"q5_0", GGML_FTYPE_MOSTLY_Q5_0},     {"q5_1", GGML_FTYPE_MOSTLY_Q5_1},
-    {"q8_0", GGML_FTYPE_MOSTLY_Q8_0},     {"q2_k", GGML_FTYPE_MOSTLY_Q2_K},
-    {"q3_k", GGML_FTYPE_MOSTLY_Q3_K},     {"q4_k", GGML_FTYPE_MOSTLY_Q4_K},
-    {"q4_k_m", GGML_FTYPE_MOSTLY_Q4_K_M}, {"q5_k", GGML_FTYPE_MOSTLY_Q5_K},
-    {"q5_k_m", GGML_FTYPE_MOSTLY_Q5_K_M}, {"q6_k", GGML_FTYPE_MOSTLY_Q6_K},
+    {"q4_0",    GGML_FTYPE_MOSTLY_Q4_0},
+    {"q4_1",    GGML_FTYPE_MOSTLY_Q4_1},
+    {"q5_0",    GGML_FTYPE_MOSTLY_Q5_0},
+    {"q5_1",    GGML_FTYPE_MOSTLY_Q5_1},
+    {"q8_0",    GGML_FTYPE_MOSTLY_Q8_0},
+    {"q2_k",    GGML_FTYPE_MOSTLY_Q2_K},
+    {"q3_k",    GGML_FTYPE_MOSTLY_Q3_K},
+    {"q4_k",    GGML_FTYPE_MOSTLY_Q4_K},
+    {"q4_k_m",  GGML_FTYPE_MOSTLY_Q4_K_M},
+    {"q5_k",    GGML_FTYPE_MOSTLY_Q5_K},
+    {"q5_k_m",  GGML_FTYPE_MOSTLY_Q5_K_M},
+    {"q6_k",    GGML_FTYPE_MOSTLY_Q6_K},
+    {"iq1_m",   GGML_FTYPE_MOSTLY_IQ1_M},
+    {"iq1_s",   GGML_FTYPE_MOSTLY_IQ1_S},
+    {"iq2_s",   GGML_FTYPE_MOSTLY_IQ2_S},
+    {"iq2_xs",  GGML_FTYPE_MOSTLY_IQ2_XS},
+    {"iq2_xxs", GGML_FTYPE_MOSTLY_IQ2_XXS},
+    {"iq3_xxs", GGML_FTYPE_MOSTLY_IQ3_XXS},
+    {"iq3_s",   GGML_FTYPE_MOSTLY_IQ3_S},
+    {"iq4_nl",  GGML_FTYPE_MOSTLY_IQ4_NL},
+    {"iq4_xs",  GGML_FTYPE_MOSTLY_IQ4_XS},
 };
 
 void ggml_print_ftypes(FILE *fp) {
@@ -29,15 +45,14 @@ void ggml_print_ftypes(FILE *fp) {
 
 enum ggml_ftype ggml_parse_ftype(const char *str) {
   enum ggml_ftype ftype;
-  if (str[0] == 'q') {
-    const auto it = GGML_FTYPE_MAP.find(str);
-    if (it == GGML_FTYPE_MAP.end()) {
-      fprintf(stderr, "%s: unknown ftype '%s'\n", __func__, str);
-      return GGML_FTYPE_UNKNOWN;
-    }
+  const auto it = GGML_FTYPE_MAP.find(str);
+  if (it != GGML_FTYPE_MAP.end()) {
     ftype = it->second;
-  } else {
+  } else if (str[0] >= '0' && str[0] <= '9') {
     ftype = (enum ggml_ftype)atoi(str);
+  } else {
+    fprintf(stderr, "%s: unknown ftype '%s'\n", __func__, str);
+    return GGML_FTYPE_UNKNOWN;
   }
   return ftype;
 }
@@ -154,6 +169,112 @@ static size_t rs_tensor_quantize_internal(enum ggml_type new_type,
 }
 
 // ============================================
+// Tensor categorization for mixed-precision strategies
+// ============================================
+
+enum class tensor_category {
+  TOKEN_EMBD,
+  ATTENTION_V,
+  ATTENTION_K,
+  ATTENTION_Q,
+  ATTENTION_OUTPUT,
+  FFN_UP,
+  FFN_GATE,
+  FFN_DOWN,
+  OUTPUT,
+  OTHER,
+};
+
+// Extract layer index from tensor names like:
+//   model.layers.{N}.*
+//   encoder.encoders.{N}.*
+// Returns -1 if no layer index found.
+static int extract_layer_index(const std::string &name) {
+  // TTS LLM backbone variants + ASR encoder
+  const char *prefixes[] = {
+      "model.layers.",
+      "llm.layers.",
+      "encoder.encoders.",
+      "semantic_model.encoder.layers.",
+  };
+  for (const auto &pfx : prefixes) {
+    size_t pos = name.find(pfx);
+    if (pos != std::string::npos) {
+      pos += strlen(pfx);
+      size_t end = name.find('.', pos);
+      if (end != std::string::npos) {
+        try {
+          return std::stoi(name.substr(pos, end - pos));
+        } catch (...) {
+          return -1;
+        }
+      }
+    }
+  }
+  return -1;
+}
+
+static bool name_ends_with(const std::string &name, const char *suffix) {
+  size_t nlen = name.size();
+  size_t slen = strlen(suffix);
+  return nlen >= slen && name.compare(nlen - slen, slen, suffix) == 0;
+}
+
+static tensor_category categorize_tensor(const std::string &name) {
+  // Token embeddings (may have prefixes like "llm.", "model.")
+  if (name_ends_with(name, "embed_tokens.weight") ||
+      name == "embed.weight") {
+    return tensor_category::TOKEN_EMBD;
+  }
+  // Output projection
+  if (name_ends_with(name, "lm_head.weight") ||
+      name_ends_with(name, "ctc.ctc_lo.weight")) {
+    return tensor_category::OUTPUT;
+  }
+  // Attention V (most sensitive to quantization)
+  if (name.find("v_proj.weight") != std::string::npos ||
+      name.find("linear_v.weight") != std::string::npos) {
+    return tensor_category::ATTENTION_V;
+  }
+  // Attention K
+  if (name.find("k_proj.weight") != std::string::npos ||
+      name.find("linear_k.weight") != std::string::npos) {
+    return tensor_category::ATTENTION_K;
+  }
+  // Attention Q
+  if (name.find("q_proj.weight") != std::string::npos ||
+      name.find("linear_q.weight") != std::string::npos) {
+    return tensor_category::ATTENTION_Q;
+  }
+  // Attention Output
+  if (name.find("o_proj.weight") != std::string::npos ||
+      name.find("out_proj.weight") != std::string::npos ||
+      name.find("linear_out.weight") != std::string::npos) {
+    return tensor_category::ATTENTION_OUTPUT;
+  }
+  // FFN Up / Gate
+  if (name.find("up_proj.weight") != std::string::npos ||
+      name.find("w_1.weight") != std::string::npos) {
+    return tensor_category::FFN_UP;
+  }
+  if (name.find("gate_proj.weight") != std::string::npos) {
+    return tensor_category::FFN_GATE;
+  }
+  // FFN Down
+  if (name.find("down_proj.weight") != std::string::npos ||
+      name.find("w_2.weight") != std::string::npos) {
+    return tensor_category::FFN_DOWN;
+  }
+  if (name.find("intermediate_dense.weight") != std::string::npos) {
+    return tensor_category::FFN_UP;
+  }
+  if (name.find("output_dense.weight") != std::string::npos) {
+    return tensor_category::FFN_DOWN;
+  }
+  return tensor_category::OTHER;
+}
+
+// ============================================
 // Per-tensor type selection for mixed-precision strategies
 // ============================================
 
@@ -177,37 +298,160 @@ rs_get_qtype_for_tensor(ggml_ftype ftype, const std::string &name,
     return tensor->type;
   }
 
+  auto cat = categorize_tensor(name);
+  int layer = extract_layer_index(name);
+
+  // Heuristic: use more bits for early/late layers
+  auto is_critical_layer = [](int layer) -> bool {
+    return layer >= 0 && (layer < 3 || layer >= 25);  // first 3, last layers
+  };
+
+  auto is_first_last_8th = [](int layer) -> bool {
+    return layer >= 0 && (layer < 4 || layer >= 28);  // ~1/8 of typical 32 layers
+  };
+
+  auto align_check = [tensor](ggml_type qt) -> bool {
+    return tensor->ne[0] % ggml_blck_size(qt) == 0;
+  };
+
   // Select per-tensor type based on the overall strategy
   switch (ftype) {
-  case GGML_FTYPE_MOSTLY_Q4_K_M:
-    // Q4_K_M: embed + lm_head + ctc_lo → Q6_K, everything else → Q4_K
-    if (name.find("embed_tokens.weight") != std::string::npos ||
-        name.find("lm_head.weight") != std::string::npos ||
-        name.find("ctc.ctc_lo.weight") != std::string::npos) {
-      return GGML_TYPE_Q6_K;
+  // ================================================================
+  // Q4_K_M: ~4.5 bpw mixed. Baseline = Q4_K, embed/lm_head = Q6_K
+  // ================================================================
+  case GGML_FTYPE_MOSTLY_Q4_K_M: {
+    if (cat == tensor_category::TOKEN_EMBD ||
+        cat == tensor_category::OUTPUT) {
+      return align_check(GGML_TYPE_Q6_K) ? GGML_TYPE_Q6_K : GGML_TYPE_Q4_K;
     }
-    // Check ne[0] alignment for Q4_K (blck_size=256)
-    if (tensor->ne[0] % ggml_blck_size(GGML_TYPE_Q4_K) != 0) {
-      return tensor->type;
+    if (cat == tensor_category::ATTENTION_V) {
+      return is_critical_layer(layer) ? GGML_TYPE_Q6_K : GGML_TYPE_Q5_K;
     }
-    return GGML_TYPE_Q4_K;
+    if (cat == tensor_category::ATTENTION_OUTPUT) {
+      return is_critical_layer(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K;
+    }
+    if (cat == tensor_category::FFN_DOWN) {
+      return is_first_last_8th(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K;
+    }
+    if (align_check(GGML_TYPE_Q4_K)) return GGML_TYPE_Q4_K;
+    return tensor->type;
+  }
 
-  case GGML_FTYPE_MOSTLY_Q5_K_M:
-    // Q5_K_M: embed + lm_head + ctc_lo → Q6_K, everything else → Q5_K
-    if (name.find("embed_tokens.weight") != std::string::npos ||
-        name.find("lm_head.weight") != std::string::npos ||
-        name.find("ctc.ctc_lo.weight") != std::string::npos) {
-      return GGML_TYPE_Q6_K;
+  // ================================================================
+  // Q5_K_M: ~5.5 bpw mixed. Baseline = Q5_K, embed/lm_head = Q6_K
+  // ================================================================
+  case GGML_FTYPE_MOSTLY_Q5_K_M: {
+    if (cat == tensor_category::TOKEN_EMBD ||
+        cat == tensor_category::OUTPUT) {
+      return align_check(GGML_TYPE_Q6_K) ? GGML_TYPE_Q6_K : GGML_TYPE_Q5_K;
     }
-    if (tensor->ne[0] % ggml_blck_size(GGML_TYPE_Q5_K) != 0) {
-      return tensor->type;
+    if (cat == tensor_category::ATTENTION_V) {
+      return is_critical_layer(layer) ? GGML_TYPE_Q6_K : GGML_TYPE_Q6_K;
     }
-    return GGML_TYPE_Q5_K;
+    if (cat == tensor_category::ATTENTION_OUTPUT ||
+        cat == tensor_category::ATTENTION_Q ||
+        cat == tensor_category::ATTENTION_K) {
+      return is_critical_layer(layer) ? GGML_TYPE_Q6_K : GGML_TYPE_Q5_K;
+    }
+    if (cat == tensor_category::FFN_DOWN) {
+      return is_first_last_8th(layer) ? GGML_TYPE_Q6_K : GGML_TYPE_Q5_K;
+    }
+    if (align_check(GGML_TYPE_Q5_K)) return GGML_TYPE_Q5_K;
+    return tensor->type;
+  }
+
+  // ================================================================
+  // IQ3_XXS: ~3.06 bpw. embed/output → IQ3_S, attn_v → Q4_K
+  // ================================================================
+  case GGML_FTYPE_MOSTLY_IQ3_XXS: {
+    if (cat == tensor_category::TOKEN_EMBD ||
+        cat == tensor_category::OUTPUT) {
+      return align_check(GGML_TYPE_IQ3_S) ? GGML_TYPE_IQ3_S : GGML_TYPE_Q4_K;
+    }
+    if (cat == tensor_category::ATTENTION_V) {
+      return GGML_TYPE_Q4_K;
+    }
+    if (cat == tensor_category::ATTENTION_OUTPUT) {
+      return is_critical_layer(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ3_S;
+    }
+    if (cat == tensor_category::FFN_DOWN) {
+      return is_first_last_8th(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ3_XXS;
+    }
+    if (align_check(GGML_TYPE_IQ3_XXS)) return GGML_TYPE_IQ3_XXS;
+    if (align_check(GGML_TYPE_Q4_K)) return GGML_TYPE_Q4_K;
+    return tensor->type;
+  }
+
+  // ================================================================
+  // IQ3_S: ~3.44 bpw. embed/output → Q4_K, attn_v → Q4_K
+  // ================================================================
+  case GGML_FTYPE_MOSTLY_IQ3_S: {
+    if (cat == tensor_category::TOKEN_EMBD ||
+        cat == tensor_category::OUTPUT) {
+      return align_check(GGML_TYPE_Q4_K) ? GGML_TYPE_Q4_K : GGML_TYPE_Q5_K;
+    }
+    if (cat == tensor_category::ATTENTION_V) {
+      return GGML_TYPE_Q5_K;
+    }
+    if (cat == tensor_category::ATTENTION_OUTPUT) {
+      return is_critical_layer(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K;
+    }
+    if (cat == tensor_category::FFN_DOWN) {
+      return is_first_last_8th(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ3_S;
+    }
+    if (align_check(GGML_TYPE_IQ3_S)) return GGML_TYPE_IQ3_S;
+    if (align_check(GGML_TYPE_Q4_K)) return GGML_TYPE_Q4_K;
+    return tensor->type;
+  }
+
+  // ================================================================
+  // IQ4_NL: ~4.44 bpw. embed/output → Q5_K, attn_v → Q5_K
+  // ================================================================
+  case GGML_FTYPE_MOSTLY_IQ4_NL: {
+    if (cat == tensor_category::TOKEN_EMBD ||
+        cat == tensor_category::OUTPUT) {
+      return align_check(GGML_TYPE_Q5_K) ? GGML_TYPE_Q5_K : GGML_TYPE_Q6_K;
+    }
+    if (cat == tensor_category::ATTENTION_V) {
+      return GGML_TYPE_Q5_K;
+    }
+    if (cat == tensor_category::FFN_DOWN) {
+      return is_first_last_8th(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_IQ4_NL;
+    }
+    if (cat == tensor_category::ATTENTION_OUTPUT) {
+      return is_critical_layer(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_IQ4_NL;
+    }
+    if (align_check(GGML_TYPE_IQ4_NL)) return GGML_TYPE_IQ4_NL;
+    if (align_check(GGML_TYPE_Q4_K)) return GGML_TYPE_Q4_K;
+    return tensor->type;
+  }
+
+  // ================================================================
+  // IQ4_XS: ~4.19 bpw. embed/output → Q5_K, attn_v → Q5_K
+  // ================================================================
+  case GGML_FTYPE_MOSTLY_IQ4_XS: {
+    if (cat == tensor_category::TOKEN_EMBD ||
+        cat == tensor_category::OUTPUT) {
+      return align_check(GGML_TYPE_Q5_K) ? GGML_TYPE_Q5_K : GGML_TYPE_Q6_K;
+    }
+    if (cat == tensor_category::ATTENTION_V) {
+      return GGML_TYPE_Q5_K;
+    }
+    if (cat == tensor_category::FFN_DOWN) {
+      return is_first_last_8th(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ4_XS;
+    }
+    if (cat == tensor_category::ATTENTION_OUTPUT) {
+      return is_critical_layer(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ4_XS;
+    }
+    if (align_check(GGML_TYPE_IQ4_XS)) return GGML_TYPE_IQ4_XS;
+    if (align_check(GGML_TYPE_Q4_K)) return GGML_TYPE_Q4_K;
+    return tensor->type;
+  }
 
   default: {
     // Uniform quantization — resolve ftype → qtype
     ggml_type qtype = ggml_ftype_to_ggml_type(ftype);
-    // Check ne[0] alignment
+    if (qtype == GGML_TYPE_COUNT) return tensor->type;
     if (tensor->ne[0] % ggml_blck_size(qtype) != 0) {
       return tensor->type;
     }
@@ -225,7 +469,8 @@ bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
                                 const std::string &fname_out,
                                 const ggml_ftype ftype, const int nthread,
                                 const std::vector<std::string> &to_quant,
-                                const std::vector<std::string> &to_skip) {
+                                const std::vector<std::string> &to_skip,
+                                const std::string &imatrix_file) {
 
   // Validate that the ftype is supported
   {
@@ -243,6 +488,15 @@ bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
     case GGML_FTYPE_MOSTLY_Q6_K:
     case GGML_FTYPE_MOSTLY_Q4_K_M:
     case GGML_FTYPE_MOSTLY_Q5_K_M:
+    case GGML_FTYPE_MOSTLY_IQ1_M:
+    case GGML_FTYPE_MOSTLY_IQ1_S:
+    case GGML_FTYPE_MOSTLY_IQ2_S:
+    case GGML_FTYPE_MOSTLY_IQ2_XS:
+    case GGML_FTYPE_MOSTLY_IQ2_XXS:
+    case GGML_FTYPE_MOSTLY_IQ3_XXS:
+    case GGML_FTYPE_MOSTLY_IQ3_S:
+    case GGML_FTYPE_MOSTLY_IQ4_NL:
+    case GGML_FTYPE_MOSTLY_IQ4_XS:
       supported = true;
       break;
     default:
@@ -255,6 +509,18 @@ bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
   }
 
   printf("%s: quantizing with strategy ftype=%d ..\n", __func__, ftype);
+
+  // Load importance matrix (activation-aware quantization)
+  IMatrixCollector imatrix_collector;
+  if (!imatrix_file.empty()) {
+      if (!imatrix_collector.load(imatrix_file)) {
+          fprintf(stderr, "%s: failed to load imatrix from %s\n", __func__,
+                  imatrix_file.c_str());
+          return false;
+      }
+      printf("%s: loaded imatrix with %zu entries from %s\n", __func__,
+             imatrix_collector.stats.size(), imatrix_file.c_str());
+  }
 
   size_t total_size_org = 0;
   size_t total_size_new = 0;
@@ -374,6 +640,26 @@ bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
     void *new_data;
     size_t new_size;
 
+    // Imatrix lookup for activation-aware quantization
+    const float *imatrix = nullptr;
+    if (quantize && !imatrix_file.empty()) {
+        imatrix = imatrix_collector.get_imatrix(name, tensor->ne[0]);
+    }
+
+    // IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S require imatrix data.
+    // Fall back to Q4_K for tensors missing imatrix (e.g. embeddings that
+    // use GET_ROWS instead of MUL_MAT, so have no activation statistics).
+    if (quantize && !imatrix && ggml_quantize_requires_imatrix(new_type)) {
+        if (tensor->ne[0] % ggml_blck_size(GGML_TYPE_Q4_K) == 0) {
+            new_type = GGML_TYPE_Q4_K;
+            printf("(no imatrix, fallback Q4_K) ");
+        } else {
+            new_type = tensor->type;
+            quantize = false;
+            printf("(no imatrix, keeping %s) ", ggml_type_name(tensor->type));
+        }
+    }
+
     if (!quantize) {
       new_type = tensor->type;
       new_data = tensor->data;
@@ -381,7 +667,6 @@ bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
       printf("size = %8.3f MB\n", ggml_nbytes(tensor) / 1024.0 / 1024.0);
     } else {
       const int64_t nelements = ggml_nelements(tensor);
-      const float *imatrix = nullptr;
 
       float *f32_data;
       std::vector<float> f32_converted; // only used when input is F16
@@ -456,10 +741,9 @@ bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
          total_size_org / 1024.0 / 1024.0);
   printf("%s: quant size  = %8.2f MB | ftype = %d (%s)\n", __func__,
          total_size_new / 1024.0 / 1024.0, ftype,
-         ftype == GGML_FTYPE_MOSTLY_Q4_K_M ? "Q4_K_M"
-         : ftype == GGML_FTYPE_MOSTLY_Q5_K_M
-             ? "Q5_K_M"
-             : ggml_type_name(ggml_ftype_to_ggml_type(ftype)));
+         ftype == GGML_FTYPE_MOSTLY_Q4_K_M   ? "Q4_K_M"
+         : ftype == GGML_FTYPE_MOSTLY_Q5_K_M ? "Q5_K_M"
+         : ggml_type_name(ggml_ftype_to_ggml_type(ftype)));
 
   return true;
 }

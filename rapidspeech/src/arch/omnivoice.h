@@ -4,6 +4,7 @@
 #include "core/rs_model.h"
 #include "llm_graph.h"
 #include "llm_model.h"
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -143,6 +144,12 @@ struct RVQCodebookWeights {
     struct ggml_tensor *project_out_w = nullptr;  // [64, 1024] decode path
     struct ggml_tensor *project_out_b = nullptr;  // [1024]
     std::vector<float>  embed_sq_cpu;             // CPU copy of embed_sq
+    // CPU-side F32 caches (populated at load time, avoids per-call tensor_get)
+    std::vector<float>  project_in_w_cpu;         // [H * D]
+    std::vector<float>  project_in_b_cpu;         // [D]
+    std::vector<float>  embed_cpu;                // [D * V]
+    std::vector<float>  project_out_w_cpu;        // [D * H]
+    std::vector<float>  project_out_b_cpu;        // [H]
 };
 
 struct RVQCodec {
@@ -342,6 +349,12 @@ public:
     int GetAudioOutput(RSState &state, float **out_data) override;
     void SetDiffusionSteps(int n_steps) override { n_diff_steps_ = n_steps; }
 
+    // Activation statistics callback for imatrix collection.
+    // Called after each ggml_backend_sched_graph_compute during diffusion.
+    void set_imatrix_callback(std::function<void(struct ggml_cgraph *)> cb) {
+        imatrix_cb_ = std::move(cb);
+    }
+
 private:
     RSModelMeta meta_;
     OmniVoiceHParams hparams_;
@@ -386,6 +399,10 @@ private:
     struct ggml_tensor *fc2_w_ = nullptr; // [1024, 256]
     struct ggml_tensor *fc2_b_ = nullptr; // [256]
 
+    // CPU-side F32 caches for fc weights (populated at load time)
+    std::vector<float> fc_w_cpu_;
+    std::vector<float> fc_b_cpu_;
+
     bool codec_loaded_ = false;
     std::string codec_path_;
 
@@ -393,21 +410,33 @@ private:
     int audio_vocab_size_ = 1025;
     int audio_mask_id_ = 1024;
 
+    // Imatrix collection callback (called after each graph compute during diffusion)
+    std::function<void(struct ggml_cgraph *)> imatrix_cb_;
+
+    // Quantization level (detected from tensor types at load time)
+    int quant_level_ = 0;  // 0=F16, 1=Q8_0/Q8_1, 2=Q4_0/Q4_1, 3=Q2_K/Q3_K/other
+
     // Backend for codec weights (always CPU — DAC vocoder has many small conv
     // ops where GPU kernel launch overhead dominates, making CPU ~300x faster)
     ggml_backend_t backend_ = nullptr;
     ggml_backend_t cpu_backend_ = nullptr;
+    struct ggml_context *gguf_data_ = nullptr;  // GGUF weight context (for GPU-resident encoder weights)
 
 #ifdef RS_USE_METAL_DAC
     // Optional Metal GPU backend for DAC vocoder (fused kernels, faster than CPU)
     std::unique_ptr<DACMetalDecoder> dac_metal_;
 #endif
 
+    // GPU-resident GGUF originals for encoder-side weights (used by scheduler graphs)
+    struct ggml_tensor *fc_w_gpu_ = nullptr;
+    struct ggml_tensor *fc_b_gpu_ = nullptr;
+
     // Internal methods
     bool LoadLM(const std::unique_ptr<rs_context_t> &ctx);
     bool LoadCodec(struct ggml_context *gguf_data);
     bool LoadEncoderWeights();
     bool MapTensors(std::map<std::string, struct ggml_tensor *> &tensors);
+    void RedirectEncoderWeightsToGPU();
 
     bool BuildPrompt(OmniVoiceState &state, OmniVoicePrompt &prompt);
     bool RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sched_t sched);
@@ -421,14 +450,18 @@ private:
     // Graph reuse: build LLM graph once, reuse across diffusion steps
     struct DiffusionGraphState;
     bool BuildDiffusionGraph(DiffusionGraphState &gs, const OmniVoicePrompt &prompt,
-                             ggml_backend_sched_t sched, int T_audio);
+                             ggml_backend_sched_t sched, int T_audio,
+                             int override_b_prime = 0);
+    bool BuildCondDiffusionGraph(DiffusionGraphState &gs, const OmniVoicePrompt &prompt,
+                                  ggml_backend_sched_t sched, int T_audio);
     std::vector<float> RunDiffusionGraph(DiffusionGraphState &gs,
                                           const OmniVoicePrompt &prompt,
                                           ggml_backend_sched_t sched);
     void FreeDiffusionGraph(DiffusionGraphState &gs, ggml_backend_sched_t sched);
 
     // Audio encoding for voice cloning
-    std::vector<int32_t> EncodeReferenceAudio(const float *audio_24k, int n_samples);
+    std::vector<int32_t> EncodeReferenceAudio(const float *audio_24k, int n_samples,
+                                                ggml_backend_sched_t sched);
 
     // MaskGIT helpers
     void MaskGITLogSoftmax(float *x, int V);

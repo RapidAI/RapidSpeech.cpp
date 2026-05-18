@@ -44,11 +44,11 @@ static void bpe_build_byte_encoder(std::string byte2str[256]) {
 }
 
 static int bpe_utf8_codepoint(const char *s, int *advance) {
-    unsigned char c = s[0];
+    unsigned char c = (unsigned char)s[0];
     if (c < 0x80) { *advance = 1; return c; }
-    if ((c & 0xE0) == 0xC0) { *advance = 2; return ((c&0x1F)<<6)|(s[1]&0x3F); }
-    if ((c & 0xF0) == 0xE0) { *advance = 3; return ((c&0x0F)<<12)|((s[1]&0x3F)<<6)|(s[2]&0x3F); }
-    if ((c & 0xF8) == 0xF0) { *advance = 4; return ((c&0x07)<<18)|((s[1]&0x3F)<<12)|((s[2]&0x3F)<<6)|(s[3]&0x3F); }
+    if ((c & 0xE0) == 0xC0) { *advance = 2; return ((c&0x1F)<<6)|((unsigned char)s[1]&0x3F); }
+    if ((c & 0xF0) == 0xE0) { *advance = 3; return ((c&0x0F)<<12)|(((unsigned char)s[1]&0x3F)<<6)|((unsigned char)s[2]&0x3F); }
+    if ((c & 0xF8) == 0xF0) { *advance = 4; return ((c&0x07)<<18)|(((unsigned char)s[1]&0x3F)<<12)|(((unsigned char)s[2]&0x3F)<<6)|((unsigned char)s[3]&0x3F); }
     *advance = 1; return c;
 }
 
@@ -368,6 +368,21 @@ std::vector<int> OmniVoiceBPETokenizer::encode(const std::string &text, bool add
     }
 
     if (add_eos && eos_id >= 0) ids.push_back(eos_id);
+
+    // Diagnostic: log first 20 token IDs for debugging platform-specific issues
+    static int diag_counter = 0;
+    if (diag_counter < 5) {
+        diag_counter++;
+        size_t n_show = std::min(ids.size(), (size_t)20);
+        std::string tok_str;
+        for (size_t ti = 0; ti < n_show; ti++) {
+            if (ti > 0) tok_str += ",";
+            tok_str += std::to_string(ids[ti]);
+        }
+        if (ids.size() > 20) tok_str += ",...";
+        RS_LOG_INFO("[BPE-DIAG] encode '%s' -> %zu tokens: [%s]",
+                    text.c_str(), ids.size(), tok_str.c_str());
+    }
     return ids;
 }
 
@@ -554,6 +569,10 @@ bool OmniVoiceModel::Load(const std::unique_ptr<rs_context_t> &ctx, ggml_backend
         codec_loaded_ = false;
     } else {
         codec_loaded_ = true;
+        // Redirect encoder-side weight pointers to GGUF originals (GPU-resident)
+        // so scheduler graphs in EncodeReferenceAudio use GPU-resident weights
+        // instead of CPU copies. Decoder weights (DAC vocoder) stay on CPU.
+        RedirectEncoderWeightsToGPU();
 
 #ifdef RS_USE_METAL_DAC
         // Try to initialize the Metal GPU backend for DAC vocoder (fused kernels).
@@ -662,6 +681,26 @@ bool OmniVoiceModel::LoadLM(const std::unique_ptr<rs_context_t> &ctx) {
         RS_LOG_INFO("L0 norms: attn_norm=%p q_norm=%p k_norm=%p ffn_norm=%p",
                     (void*)l0.attn_norm, (void*)l0.attn_q_norm,
                     (void*)l0.attn_k_norm, (void*)l0.ffn_norm);
+
+        // Detect quantization level from first layer weight tensor type
+        // quant_level: 0=F16, 1=high quant (Q8/Q5/Q6), 2=mid quant (Q4), 3=low quant (Q2/Q3)
+        if (l0.wq) {
+            switch (l0.wq->type) {
+                case GGML_TYPE_F16:  quant_level_ = 0; break;
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_Q8_1:
+                case GGML_TYPE_Q5_K:
+                case GGML_TYPE_Q6_K:
+                case GGML_TYPE_Q8_K: quant_level_ = 1; break;
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q4_K: quant_level_ = 2; break;
+                case GGML_TYPE_Q2_K:
+                case GGML_TYPE_Q3_K: quant_level_ = 3; break;
+                default:             quant_level_ = 3; break;
+            }
+        }
+        RS_LOG_INFO("OmniVoice: quant_level=%d (type=%d)", quant_level_, (int)(l0.wq ? l0.wq->type : -1));
     }
 
     // Map audio-specific tensors
@@ -680,6 +719,127 @@ bool OmniVoiceModel::LoadLM(const std::unique_ptr<rs_context_t> &ctx) {
     }
 
     return true;
+}
+
+void OmniVoiceModel::RedirectEncoderWeightsToGPU() {
+    if (!gguf_data_) return;
+
+    // Helper: redirect a tensor pointer to its GGUF original (GPU-resident)
+    auto redirect = [&](const char *name, struct ggml_tensor *&ptr) {
+        struct ggml_tensor *t = ggml_get_tensor(gguf_data_, name);
+        if (t) ptr = t;
+    };
+
+    char tname[256];
+
+    // HuBERT feature extractor
+    for (int i = 0; i < 7; i++) {
+        snprintf(tname, sizeof(tname), "semantic_model.feature_extractor.conv_layers.%d.conv.weight", i);
+        redirect(tname, hubert_feat_.conv[i].conv_w);
+        if (i == 0) {
+            snprintf(tname, sizeof(tname), "semantic_model.feature_extractor.conv_layers.%d.layer_norm.weight", i);
+            redirect(tname, hubert_feat_.conv[i].ln_w);
+            snprintf(tname, sizeof(tname), "semantic_model.feature_extractor.conv_layers.%d.layer_norm.bias", i);
+            redirect(tname, hubert_feat_.conv[i].ln_b);
+        }
+    }
+
+    // HuBERT feature projection
+    redirect("semantic_model.feature_projection.layer_norm.weight", hubert_proj_.ln_w);
+    redirect("semantic_model.feature_projection.layer_norm.bias", hubert_proj_.ln_b);
+    redirect("semantic_model.feature_projection.projection.weight", hubert_proj_.proj_w);
+    redirect("semantic_model.feature_projection.projection.bias", hubert_proj_.proj_b);
+
+    // HuBERT encoder init
+    redirect("semantic_model.encoder.pos_conv_embed.conv.weight", hubert_enc_init_.pos_conv_w);
+    redirect("semantic_model.encoder.pos_conv_embed.conv.bias", hubert_enc_init_.pos_conv_b);
+    redirect("semantic_model.encoder.layer_norm.weight", hubert_enc_init_.ln_w);
+    redirect("semantic_model.encoder.layer_norm.bias", hubert_enc_init_.ln_b);
+
+    // HuBERT encoder layers (12 layers)
+    for (int i = 0; i < HUBERT_NUM_LAYERS; i++) {
+        HubertLayerWeights &l = hubert_layers_[i];
+        snprintf(tname, sizeof(tname), "semantic_model.encoder.layers.%d.layer_norm.weight", i);
+        redirect(tname, l.ln_attn_w);
+        snprintf(tname, sizeof(tname), "semantic_model.encoder.layers.%d.layer_norm.bias", i);
+        redirect(tname, l.ln_attn_b);
+        snprintf(tname, sizeof(tname), "semantic_model.encoder.layers.%d.attention.q_proj.weight", i);
+        redirect(tname, l.attn.q_w);
+        snprintf(tname, sizeof(tname), "semantic_model.encoder.layers.%d.attention.q_proj.bias", i);
+        redirect(tname, l.attn.q_b);
+        snprintf(tname, sizeof(tname), "semantic_model.encoder.layers.%d.attention.k_proj.weight", i);
+        redirect(tname, l.attn.k_w);
+        snprintf(tname, sizeof(tname), "semantic_model.encoder.layers.%d.attention.k_proj.bias", i);
+        redirect(tname, l.attn.k_b);
+        snprintf(tname, sizeof(tname), "semantic_model.encoder.layers.%d.attention.v_proj.weight", i);
+        redirect(tname, l.attn.v_w);
+        snprintf(tname, sizeof(tname), "semantic_model.encoder.layers.%d.attention.v_proj.bias", i);
+        redirect(tname, l.attn.v_b);
+        snprintf(tname, sizeof(tname), "semantic_model.encoder.layers.%d.attention.out_proj.weight", i);
+        redirect(tname, l.attn.o_w);
+        snprintf(tname, sizeof(tname), "semantic_model.encoder.layers.%d.attention.out_proj.bias", i);
+        redirect(tname, l.attn.o_b);
+        snprintf(tname, sizeof(tname), "semantic_model.encoder.layers.%d.final_layer_norm.weight", i);
+        redirect(tname, l.ln_ffn_w);
+        snprintf(tname, sizeof(tname), "semantic_model.encoder.layers.%d.final_layer_norm.bias", i);
+        redirect(tname, l.ln_ffn_b);
+        snprintf(tname, sizeof(tname), "semantic_model.encoder.layers.%d.feed_forward.intermediate_dense.weight", i);
+        redirect(tname, l.ffn.w1_w);
+        snprintf(tname, sizeof(tname), "semantic_model.encoder.layers.%d.feed_forward.intermediate_dense.bias", i);
+        redirect(tname, l.ffn.w1_b);
+        snprintf(tname, sizeof(tname), "semantic_model.encoder.layers.%d.feed_forward.output_dense.weight", i);
+        redirect(tname, l.ffn.w2_w);
+        snprintf(tname, sizeof(tname), "semantic_model.encoder.layers.%d.feed_forward.output_dense.bias", i);
+        redirect(tname, l.ffn.w2_b);
+    }
+
+    // Semantic encoder
+    redirect("encoder_semantic.conv.weight", sem_enc_.c1w);
+    for (int i = 0; i < 2; i++) {
+        snprintf(tname, sizeof(tname), "encoder_semantic.conv_blocks.%d.conv.weight", i);
+        redirect(tname, sem_enc_.blk[i].cw);
+        snprintf(tname, sizeof(tname), "encoder_semantic.conv_blocks.%d.conv.bias", i);
+        redirect(tname, sem_enc_.blk[i].cb);
+        for (int r = 0; r < 2; r++) {
+            snprintf(tname, sizeof(tname), "encoder_semantic.conv_blocks.%d.res_units.%d.conv1.weight", i, r);
+            redirect(tname, sem_enc_.blk[i].ru[r].c1w);
+            snprintf(tname, sizeof(tname), "encoder_semantic.conv_blocks.%d.res_units.%d.conv2.weight", i, r);
+            redirect(tname, sem_enc_.blk[i].ru[r].c2w);
+        }
+    }
+
+    // DAC encoder
+    redirect("acoustic_encoder.conv1.weight", dac_enc_.c1w);
+    redirect("acoustic_encoder.conv1.bias", dac_enc_.c1b);
+    redirect("acoustic_encoder.conv2.weight", dac_enc_.c2w);
+    redirect("acoustic_encoder.conv2.bias", dac_enc_.c2b);
+    redirect("acoustic_encoder.snake1.alpha", dac_enc_.s_final.a);
+    for (int i = 0; i < DAC_NUM_BLOCKS; i++) {
+        DACEncBlockWeights &b = dac_enc_.blk[i];
+        snprintf(tname, sizeof(tname), "acoustic_encoder.block.%d.snake1.alpha", i);
+        redirect(tname, b.s1.a);
+        snprintf(tname, sizeof(tname), "acoustic_encoder.block.%d.conv1.weight", i);
+        redirect(tname, b.cw);
+        snprintf(tname, sizeof(tname), "acoustic_encoder.block.%d.conv1.bias", i);
+        redirect(tname, b.cb);
+        for (int r = 0; r < DAC_RES_UNITS; r++) {
+            DACResUnitWeights &ru = b.ru[r];
+            snprintf(tname, sizeof(tname), "acoustic_encoder.block.%d.res_unit%d.snake1.alpha", i, r+1);
+            redirect(tname, ru.s1.a);
+            snprintf(tname, sizeof(tname), "acoustic_encoder.block.%d.res_unit%d.conv1.weight", i, r+1);
+            redirect(tname, ru.c1w);
+            snprintf(tname, sizeof(tname), "acoustic_encoder.block.%d.res_unit%d.conv1.bias", i, r+1);
+            redirect(tname, ru.c1b);
+            snprintf(tname, sizeof(tname), "acoustic_encoder.block.%d.res_unit%d.snake2.alpha", i, r+1);
+            redirect(tname, ru.s2.a);
+            snprintf(tname, sizeof(tname), "acoustic_encoder.block.%d.res_unit%d.conv2.weight", i, r+1);
+            redirect(tname, ru.c2w);
+            snprintf(tname, sizeof(tname), "acoustic_encoder.block.%d.res_unit%d.conv2.bias", i, r+1);
+            redirect(tname, ru.c2b);
+        }
+    }
+
+    RS_LOG_INFO("OmniVoice: encoder weights redirected to GGUF originals (GPU-resident)");
 }
 
 bool OmniVoiceModel::MapTensors(std::map<std::string, struct ggml_tensor *> &tensors) {
@@ -1257,6 +1417,69 @@ bool OmniVoiceModel::LoadCodec(struct ggml_context *gguf_data) {
         }
     }
 
+    // Pre-extract RVQ codebook weights into F32 CPU caches (avoids per-call
+    // ggml_backend_tensor_get in the hot RVQ encode path during voice cloning)
+    {
+        auto tensor_to_f32 = [](struct ggml_tensor *t, std::vector<float> &buf) {
+            if (!t || buf.empty()) return;
+            size_t n = buf.size();
+            size_t ts = ggml_type_size(t->type);
+            if (ts == sizeof(float)) {
+                ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
+            } else if (ts == sizeof(uint16_t)) {
+                std::vector<uint16_t> f16(n);
+                ggml_backend_tensor_get(t, f16.data(), 0, n * sizeof(uint16_t));
+                for (size_t i = 0; i < n; i++)
+                    buf[i] = ggml_fp16_to_fp32(f16[i]);
+            }
+        };
+        int H = rvq_.hidden, D = rvq_.codebook_dim, V = rvq_.codebook_size;
+        for (int k = 0; k < rvq_.num_codebooks; k++) {
+            auto &cb = rvq_.cb[k];
+            cb.project_in_w_cpu.resize((size_t)H * D);
+            cb.project_in_b_cpu.resize(D);
+            cb.embed_cpu.resize((size_t)D * V);
+            cb.project_out_w_cpu.resize((size_t)D * H);
+            cb.project_out_b_cpu.resize(H);
+            tensor_to_f32(cb.project_in_w, cb.project_in_w_cpu);
+            tensor_to_f32(cb.project_in_b, cb.project_in_b_cpu);
+            tensor_to_f32(cb.embed, cb.embed_cpu);
+            tensor_to_f32(cb.project_out_w, cb.project_out_w_cpu);
+            tensor_to_f32(cb.project_out_b, cb.project_out_b_cpu);
+        }
+    }
+
+    // Pre-extract fc/fc2 weights into CPU F32 caches
+    {
+        auto tensor_to_f32 = [](struct ggml_tensor *t, std::vector<float> &buf) {
+            if (!t || buf.empty()) return;
+            size_t n = buf.size();
+            size_t ts = ggml_type_size(t->type);
+            if (ts == sizeof(float)) {
+                ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
+            } else if (ts == sizeof(uint16_t)) {
+                std::vector<uint16_t> f16(n);
+                ggml_backend_tensor_get(t, f16.data(), 0, n * sizeof(uint16_t));
+                for (size_t i = 0; i < n; i++)
+                    buf[i] = ggml_fp16_to_fp32(f16[i]);
+            }
+        };
+        if (fc_w_) {
+            size_t n = (size_t)fc_w_->ne[0] * fc_w_->ne[1];
+            fc_w_cpu_.resize(n);
+            tensor_to_f32(fc_w_, fc_w_cpu_);
+        }
+        if (fc_b_) {
+            fc_b_cpu_.resize(fc_b_->ne[0]);
+            tensor_to_f32(fc_b_, fc_b_cpu_);
+        }
+    }
+
+    // Save GGUF context reference for GPU-resident weight access
+    gguf_data_ = gguf_data;
+    fc_w_gpu_ = ggml_get_tensor(gguf_data, "fc.weight");
+    fc_b_gpu_ = ggml_get_tensor(gguf_data, "fc.bias");
+
     // Log encoder status
     int enc_ok = 0;
     for (int k = 0; k < rvq_.num_codebooks; k++)
@@ -1371,38 +1594,13 @@ static bool rvq_encode_cpu(const RVQCodec &rvq, const float *embeddings,
 
     for (int k = 0; k < K; k++) {
         const auto &cb = rvq.cb[k];
-        if (!cb.embed || !cb.project_in_w || cb.embed_sq_cpu.empty()) return false;
+        if (cb.project_in_w_cpu.empty() || cb.embed_cpu.empty() || cb.embed_sq_cpu.empty()) return false;
 
-        // Helper: read tensor data as F32, handling F16→F32 conversion
-        auto get_as_f32 = [](const struct ggml_tensor *t, std::vector<float> &dst) {
-            size_t n = dst.size();
-            size_t ts = ggml_type_size(t->type);
-            if (ts == sizeof(float)) {
-                ggml_backend_tensor_get(t, dst.data(), 0, n * sizeof(float));
-            } else if (ts == sizeof(uint16_t)) {
-                std::vector<uint16_t> buf(n);
-                ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(uint16_t));
-                for (size_t i = 0; i < n; i++)
-                    dst[i] = ggml_fp16_to_fp32(buf[i]);
-            }
-        };
-
-        // Download weights to CPU
-        std::vector<float> proj_w(H * D), proj_b(D), emb(D * V);
-        get_as_f32(cb.project_in_w, proj_w);
-        get_as_f32(cb.project_in_b, proj_b);
-        get_as_f32(cb.embed, emb);
-
-        // Download project_out weights (for decoding back to residual space)
-        std::vector<float> out_w, out_b;
-        if (k + 1 < K && cb.project_out_w) {
-            out_w.resize(D * H);
-            get_as_f32(cb.project_out_w, out_w);
-        }
-        if (k + 1 < K && cb.project_out_b) {
-            out_b.resize(H);
-            get_as_f32(cb.project_out_b, out_b);
-        }
+        const float *proj_w = cb.project_in_w_cpu.data();
+        const float *proj_b = cb.project_in_b_cpu.data();
+        const float *emb    = cb.embed_cpu.data();
+        const float *out_w  = cb.project_out_w_cpu.empty() ? nullptr : cb.project_out_w_cpu.data();
+        const float *out_b  = cb.project_out_b_cpu.empty() ? nullptr : cb.project_out_b_cpu.data();
 
         for (int t = 0; t < T; t++) {
             const float *r = residual.data() + t * H;
@@ -1439,12 +1637,12 @@ static bool rvq_encode_cpu(const RVQCodec &rvq, const float *embeddings,
                 int code = codes[k * T + t];
                 float *r = residual.data() + t * H;
 
-                if (!out_w.empty()) {
+                if (out_w) {
                     // Decode: decoded = project_out_w @ q_emb + project_out_b
                     // ggml layout [ne0=D, ne1=H]: element (ne0=d, ne1=h) at flat d + h*D
                     // embed layout [ne0=D, ne1=V]: element (ne0=d, ne1=code) at flat d + code*D
                     for (int h = 0; h < H; h++) {
-                        float s = out_b.empty() ? 0.0f : out_b[h];
+                        float s = out_b ? out_b[h] : 0.0f;
                         for (int d = 0; d < D; d++)
                             s += out_w[d + h * D] * emb[d + code * D];
                         r[h] -= s;
@@ -1851,7 +2049,8 @@ static struct ggml_tensor *dac_encoder_graph(
 // =====================================================================
 
 std::vector<int32_t> OmniVoiceModel::EncodeReferenceAudio(const float *audio_24k,
-                                                           int n_samples) {
+                                                           int n_samples,
+                                                           ggml_backend_sched_t sched) {
     if (n_samples <= 0) return {};
 
     // Resample to 16kHz for HuBERT
@@ -2006,22 +2205,24 @@ std::vector<int32_t> OmniVoiceModel::EncodeReferenceAudio(const float *audio_24k
         struct ggml_cgraph *gf = ggml_new_graph_custom(gctx, n_max_nodes, false);
         ggml_build_forward_expand(gf, sem);
 
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(gctx, cpu_backend_);
-        if (!buf) { ggml_free(gctx); return {}; }
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+            RS_LOG_ERR("OmniVoice: sched_alloc_graph failed (HuBERT)");
+            ggml_free(gctx);
+            return {};
+        }
 
         ggml_backend_tensor_set(ggml_get_tensor(gctx, "audio_16k"), padded.data(), 0,
                                 n_padded * sizeof(float));
-        ggml_backend_cpu_set_n_threads(cpu_backend_, 4);
-        if (ggml_backend_graph_compute(cpu_backend_, gf) != GGML_STATUS_SUCCESS) {
+        if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
             RS_LOG_ERR("OmniVoice: HuBERT graph compute failed");
-            ggml_backend_buffer_free(buf);
+            ggml_backend_sched_reset(sched);
             ggml_free(gctx);
             return {};
         }
 
         struct ggml_tensor *sem_out = ggml_get_tensor(gctx, "semantic_out");
         if (!sem_out) {
-            ggml_backend_buffer_free(buf);
+            ggml_backend_sched_reset(sched);
             ggml_free(gctx);
             return {};
         }
@@ -2031,7 +2232,8 @@ std::vector<int32_t> OmniVoiceModel::EncodeReferenceAudio(const float *audio_24k
         semantic_feat.resize((size_t)T_s * C_sem);
         ggml_backend_tensor_get(sem_out, semantic_feat.data(), 0,
                                 semantic_feat.size() * sizeof(float));
-        ggml_backend_buffer_free(buf);
+
+        ggml_backend_sched_reset(sched);
         ggml_free(gctx);
 
         // Diagnostic: semantic feature statistics
@@ -2103,8 +2305,11 @@ std::vector<int32_t> OmniVoiceModel::EncodeReferenceAudio(const float *audio_24k
         struct ggml_cgraph *gf = ggml_new_graph_custom(gctx, n_max_nodes, false);
         ggml_build_forward_expand(gf, acoustic);
 
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(gctx, cpu_backend_);
-        if (!buf) { ggml_free(gctx); return {}; }
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+            RS_LOG_ERR("OmniVoice: sched_alloc_graph failed (DAC encoder)");
+            ggml_free(gctx);
+            return {};
+        }
 
         ggml_backend_tensor_set(ggml_get_tensor(gctx, "audio_24k"), dac_audio, 0,
                                 dac_n_samples * sizeof(float));
@@ -2128,17 +2333,16 @@ std::vector<int32_t> OmniVoiceModel::EncodeReferenceAudio(const float *audio_24k
         }
         set_enc_inv_b(dac_enc_.s_final.inv_b, "enc_inv_b_sfinal");
 
-        ggml_backend_cpu_set_n_threads(cpu_backend_, 4);
-        if (ggml_backend_graph_compute(cpu_backend_, gf) != GGML_STATUS_SUCCESS) {
+        if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
             RS_LOG_ERR("OmniVoice: DAC encoder graph compute failed");
-            ggml_backend_buffer_free(buf);
+            ggml_backend_sched_reset(sched);
             ggml_free(gctx);
             return {};
         }
 
         struct ggml_tensor *ac_out = ggml_get_tensor(gctx, "acoustic_out");
         if (!ac_out) {
-            ggml_backend_buffer_free(buf);
+            ggml_backend_sched_reset(sched);
             ggml_free(gctx);
             return {};
         }
@@ -2148,7 +2352,8 @@ std::vector<int32_t> OmniVoiceModel::EncodeReferenceAudio(const float *audio_24k
         acoustic_feat.resize((size_t)T_a * C_a);
         ggml_backend_tensor_get(ac_out, acoustic_feat.data(), 0,
                                 acoustic_feat.size() * sizeof(float));
-        ggml_backend_buffer_free(buf);
+
+        ggml_backend_sched_reset(sched);
         ggml_free(gctx);
 
         // Diagnostic: acoustic feature statistics
@@ -2208,54 +2413,42 @@ std::vector<int32_t> OmniVoiceModel::EncodeReferenceAudio(const float *audio_24k
     }
 
     std::vector<float> projected;
-    if (fc_w_ && C_in == (int)fc_w_->ne[0]) {
-        C_out = (int)fc_w_->ne[1];
+    if (fc_w_ && C_in == (int)fc_w_->ne[0] && fc_w_gpu_ && fc_b_gpu_) {
+        C_out = (int)fc_w_gpu_->ne[1];
         projected.resize((size_t)T_s * C_out, 0.0f);
 
-        // Read fc_w, converting from F16 if needed
-        size_t n_weights = (size_t)C_in * C_out;
-        size_t type_sz = ggml_type_size(fc_w_->type);
-        std::vector<float> fc_w_cpu(n_weights);
+        // GPU fc via scheduler mul_mat
+        struct ggml_init_params gp = {
+            (size_t)1024 * ggml_tensor_overhead() + (16 << 10),
+            nullptr, true};
+        struct ggml_context *gctx = ggml_init(gp);
+        if (gctx) {
+            // fc_w_gpu_ is [C_in, C_out] (ne0=C_in, ne1=C_out) — correct for ggml mul_mat.
+            // Input: combined is [T_s, C_in] row-major, same flat layout as [C_in, T_s]
+            // (ne0=C_in, ne1=T_s) — no transpose needed.
+            struct ggml_tensor *inp = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, C_in, T_s);
+            ggml_set_name(inp, "fc_inp");
+            ggml_set_input(inp);
 
-        // The fc weight has acoustic column RMS ~7.6x larger than semantic columns
-        // (verified against original PyTorch safetensors). This partially compensates
-        // for the acoustic feature scale (~15611) being much larger than semantic (~0.3),
-        // but acoustic features still dominate the projection by ~6500x.
-        if (type_sz == sizeof(float)) {
-            ggml_backend_tensor_get(fc_w_, fc_w_cpu.data(), 0, n_weights * sizeof(float));
-        } else if (type_sz == sizeof(uint16_t)) {
-            std::vector<uint16_t> f16_buf(n_weights);
-            ggml_backend_tensor_get(fc_w_, f16_buf.data(), 0, n_weights * sizeof(uint16_t));
-            for (size_t i = 0; i < n_weights; i++)
-                fc_w_cpu[i] = ggml_fp16_to_fp32(f16_buf[i]);
-        } else {
-            RS_LOG_ERR("OmniVoice: fc_w unsupported type size %zu", type_sz);
-            return {};
-        }
+            struct ggml_tensor *out = ggml_mul_mat(gctx, fc_w_gpu_, inp);
+            out = ggml_add(gctx, out, fc_b_gpu_);
+            ggml_set_name(out, "fc_out");
+            ggml_set_output(out);
 
-        std::vector<float> fc_b_cpu;
-        if (fc_b_) {
-            fc_b_cpu.resize(C_out);
-            // fc_b is typically F32 (1D tensor), but handle F16 defensively
-            size_t b_type_sz = ggml_type_size(fc_b_->type);
-            if (b_type_sz == sizeof(float)) {
-                ggml_backend_tensor_get(fc_b_, fc_b_cpu.data(), 0, C_out * sizeof(float));
-            } else if (b_type_sz == sizeof(uint16_t)) {
-                std::vector<uint16_t> f16_buf(C_out);
-                ggml_backend_tensor_get(fc_b_, f16_buf.data(), 0, C_out * sizeof(uint16_t));
-                for (size_t i = 0; i < (size_t)C_out; i++)
-                    fc_b_cpu[i] = ggml_fp16_to_fp32(f16_buf[i]);
+            struct ggml_cgraph *gf = ggml_new_graph(gctx);
+            ggml_build_forward_expand(gf, out);
+
+            if (ggml_backend_sched_alloc_graph(sched, gf)) {
+                ggml_backend_tensor_set(inp, combined.data(), 0,
+                                        (size_t)T_s * C_in * sizeof(float));
+
+                if (ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS) {
+                    ggml_backend_tensor_get(out, projected.data(), 0,
+                                            projected.size() * sizeof(float));
+                }
             }
-        }
-
-        // fc_w in ggml ne0=C_in: fc_weight[out=o, in=i] at flat i + o*C_in
-        for (int t = 0; t < T_s; t++) {
-            for (int o = 0; o < C_out; o++) {
-                float s = fc_b_cpu.empty() ? 0.0f : fc_b_cpu[o];
-                for (int i = 0; i < C_in; i++)
-                    s += fc_w_cpu[(size_t)o * C_in + i] * combined[(size_t)t * C_in + i];
-                projected[(size_t)t * C_out + o] = s;
-            }
+            ggml_backend_sched_reset(sched);
+            ggml_free(gctx);
         }
     } else {
         // No fc or dimension mismatch — use combined directly
@@ -2372,7 +2565,7 @@ bool OmniVoiceModel::PushReferenceAudio(RSState &state, const float *samples,
     }
 
     // Run full encode pipeline (HuBERT + SemanticEncoder + DAC encoder + RVQ)
-    std::vector<int32_t> codes = EncodeReferenceAudio(ref_data, ref_len);
+    std::vector<int32_t> codes = EncodeReferenceAudio(ref_data, ref_len, sched);
     if (codes.empty()) {
         RS_LOG_WARN("OmniVoice: encode failed, using placeholder prompt");
         s.n_prompt_frames = 16;
@@ -2422,12 +2615,8 @@ bool OmniVoiceModel::BuildPrompt(OmniVoiceState &state, OmniVoicePrompt &prompt)
         style_ids = llm_model_->vocab().tokenize(style_text, false);
     }
 
-    // Do NOT combine ref_text with target text for voice cloning.
-    // Combining causes prompt speech leakage where reference audio content
-    // bleeds into synthesized target audio (model generates tokens for both
-    // ref_text and target_text in the target window).
-    // For pure TTS (no ref), ref_text is empty so combining would be a no-op.
-    std::string full_text = state.text_original;
+    // Include reference text in prompt for voice cloning
+    std::string full_text = prompt_combine_text(state.text_original, state.ref_text);
     std::string wrapped = "<|text_start|>" + full_text + "<|text_end|>";
 
     std::vector<int> text_ids;
@@ -2562,14 +2751,14 @@ struct OmniVoiceModel::DiffusionGraphState {
     bool allocated = false;
 };
 
-// Build the full LLM graph once. The graph structure is identical across all
-// MaskGIT diffusion steps; only the audio token values change (updated via
-// t_shifted and t_text_ids inputs each step).
+// Build the full LLM graph once — reused across all MaskGIT diffusion steps.
+// When override_b_prime=1, builds a cond-only graph (B'=1) for CFG cache steps.
 bool OmniVoiceModel::BuildDiffusionGraph(DiffusionGraphState &gs,
                                           const OmniVoicePrompt &prompt,
-                                          ggml_backend_sched_t sched, int T_audio) {
-    gs.B_prime = prompt.B_prime;
-    gs.graph_b = prompt.B_prime;
+                                          ggml_backend_sched_t sched, int T_audio,
+                                          int override_b_prime) {
+    gs.B_prime = (override_b_prime > 0) ? override_b_prime : prompt.B_prime;
+    gs.graph_b = gs.B_prime;
     gs.K = prompt.K;
     gs.S = prompt.S_max;
     gs.V = audio_vocab_size_;
@@ -2765,11 +2954,15 @@ bool OmniVoiceModel::BuildDiffusionGraph(DiffusionGraphState &gs,
         ggml_set_name(gs.cond_audio, "cond_audio_logits");
         ggml_set_output(gs.cond_audio);
 
-        gs.uncond_audio = ggml_cont(gctx, ggml_view_4d(gctx, gs.logits_flat, V, K, T_audio, 1,
-            gs.logits_flat->nb[1], gs.logits_flat->nb[2], gs.logits_flat->nb[3],
-            0 * gs.logits_flat->nb[2] + 1 * gs.logits_flat->nb[3]));
-        ggml_set_name(gs.uncond_audio, "uncond_audio_logits");
-        ggml_set_output(gs.uncond_audio);
+        if (B_prime > 1) {
+            gs.uncond_audio = ggml_cont(gctx, ggml_view_4d(gctx, gs.logits_flat, V, K, T_audio, 1,
+                gs.logits_flat->nb[1], gs.logits_flat->nb[2], gs.logits_flat->nb[3],
+                0 * gs.logits_flat->nb[2] + 1 * gs.logits_flat->nb[3]));
+            ggml_set_name(gs.uncond_audio, "uncond_audio_logits");
+            ggml_set_output(gs.uncond_audio);
+        } else {
+            gs.uncond_audio = nullptr;
+        }
     } else {
         ggml_set_name(gs.logits_flat, "audio_logits");
         ggml_set_output(gs.logits_flat);
@@ -2778,7 +2971,8 @@ bool OmniVoiceModel::BuildDiffusionGraph(DiffusionGraphState &gs,
     gs.cgraph = ggml_new_graph_custom(gctx, n_max_nodes, false);
     if (T_audio > 0) {
         ggml_build_forward_expand(gs.cgraph, gs.cond_audio);
-        ggml_build_forward_expand(gs.cgraph, gs.uncond_audio);
+        if (B_prime > 1)
+            ggml_build_forward_expand(gs.cgraph, gs.uncond_audio);
     } else {
         ggml_build_forward_expand(gs.cgraph, gs.logits_flat);
     }
@@ -2798,9 +2992,17 @@ bool OmniVoiceModel::BuildDiffusionGraph(DiffusionGraphState &gs,
     return true;
 }
 
+// Build a cond-only graph (B_prime=1) for CFG cache steps — skips uncond branch.
+bool OmniVoiceModel::BuildCondDiffusionGraph(DiffusionGraphState &gs,
+                                              const OmniVoicePrompt &prompt,
+                                              ggml_backend_sched_t sched, int T_audio) {
+    return BuildDiffusionGraph(gs, prompt, sched, T_audio, 1);
+}
+
 // Execute one forward pass using the pre-built graph. Only updates inputs that
 // may have changed since the previous step (shifted audio tokens, text_ids,
 // mask/inv_mask; the latter two are constant in practice but updated defensively).
+// When gs.B_prime == 1 (cond-only mode), the graph only returns cond logits.
 std::vector<float> OmniVoiceModel::RunDiffusionGraph(DiffusionGraphState &gs,
                                                       const OmniVoicePrompt &prompt,
                                                       ggml_backend_sched_t sched) {
@@ -2810,7 +3012,7 @@ std::vector<float> OmniVoiceModel::RunDiffusionGraph(DiffusionGraphState &gs,
     const int V = gs.V;
     const int T_audio = gs.T_audio;
 
-    // Pre-compute input data
+    // Pre-compute input data (read batch 0 from prompt for cond-only graphs)
     std::vector<int32_t> shifted((size_t)K * B_prime * S);
     std::vector<int32_t> text_ids_buf((size_t)B_prime * S);
     for (int b = 0; b < B_prime; b++) {
@@ -2846,13 +3048,24 @@ std::vector<float> OmniVoiceModel::RunDiffusionGraph(DiffusionGraphState &gs,
         return {};
     }
 
+    // Notify imatrix collector (if attached)
+    if (imatrix_cb_) {
+        imatrix_cb_(gs.cgraph);
+    }
+
     // Read output
     std::vector<float> out;
     if (T_audio > 0) {
         size_t per = (size_t)V * K * T_audio;
-        out.resize(2 * per);
-        ggml_backend_tensor_get(gs.cond_audio, out.data(), 0, per * sizeof(float));
-        ggml_backend_tensor_get(gs.uncond_audio, out.data() + per, 0, per * sizeof(float));
+        if (gs.uncond_audio) {
+            out.resize(2 * per);
+            ggml_backend_tensor_get(gs.cond_audio, out.data(), 0, per * sizeof(float));
+            ggml_backend_tensor_get(gs.uncond_audio, out.data() + per, 0, per * sizeof(float));
+        } else {
+            // Cond-only mode: return just cond logits
+            out.resize(per);
+            ggml_backend_tensor_get(gs.cond_audio, out.data(), 0, per * sizeof(float));
+        }
     } else {
         size_t n = ggml_nelements(gs.logits_flat);
         out.resize(n);
@@ -3236,8 +3449,17 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
     const int Sref = state.n_prompt_frames;
     const int V = audio_vocab_size_;
     const int mask_id = audio_mask_id_;
-    const int n_steps = n_diff_steps_;
     const float tau = hparams_.diffusion_tau;
+
+    // Auto-scale diffusion steps based on target frame count.
+    // Longer text needs more steps to avoid demasking too many tokens
+    // per step, which causes quality collapse.  Target: ~10 frames/step.
+    const int n_steps_user = n_diff_steps_;
+    const int n_steps = std::max(n_steps_user, std::min(T / 10, 128));
+    if (n_steps != n_steps_user) {
+        RS_LOG_INFO("MaskGIT: auto-scaled steps %d -> %d (T=%d, user=%d)",
+                    n_steps_user, n_steps, T, n_steps_user);
+    }
 
     // Build prompt
     OmniVoicePrompt prompt;
@@ -3275,8 +3497,21 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
 
     MaskgitConfig mg_cfg;
     mg_cfg.num_step = n_steps;
-    mg_cfg.guidance_scale = 2.0f;
     mg_cfg.t_shift = tau;
+
+    // Quantization-aware CFG: higher guidance helps the conditioning signal
+    // overcome weight quantization noise for more stable long-form synthesis.
+    float logit_temperature = 1.0f;
+    if (quant_level_ >= 2) {
+        mg_cfg.guidance_scale = 3.0f;
+        logit_temperature = 0.85f;
+    } else if (quant_level_ >= 1) {
+        mg_cfg.guidance_scale = 2.5f;
+        logit_temperature = 0.9f;
+    } else {
+        mg_cfg.guidance_scale = 2.0f;
+    }
+
     // Build attention mask (constant across steps) before building the graph
     std::vector<uint16_t> attn_f16;
     if (!prompt.attention_mask.empty()) {
@@ -3286,14 +3521,6 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
         for (size_t i = 0; i < (size_t)B_prime * S * S; i++)
             attn_f16[i] = (prompt.attention_mask[i] != 0) ? f16_one : f16_zero;
     }
-
-    // Build the full LLM graph once — reused across all diffusion steps
-    DiffusionGraphState gs;
-    if (!BuildDiffusionGraph(gs, prompt, sched, T)) return false;
-
-    // Upload attention mask (constant across steps)
-    if (gs.t_attn && !attn_f16.empty())
-        ggml_backend_tensor_set(gs.t_attn, attn_f16.data(), 0, attn_f16.size() * sizeof(uint16_t));
 
     RS_LOG_INFO("MaskGIT: T=%d K=%d S=%d V=%d steps=%d", T, K, S, V, n_steps);
 
@@ -3305,6 +3532,22 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
     std::vector<int32_t> pred_tokens((size_t)K * T);
     std::vector<float> confidence((size_t)K * T);
     std::vector<int> idx(K * T);
+    std::vector<float> cached_uncond;
+
+    // Helper: build graph, upload attn mask, run forward, free.
+    auto run_step = [&](int b_prime, std::vector<float> &logits_out) -> bool {
+        DiffusionGraphState gs_local;
+        if (!BuildDiffusionGraph(gs_local, prompt, sched, T, b_prime)) return false;
+        if (gs_local.t_attn && !attn_f16.empty()) {
+            // attn_f16 is sized for B_prime=2; write only as many bytes as the
+            // current graph's tensor holds (S*S*b_prime elements for cond-only).
+            size_t nbytes = ggml_nbytes(gs_local.t_attn);
+            ggml_backend_tensor_set(gs_local.t_attn, attn_f16.data(), 0, nbytes);
+        }
+        logits_out = RunDiffusionGraph(gs_local, prompt, sched);
+        FreeDiffusionGraph(gs_local, sched);
+        return !logits_out.empty();
+    };
 
     for (int step = 0; step < n_steps; step++) {
         int k_demask = demask_sched[step];
@@ -3312,14 +3555,30 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
 
         state.diff_step = step + 1;
 
-        // Execute forward pass using pre-built graph (only updates changed inputs)
-        std::vector<float> logits_full = RunDiffusionGraph(gs, prompt, sched);
-        if (logits_full.empty()) { FreeDiffusionGraph(gs, sched); return false; }
+        // CFG branch caching: full forward on even steps (cache uncond for
+        // the next cond-only step). Reduces LLM compute by ~25%.
+        bool use_cache = (step % 2 == 1 && !cached_uncond.empty());
+        int b_prime = use_cache ? 1 : B_prime;
 
-        if (logits_full.size() != 2 * per_audio) {
-            RS_LOG_ERR("MaskGIT: expected %zu logits, got %zu", 2 * per_audio, logits_full.size());
-            FreeDiffusionGraph(gs, sched);
-            return false;
+        std::vector<float> logits_full;
+        if (b_prime == 2) {
+            // Full forward: compute both cond and uncond
+            if (!run_step(B_prime, logits_full)) return false;
+            if (logits_full.size() != 2 * per_audio) {
+                RS_LOG_ERR("MaskGIT: expected %zu logits, got %zu", 2 * per_audio, logits_full.size());
+                return false;
+            }
+            // Cache uncond output for next cond-only step
+            cached_uncond.assign(logits_full.begin() + per_audio, logits_full.end());
+        } else {
+            // Cond-only forward, reuse cached uncond
+            if (!run_step(1, logits_full)) return false;
+            if (logits_full.size() != per_audio) {
+                RS_LOG_ERR("MaskGIT (cond): expected %zu logits, got %zu", per_audio, logits_full.size());
+                return false;
+            }
+            logits_full.resize(2 * per_audio);
+            memcpy(logits_full.data() + per_audio, cached_uncond.data(), per_audio * sizeof(float));
         }
 
         // Debug: save first-step raw logits for analysis
@@ -3357,6 +3616,14 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
                 float *c = c_log.data() + off;
                 float *u = u_log.data() + off;
                 float *lp = log_probs.data() + off;
+
+                // Temperature sharpening: divide by T before softmax to
+                // increase confidence — helps quantized models where
+                // weight noise reduces logit contrast.
+                if (logit_temperature != 1.0f) {
+                    float inv_t = 1.0f / logit_temperature;
+                    for (int v = 0; v < V; v++) { c[v] *= inv_t; u[v] *= inv_t; }
+                }
 
                 if (mg_cfg.guidance_scale != 0.0f) {
                     MaskGITLogSoftmax(c, V);
@@ -3424,14 +3691,13 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
         }
     }
 
-    // Safety net: force-demask any residual mask tokens (use persistent graph)
+    // Safety net: force-demask any residual mask tokens
     int remaining = (int)std::count(state.acoustic_tokens.begin(), state.acoustic_tokens.end(), mask_id);
     if (remaining > 0) {
         RS_LOG_INFO("MaskGIT: force-demasking %d residual tokens", remaining);
-        std::vector<float> logits_full = RunDiffusionGraph(gs, prompt, sched);
-        if (logits_full.empty()) { FreeDiffusionGraph(gs, sched); return false; }
+        std::vector<float> logits_full;
+        if (!run_step(B_prime, logits_full)) return false;
 
-        size_t per_audio = (size_t)V * K * T;
         if (logits_full.size() >= 2 * per_audio) {
             for (int k = 0; k < K; k++) {
                 for (int t = 0; t < T; t++) {
@@ -3455,7 +3721,6 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
             RS_LOG_ERR("MaskGIT: still %d residual masks after force-demask!", remaining);
     }
 
-    FreeDiffusionGraph(gs, sched);
     return true;
 }
 

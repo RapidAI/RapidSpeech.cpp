@@ -182,6 +182,14 @@ target_include_directories(rapidspeech-core PUBLIC
 target_compile_definitions(rapidspeech-core PRIVATE RAPIDSPEECH_BUILD)
 
 # MSVC portability: _USE_MATH_DEFINES enables M_PI from <cmath>,
+# _CRT_SECURE_NO_WARNINGS suppresses getenv deprecation,
+# /wd4244 suppresses int64→int truncation warnings from ggml API.
+if (MSVC)
+    target_compile_definitions(rapidspeech-core PRIVATE _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(rapidspeech-core PRIVATE /wd4244)
+endif()
+
+# MSVC portability: _USE_MATH_DEFINES enables M_PI from <cmath>,
 # _CRT_SECURE_NO_WARNINGS suppresses getenv deprecation warning,
 # /wd4244 suppresses int64→int truncation warnings from ggml API.
 if (MSVC)
@@ -232,7 +240,7 @@ endif()
 if (APPLE)
     # Always link Metal + Foundation — used by our custom DAC vocoder shader.
     # ggml-metal is not required for our Metal path (we use MTL API directly).
-    target_link_libraries(rapidspeech-core PRIVATE "-framework Foundation" "-framework Metal")
+    target_link_libraries(rapidspeech-core PRIVATE "-framework Foundation" "-framework Metal" "-framework Accelerate")
 
     # Custom Metal DAC vocoder (fused compute kernels, bypasses ggml per-op overhead)
     target_sources(rapidspeech-core PRIVATE rapidspeech/src/arch/dac_metal.mm)
@@ -359,10 +367,14 @@ if (RS_BUILD_CLI)
             examples/quantize/quantize.cpp
             examples/quantize/common_quantize.cpp
     )
+    add_executable(rs-imatrix
+            examples/imatrix/rs-imatrix.cpp
+    )
     target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-asr-online  PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-tts-offline PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-quantize PRIVATE ggml)
+    target_link_libraries(rs-imatrix PRIVATE rapidspeech-core ggml)
 
     if (NOT MSVC)
         target_link_libraries(rs-quantize PRIVATE pthread)
@@ -370,6 +382,15 @@ if (RS_BUILD_CLI)
 
     target_include_directories(rs-quantize PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/examples/quantize
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/imatrix
+        ${GGML_PATH}/include
+        ${GGML_PATH}/src
+    )
+    target_include_directories(rs-imatrix PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/imatrix
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
         ${GGML_PATH}/include
         ${GGML_PATH}/src
     )
