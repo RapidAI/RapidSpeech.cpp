@@ -80,6 +80,11 @@ struct OmniVoiceHParams {
     // Diffusion
     int32_t n_diff_steps = OMNIVOICE_DEFAULT_N_STEPS;
     float   diffusion_tau = 0.1f;
+    float   diffusion_schedule_gamma = 0.8f;  // <1: early-heavy demask
+    float   cfg_anneal_high = 1.05f; // CFG multiplier at step 0
+    float   cfg_anneal_low  = 0.95f; // CFG multiplier at final step
+    float   temp_anneal_start = 0.7f; // temperature multiplier at step 0 (lower=sharper)
+    float   temp_anneal_end   = 1.1f; // temperature multiplier at final step
 
     // RoPE
     float rope_theta = 1000000.0f;
@@ -421,6 +426,8 @@ private:
     ggml_backend_t backend_ = nullptr;
     ggml_backend_t cpu_backend_ = nullptr;
     struct ggml_context *gguf_data_ = nullptr;  // GGUF weight context (for GPU-resident encoder weights)
+    std::vector<ggml_backend_t> diffusion_sched_backends_;
+    bool diffusion_sched_op_offload_ = false;
 
 #ifdef RS_USE_METAL_DAC
     // Optional Metal GPU backend for DAC vocoder (fused kernels, faster than CPU)

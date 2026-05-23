@@ -552,6 +552,14 @@ OmniVoiceModel::~OmniVoiceModel() {
 
 bool OmniVoiceModel::Load(const std::unique_ptr<rs_context_t> &ctx, ggml_backend_t backend) {
     backend_ = backend;
+    diffusion_sched_backends_.clear();
+    if (ctx && !ctx->backends.empty()) {
+        diffusion_sched_backends_ = ctx->backends;
+        diffusion_sched_op_offload_ = ctx->backends.size() > 1;
+    } else if (backend_) {
+        diffusion_sched_backends_.push_back(backend_);
+        diffusion_sched_op_offload_ = false;
+    }
 
     // Create a CPU backend for the DAC vocoder — many small conv ops where
     // GPU kernel launch overhead dwarfs the actual compute (~300x slowdown).
@@ -3473,7 +3481,9 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
     state.acoustic_tokens.resize((size_t)K * T, mask_id);
     state.n_total_frames = Sref + T;
 
-    // Cosine timestep schedule
+    // Cosine timestep schedule (original MaskGIT formulation).
+    // Keeps most tokens masked until final steps where the model has
+    // sufficient context from already-unmasked tokens.
     std::vector<float> timesteps(n_steps + 1);
     for (int i = 0; i <= n_steps; i++) {
         float t = (float)i / n_steps;
@@ -3499,18 +3509,27 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
     mg_cfg.num_step = n_steps;
     mg_cfg.t_shift = tau;
 
-    // Quantization-aware CFG: higher guidance helps the conditioning signal
-    // overcome weight quantization noise for more stable long-form synthesis.
-    float logit_temperature = 1.0f;
+    // Quantization-aware base CFG and temperature.
+    float cfg_base;
+    float temp_base = 1.0f;
     if (quant_level_ >= 2) {
-        mg_cfg.guidance_scale = 3.0f;
-        logit_temperature = 0.85f;
+        cfg_base = 3.0f;
+        temp_base = 0.85f;
     } else if (quant_level_ >= 1) {
-        mg_cfg.guidance_scale = 2.5f;
-        logit_temperature = 0.9f;
+        cfg_base = 2.5f;
+        temp_base = 0.9f;
     } else {
-        mg_cfg.guidance_scale = 2.0f;
+        cfg_base = 2.0f;
     }
+
+    // CFG annealing: start high (strong conditioning), end low (natural detail).
+    const float cfg_anneal_high = cfg_base * hparams_.cfg_anneal_high;
+    const float cfg_anneal_low  = cfg_base * hparams_.cfg_anneal_low;
+
+    // Temperature annealing: low early (confident, fewer errors at low context),
+    // high late (softer, more natural detail). Linear interpolate per step.
+    const float temp_anneal_start = temp_base * hparams_.temp_anneal_start;
+    const float temp_anneal_end   = temp_base * hparams_.temp_anneal_end;
 
     // Build attention mask (constant across steps) before building the graph
     std::vector<uint16_t> attn_f16;
@@ -3533,19 +3552,68 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
     std::vector<float> confidence((size_t)K * T);
     std::vector<int> idx(K * T);
     std::vector<float> cached_uncond;
+    // Build both graph shapes once. Use a second scheduler for the cond-only
+    // graph so B'=2 and B'=1 allocations can stay live independently.
+    DiffusionGraphState gs_full;
+    DiffusionGraphState gs_cond;
+    ggml_backend_sched_t cond_sched = nullptr;
 
-    // Helper: build graph, upload attn mask, run forward, free.
-    auto run_step = [&](int b_prime, std::vector<float> &logits_out) -> bool {
-        DiffusionGraphState gs_local;
-        if (!BuildDiffusionGraph(gs_local, prompt, sched, T, b_prime)) return false;
-        if (gs_local.t_attn && !attn_f16.empty()) {
-            // attn_f16 is sized for B_prime=2; write only as many bytes as the
-            // current graph's tensor holds (S*S*b_prime elements for cond-only).
-            size_t nbytes = ggml_nbytes(gs_local.t_attn);
-            ggml_backend_tensor_set(gs_local.t_attn, attn_f16.data(), 0, nbytes);
+    auto upload_graph_constants = [&](DiffusionGraphState &gs) {
+        if (gs.t_positions) {
+            std::vector<int32_t> pos_data(gs.S);
+            for (int i = 0; i < gs.S; i++) pos_data[i] = i;
+            ggml_backend_tensor_set(gs.t_positions, pos_data.data(), 0,
+                                    pos_data.size() * sizeof(int32_t));
         }
-        logits_out = RunDiffusionGraph(gs_local, prompt, sched);
-        FreeDiffusionGraph(gs_local, sched);
+        if (gs.t_attn && !attn_f16.empty()) {
+            // attn_f16 is sized for B_prime=2; the cond-only graph needs the
+            // first S*S elements, which are the conditional batch mask.
+            size_t nbytes = ggml_nbytes(gs.t_attn);
+            ggml_backend_tensor_set(gs.t_attn, attn_f16.data(), 0, nbytes);
+        }
+    };
+
+    auto cleanup_graphs = [&]() {
+        FreeDiffusionGraph(gs_full, sched);
+        if (cond_sched) {
+            FreeDiffusionGraph(gs_cond, cond_sched);
+            ggml_backend_sched_free(cond_sched);
+            cond_sched = nullptr;
+        } else {
+            FreeDiffusionGraph(gs_cond, sched);
+        }
+    };
+
+    if (diffusion_sched_backends_.empty()) {
+        RS_LOG_ERR("OmniVoice: no backends available for diffusion scheduler");
+        return false;
+    }
+    cond_sched = ggml_backend_sched_new(diffusion_sched_backends_.data(), nullptr,
+                                        (int)diffusion_sched_backends_.size(),
+                                        16384, false, diffusion_sched_op_offload_);
+    if (!cond_sched) {
+        RS_LOG_ERR("OmniVoice: failed to create cond-only diffusion scheduler");
+        return false;
+    }
+
+    if (!BuildDiffusionGraph(gs_full, prompt, sched, T, B_prime)) {
+        cleanup_graphs();
+        return false;
+    }
+    upload_graph_constants(gs_full);
+
+    if (!BuildDiffusionGraph(gs_cond, prompt, cond_sched, T, 1)) {
+        cleanup_graphs();
+        return false;
+    }
+    upload_graph_constants(gs_cond);
+
+    auto run_step = [&](int b_prime, std::vector<float> &logits_out) -> bool {
+        if (b_prime == 1) {
+            logits_out = RunDiffusionGraph(gs_cond, prompt, cond_sched);
+        } else {
+            logits_out = RunDiffusionGraph(gs_full, prompt, sched);
+        }
         return !logits_out.empty();
     };
 
@@ -3555,26 +3623,36 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
 
         state.diff_step = step + 1;
 
+        // Per-step CFG anneal + temperature anneal.
+        float t_frac = (float)step / (float)std::max(1, n_steps - 1);
+        float cfg_scale = cfg_anneal_high + (cfg_anneal_low - cfg_anneal_high) * t_frac;
+        float step_temp = temp_anneal_start + (temp_anneal_end - temp_anneal_start) * t_frac;
+
+        std::vector<float> logits_full;
         // CFG branch caching: full forward on even steps (cache uncond for
         // the next cond-only step). Reduces LLM compute by ~25%.
         bool use_cache = (step % 2 == 1 && !cached_uncond.empty());
         int b_prime = use_cache ? 1 : B_prime;
 
-        std::vector<float> logits_full;
         if (b_prime == 2) {
-            // Full forward: compute both cond and uncond
-            if (!run_step(B_prime, logits_full)) return false;
-            if (logits_full.size() != 2 * per_audio) {
-                RS_LOG_ERR("MaskGIT: expected %zu logits, got %zu", 2 * per_audio, logits_full.size());
+            if (!run_step(B_prime, logits_full)) {
+                cleanup_graphs();
                 return false;
             }
-            // Cache uncond output for next cond-only step
+            if (logits_full.size() != 2 * per_audio) {
+                RS_LOG_ERR("MaskGIT: expected %zu logits, got %zu", 2 * per_audio, logits_full.size());
+                cleanup_graphs();
+                return false;
+            }
             cached_uncond.assign(logits_full.begin() + per_audio, logits_full.end());
         } else {
-            // Cond-only forward, reuse cached uncond
-            if (!run_step(1, logits_full)) return false;
+            if (!run_step(1, logits_full)) {
+                cleanup_graphs();
+                return false;
+            }
             if (logits_full.size() != per_audio) {
                 RS_LOG_ERR("MaskGIT (cond): expected %zu logits, got %zu", per_audio, logits_full.size());
+                cleanup_graphs();
                 return false;
             }
             logits_full.resize(2 * per_audio);
@@ -3617,19 +3695,19 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
                 float *u = u_log.data() + off;
                 float *lp = log_probs.data() + off;
 
-                // Temperature sharpening: divide by T before softmax to
-                // increase confidence — helps quantized models where
-                // weight noise reduces logit contrast.
-                if (logit_temperature != 1.0f) {
-                    float inv_t = 1.0f / logit_temperature;
+                // Temperature annealing: lower T early → sharper, more
+                // confident token selection with limited context.
+                // Higher T late → softer, more natural detail.
+                if (step_temp != 1.0f) {
+                    float inv_t = 1.0f / step_temp;
                     for (int v = 0; v < V; v++) { c[v] *= inv_t; u[v] *= inv_t; }
                 }
 
-                if (mg_cfg.guidance_scale != 0.0f) {
+                if (cfg_scale != 0.0f) {
                     MaskGITLogSoftmax(c, V);
                     MaskGITLogSoftmax(u, V);
                     for (int v = 0; v < V; v++)
-                        lp[v] = c[v] + mg_cfg.guidance_scale * (c[v] - u[v]);
+                        lp[v] = c[v] + cfg_scale * (c[v] - u[v]);
                     MaskGITLogSoftmax(lp, V);
                 } else {
                     for (int v = 0; v < V; v++) lp[v] = c[v];
@@ -3696,7 +3774,10 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
     if (remaining > 0) {
         RS_LOG_INFO("MaskGIT: force-demasking %d residual tokens", remaining);
         std::vector<float> logits_full;
-        if (!run_step(B_prime, logits_full)) return false;
+        if (!run_step(B_prime, logits_full)) {
+            cleanup_graphs();
+            return false;
+        }
 
         if (logits_full.size() >= 2 * per_audio) {
             for (int k = 0; k < K; k++) {
@@ -3721,6 +3802,7 @@ bool OmniVoiceModel::RunDiffusionDecode(OmniVoiceState &state, ggml_backend_sche
             RS_LOG_ERR("MaskGIT: still %d residual masks after force-demask!", remaining);
     }
 
+    cleanup_graphs();
     return true;
 }
 
