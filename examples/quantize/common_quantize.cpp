@@ -314,6 +314,16 @@ rs_get_qtype_for_tensor(ggml_ftype ftype, const std::string &name,
     return tensor->ne[0] % ggml_blck_size(qt) == 0;
   };
 
+  // Demote to an alignment-safe type when the preferred k-quant block (256)
+  // does not divide ne[0]. Small leading dims (e.g. ctc_decoder w_2 with
+  // ne[0]=128) cannot use Q4_K/Q5_K/Q6_K/IQ*; fall back to Q8_0 (block=32)
+  // when possible, otherwise keep the original dtype.
+  auto pick = [tensor, &align_check](ggml_type preferred) -> ggml_type {
+    if (align_check(preferred)) return preferred;
+    if (align_check(GGML_TYPE_Q8_0)) return GGML_TYPE_Q8_0;
+    return tensor->type;
+  };
+
   // Select per-tensor type based on the overall strategy
   switch (ftype) {
   // ================================================================
@@ -322,19 +332,18 @@ rs_get_qtype_for_tensor(ggml_ftype ftype, const std::string &name,
   case GGML_FTYPE_MOSTLY_Q4_K_M: {
     if (cat == tensor_category::TOKEN_EMBD ||
         cat == tensor_category::OUTPUT) {
-      return align_check(GGML_TYPE_Q6_K) ? GGML_TYPE_Q6_K : GGML_TYPE_Q4_K;
+      return align_check(GGML_TYPE_Q6_K) ? GGML_TYPE_Q6_K : pick(GGML_TYPE_Q4_K);
     }
     if (cat == tensor_category::ATTENTION_V) {
-      return is_critical_layer(layer) ? GGML_TYPE_Q6_K : GGML_TYPE_Q5_K;
+      return pick(is_critical_layer(layer) ? GGML_TYPE_Q6_K : GGML_TYPE_Q5_K);
     }
     if (cat == tensor_category::ATTENTION_OUTPUT) {
-      return is_critical_layer(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K;
+      return pick(is_critical_layer(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K);
     }
     if (cat == tensor_category::FFN_DOWN) {
-      return is_first_last_8th(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K;
+      return pick(is_first_last_8th(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K);
     }
-    if (align_check(GGML_TYPE_Q4_K)) return GGML_TYPE_Q4_K;
-    return tensor->type;
+    return pick(GGML_TYPE_Q4_K);
   }
 
   // ================================================================
@@ -343,21 +352,20 @@ rs_get_qtype_for_tensor(ggml_ftype ftype, const std::string &name,
   case GGML_FTYPE_MOSTLY_Q5_K_M: {
     if (cat == tensor_category::TOKEN_EMBD ||
         cat == tensor_category::OUTPUT) {
-      return align_check(GGML_TYPE_Q6_K) ? GGML_TYPE_Q6_K : GGML_TYPE_Q5_K;
+      return align_check(GGML_TYPE_Q6_K) ? GGML_TYPE_Q6_K : pick(GGML_TYPE_Q5_K);
     }
     if (cat == tensor_category::ATTENTION_V) {
-      return is_critical_layer(layer) ? GGML_TYPE_Q6_K : GGML_TYPE_Q6_K;
+      return pick(is_critical_layer(layer) ? GGML_TYPE_Q6_K : GGML_TYPE_Q6_K);
     }
     if (cat == tensor_category::ATTENTION_OUTPUT ||
         cat == tensor_category::ATTENTION_Q ||
         cat == tensor_category::ATTENTION_K) {
-      return is_critical_layer(layer) ? GGML_TYPE_Q6_K : GGML_TYPE_Q5_K;
+      return pick(is_critical_layer(layer) ? GGML_TYPE_Q6_K : GGML_TYPE_Q5_K);
     }
     if (cat == tensor_category::FFN_DOWN) {
-      return is_first_last_8th(layer) ? GGML_TYPE_Q6_K : GGML_TYPE_Q5_K;
+      return pick(is_first_last_8th(layer) ? GGML_TYPE_Q6_K : GGML_TYPE_Q5_K);
     }
-    if (align_check(GGML_TYPE_Q5_K)) return GGML_TYPE_Q5_K;
-    return tensor->type;
+    return pick(GGML_TYPE_Q5_K);
   }
 
   // ================================================================
@@ -366,20 +374,18 @@ rs_get_qtype_for_tensor(ggml_ftype ftype, const std::string &name,
   case GGML_FTYPE_MOSTLY_IQ3_XXS: {
     if (cat == tensor_category::TOKEN_EMBD ||
         cat == tensor_category::OUTPUT) {
-      return align_check(GGML_TYPE_IQ3_S) ? GGML_TYPE_IQ3_S : GGML_TYPE_Q4_K;
+      return align_check(GGML_TYPE_IQ3_S) ? GGML_TYPE_IQ3_S : pick(GGML_TYPE_Q4_K);
     }
     if (cat == tensor_category::ATTENTION_V) {
-      return GGML_TYPE_Q4_K;
+      return pick(GGML_TYPE_Q4_K);
     }
     if (cat == tensor_category::ATTENTION_OUTPUT) {
-      return is_critical_layer(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ3_S;
+      return pick(is_critical_layer(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ3_S);
     }
     if (cat == tensor_category::FFN_DOWN) {
-      return is_first_last_8th(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ3_XXS;
+      return pick(is_first_last_8th(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ3_XXS);
     }
-    if (align_check(GGML_TYPE_IQ3_XXS)) return GGML_TYPE_IQ3_XXS;
-    if (align_check(GGML_TYPE_Q4_K)) return GGML_TYPE_Q4_K;
-    return tensor->type;
+    return pick(GGML_TYPE_IQ3_XXS);
   }
 
   // ================================================================
@@ -388,20 +394,18 @@ rs_get_qtype_for_tensor(ggml_ftype ftype, const std::string &name,
   case GGML_FTYPE_MOSTLY_IQ3_S: {
     if (cat == tensor_category::TOKEN_EMBD ||
         cat == tensor_category::OUTPUT) {
-      return align_check(GGML_TYPE_Q4_K) ? GGML_TYPE_Q4_K : GGML_TYPE_Q5_K;
+      return align_check(GGML_TYPE_Q4_K) ? GGML_TYPE_Q4_K : pick(GGML_TYPE_Q5_K);
     }
     if (cat == tensor_category::ATTENTION_V) {
-      return GGML_TYPE_Q5_K;
+      return pick(GGML_TYPE_Q5_K);
     }
     if (cat == tensor_category::ATTENTION_OUTPUT) {
-      return is_critical_layer(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K;
+      return pick(is_critical_layer(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K);
     }
     if (cat == tensor_category::FFN_DOWN) {
-      return is_first_last_8th(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ3_S;
+      return pick(is_first_last_8th(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ3_S);
     }
-    if (align_check(GGML_TYPE_IQ3_S)) return GGML_TYPE_IQ3_S;
-    if (align_check(GGML_TYPE_Q4_K)) return GGML_TYPE_Q4_K;
-    return tensor->type;
+    return pick(GGML_TYPE_IQ3_S);
   }
 
   // ================================================================
@@ -410,20 +414,18 @@ rs_get_qtype_for_tensor(ggml_ftype ftype, const std::string &name,
   case GGML_FTYPE_MOSTLY_IQ4_NL: {
     if (cat == tensor_category::TOKEN_EMBD ||
         cat == tensor_category::OUTPUT) {
-      return align_check(GGML_TYPE_Q5_K) ? GGML_TYPE_Q5_K : GGML_TYPE_Q6_K;
+      return align_check(GGML_TYPE_Q5_K) ? GGML_TYPE_Q5_K : pick(GGML_TYPE_Q6_K);
     }
     if (cat == tensor_category::ATTENTION_V) {
-      return GGML_TYPE_Q5_K;
+      return pick(GGML_TYPE_Q5_K);
     }
     if (cat == tensor_category::FFN_DOWN) {
-      return is_first_last_8th(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_IQ4_NL;
+      return pick(is_first_last_8th(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_IQ4_NL);
     }
     if (cat == tensor_category::ATTENTION_OUTPUT) {
-      return is_critical_layer(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_IQ4_NL;
+      return pick(is_critical_layer(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_IQ4_NL);
     }
-    if (align_check(GGML_TYPE_IQ4_NL)) return GGML_TYPE_IQ4_NL;
-    if (align_check(GGML_TYPE_Q4_K)) return GGML_TYPE_Q4_K;
-    return tensor->type;
+    return pick(GGML_TYPE_IQ4_NL);
   }
 
   // ================================================================
@@ -432,20 +434,18 @@ rs_get_qtype_for_tensor(ggml_ftype ftype, const std::string &name,
   case GGML_FTYPE_MOSTLY_IQ4_XS: {
     if (cat == tensor_category::TOKEN_EMBD ||
         cat == tensor_category::OUTPUT) {
-      return align_check(GGML_TYPE_Q5_K) ? GGML_TYPE_Q5_K : GGML_TYPE_Q6_K;
+      return align_check(GGML_TYPE_Q5_K) ? GGML_TYPE_Q5_K : pick(GGML_TYPE_Q6_K);
     }
     if (cat == tensor_category::ATTENTION_V) {
-      return GGML_TYPE_Q5_K;
+      return pick(GGML_TYPE_Q5_K);
     }
     if (cat == tensor_category::FFN_DOWN) {
-      return is_first_last_8th(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ4_XS;
+      return pick(is_first_last_8th(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ4_XS);
     }
     if (cat == tensor_category::ATTENTION_OUTPUT) {
-      return is_critical_layer(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ4_XS;
+      return pick(is_critical_layer(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ4_XS);
     }
-    if (align_check(GGML_TYPE_IQ4_XS)) return GGML_TYPE_IQ4_XS;
-    if (align_check(GGML_TYPE_Q4_K)) return GGML_TYPE_Q4_K;
-    return tensor->type;
+    return pick(GGML_TYPE_IQ4_XS);
   }
 
   default: {
