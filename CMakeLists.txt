@@ -143,6 +143,7 @@ set(RS_SOURCES
         rapidspeech/src/arch/sensevoice_encoder.cpp
         rapidspeech/src/arch/funasr-nano.cpp
         rapidspeech/src/arch/silero_vad.cpp
+        rapidspeech/src/arch/fireredvad.cpp
         rapidspeech/src/arch/llm_model.h
         rapidspeech/src/arch/llm_model.cpp
         rapidspeech/src/arch/llm_graph.h
@@ -153,6 +154,8 @@ set(RS_SOURCES
         rapidspeech/src/arch/qwen3.cpp
 	    rapidspeech/src/arch/openvoice2.cpp
         rapidspeech/src/arch/omnivoice.cpp
+        rapidspeech/src/arch/bert.cpp
+        rapidspeech/src/arch/bert.h
         rapidspeech/src/frontend/text_frontend.cpp
         rapidspeech/src/frontend/whisper_mel.h
         rapidspeech/src/frontend/whisper_mel.cpp
@@ -375,12 +378,16 @@ if (RS_BUILD_CLI)
     add_executable(rs-tts-split
             examples/tts/rs-tts-split.cpp
     )
+    add_executable(rs-bert-smoke
+            examples/bert_smoke.cpp
+    )
     target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-asr-online  PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-tts-offline PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-tts-split   PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-quantize PRIVATE ggml)
     target_link_libraries(rs-imatrix PRIVATE rapidspeech-core ggml)
+    target_link_libraries(rs-bert-smoke  PRIVATE rapidspeech-core ggml)
 
     if (NOT MSVC)
         target_link_libraries(rs-quantize PRIVATE pthread)
@@ -424,6 +431,13 @@ if (RS_BUILD_CLI)
     )
     target_include_directories(rs-tts-split PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/examples/tts
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
+        ${GGML_PATH}/include
+        ${GGML_PATH}/src
+    )
+    target_include_directories(rs-bert-smoke PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
         ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
