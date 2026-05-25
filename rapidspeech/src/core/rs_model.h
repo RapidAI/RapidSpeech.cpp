@@ -1,5 +1,6 @@
 #pragma once
 
+#include "frontend/audio_processor.h"
 #include "ggml-backend.h"
 #include "gguf.h"
 #include <memory>
@@ -24,6 +25,12 @@ struct RSModelMeta {
   // Qwen3-ASR run their own Whisper-style mel extractor instead of the
   // shared Kaldi-style AudioProcessor.
   bool use_external_frontend = false;
+
+  // Analysis window for the shared AudioProcessor frontend. Defaults to
+  // Hamming (SenseVoice, FunASR-Nano). Kaldi-style frontends (FireRedVAD,
+  // MiMoASR) should set this to WindowType::POVEY so the periodic Hamming
+  // doesn't bias the fbank away from the training distribution.
+  WindowType window_type = WindowType::HAMMING;
 };
 
 // --- Core Model Interface ---

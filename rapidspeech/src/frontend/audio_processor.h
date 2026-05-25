@@ -2,6 +2,12 @@
 
 #include <vector>
 
+// Analysis window applied per frame before FFT.
+//   HAMMING — periodic Hamming (SenseVoice, FunASR-Nano default).
+//   POVEY   — Kaldi-style Povey window pow(0.5 - 0.5*cos(2*pi*i/(N-1)), 0.85),
+//             used by kaldi_native_fbank consumers (FireRedVAD, MiMoASR).
+enum class WindowType { HAMMING = 0, POVEY = 1 };
+
 // Configuration for SenseVoice/FunASR frontend pipeline
 struct STFTConfig {
   int sample_rate = 16000;
@@ -11,6 +17,10 @@ struct STFTConfig {
   int n_mels = 80;
   float f_min = 31.748642f;
   float f_max = 8000.0f;
+
+  // Analysis window. Defaults to Hamming for backwards compatibility with
+  // SenseVoice / FunASR-Nano; Kaldi-style frontends should set POVEY.
+  WindowType window_type = WindowType::HAMMING;
 
   // --- SenseVoice Specific (LFR & CMVN) ---
   bool use_lfr = true;
@@ -41,7 +51,7 @@ public:
 
 private:
   STFTConfig config_;
-  std::vector<double> hamming_window_;
+  std::vector<double> analysis_window_;
   std::vector<float> mel_filters_; // [n_mels, n_fft/2 + 1]
   CMVNData cmvn_;
 

@@ -1,4 +1,5 @@
 #include "frontend/text_frontend.h"
+#include "frontend/cjk_pinyin_table.h"
 #include "utils/rs_log.h"
 
 #include <algorithm>
@@ -155,10 +156,53 @@ void TextFrontend::InitChinesePinyin() {
     {0x6162, "man4"}, {0x5DE6, "zuo3"}, {0x53F3, "you4"}, {0x524D, "qian2"},
     {0x540E, "hou4"}, {0x91CC, "li3"}, {0x5916, "wai4"}, {0x5F00, "kai1"},
     {0x5173, "guan1"}, {0x95E8, "men2"}, {0x7A97, "chuang1"},
+    // Added: test text + common chars
+    {0x6B22, "huan1"}, {0x8FCE, "ying2"}, {0x4F7F, "shi3"}, {0x7528, "yong4"},
+    {0x8BED, "yu3"}, {0x97F3, "yin1"}, {0x5408, "he2"}, {0x6210, "cheng2"},
+    {0x4E66, "shu1"}, {0x5199, "xie3"}, {0x8BFB, "du2"}, {0x542C, "ting1"},
+    {0x8D70, "zou3"}, {0x8DD1, "pao3"}, {0x7761, "shui4"}, {0x5403, "chi1"},
+    {0x559D, "he1"}, {0x7231, "ai4"}, {0x6068, "hen4"}, {0x559C, "xi3"},
+    {0x6012, "nu4"}, {0x54ED, "ku1"}, {0x7B11, "xiao4"}, {0x6B4C, "ge1"},
+    {0x5531, "chang4"}, {0x8DF3, "tiao4"}, {0x821E, "wu3"}, {0x753B, "hua4"},
+    {0x5BB6, "jia1"}, {0x56DE, "hui2"}, {0x8FDB, "jin4"}, {0x51FA, "chu1"},
+    {0x6253, "da3"}, {0x5EA6, "du4"}, {0x592A, "tai4"}, {0x771F, "zhen1"},
+    {0x5047, "jia3"}, {0x7F8E, "mei3"}, {0x4E11, "chou3"},
+    {0x70ED, "re4"}, {0x51B7, "leng3"}, {0x6696, "nuan3"}, {0x51C9, "liang2"},
+    {0x6625, "chun1"}, {0x590F, "xia4"}, {0x79CB, "qiu1"}, {0x51AC, "dong1"},
+    {0x65E9, "zao3"}, {0x665A, "wan3"}, {0x663C, "zhou4"}, {0x591C, "ye4"},
+    {0x660E, "ming2"}, {0x6697, "an4"}, {0x8F7B, "qing1"}, {0x91CD, "zhong4"},
+    {0x8F6F, "ruan3"}, {0x786C, "ying4"}, {0x6DF1, "shen1"}, {0x6D45, "qian3"},
+    {0x7C97, "cu1"}, {0x7EC6, "xi4"}, {0x5BBD, "kuan1"}, {0x7A84, "zhai3"},
+    {0x539A, "hou4"}, {0x8584, "bao2"}, {0x65E7, "jiu4"}, {0x5E78, "xing4"},
+    {0x798F, "fu2"}, {0x4E50, "le4"}, {0x60B2, "bei1"}, {0x4F24, "shang1"},
+    {0x5B89, "an1"}, {0x5168, "quan2"}, {0x5371, "wei1"}, {0x9669, "xian3"},
+    {0x529F, "gong1"}, {0x5931, "shi1"}, {0x8D25, "bai4"}, {0x5E0C, "xi1"},
+    {0x671B, "wang4"}, {0x613F, "yuan4"}, {0x610F, "yi4"}, {0x601D, "si1"},
+    {0x8DEF, "lu4"}, {0x65B9, "fang1"}, {0x5411, "xiang4"}, {0x8FB9, "bian1"},
+    {0x95F4, "jian1"}, {0x4E1C, "dong1"}, {0x897F, "xi1"}, {0x5357, "nan2"},
+    {0x5317, "bei3"}, {0x8EAB, "shen1"}, {0x4F53, "ti3"}, {0x5065, "jian4"},
+    {0x5EB7, "kang1"}, {0x75BE, "ji2"}, {0x75C5, "bing4"}, {0x533B, "yi1"},
+    {0x9662, "yuan4"}, {0x6821, "xiao4"}, {0x6559, "jiao4"}, {0x5BA4, "shi4"},
+    {0x5E08, "shi1"}, {0x540C, "tong2"}, {0x670B, "peng2"}, {0x53CB, "you3"},
+    {0x4EB2, "qin1"}, {0x5988, "ma1"}, {0x7238, "ba4"}, {0x54E5, "ge1"},
+    {0x4ED6, "ta1"}, {0x5B83, "ta1"}, {0x81EA, "zi4"}, {0x5DF1, "ji3"},
+    {0x522B, "bie2"}, {0x54EA, "na3"}, {0x8C01, "shui2"}, {0x4EC0, "shen2"},
+    {0x4E48, "me5"}, {0x600E, "zen3"}, {0x6837, "yang4"}, {0x56E0, "yin1"},
   };
 
   for (const auto& entry : table) {
     char_to_pinyin_[entry.cp] = entry.py;
+  }
+
+  // Comprehensive coverage from pypinyin (CJK Unified + Ext A, ~26K chars).
+  // Hand-coded `table` entries above already loaded — keep them as overrides
+  // for any common polyphone we know the right reading for. Only insert if
+  // not already present.
+  for (int i = 0; i < rs::CJK_PINYIN_COUNT; i++) {
+    const auto& e = rs::CJK_PINYIN_TABLE[i];
+    if (char_to_pinyin_.find(e.cp) == char_to_pinyin_.end()) {
+      char_to_pinyin_[e.cp] = e.py;
+    }
   }
 }
 
@@ -232,8 +276,15 @@ void TextFrontend::InitEnglishLexicon() {
 // =====================================================================
 
 std::vector<std::string> TextFrontend::ChineseG2P(const std::string& text,
-    std::vector<int32_t>* out_tones) const {
+    std::vector<int32_t>* out_tones,
+    std::vector<int32_t>* out_word2ph) const {
   std::vector<std::string> phonemes;
+  // Track [start, end) of each Chinese character's phonemes so we can apply
+  // tone sandhi after collecting all chars. MeloTTS uses pypinyin which
+  // applies third-tone sandhi (consecutive 3s → 2,3) word-by-word; we use
+  // a simpler pairwise rule which covers the most common case.
+  struct ChunkSpan { size_t begin; size_t end; int tone; };
+  std::vector<ChunkSpan> hanzi_spans;
   const char* p = text.c_str();
   const char* end = p + text.size();
 
@@ -244,6 +295,7 @@ std::vector<std::string> TextFrontend::ChineseG2P(const std::string& text,
     if (is_chinese_char(cp)) {
       auto it = char_to_pinyin_.find(cp);
       if (it != char_to_pinyin_.end()) {
+        size_t begin_idx = phonemes.size();
         // Split pinyin into initial + tone-stripped final + tone digit
         // e.g. "ni3" -> "n" + "i" + tone=3,  "zhuang1" -> "zh" + "uang" + tone=1
         const std::string& py = it->second;
@@ -280,25 +332,43 @@ std::vector<std::string> TextFrontend::ChineseG2P(const std::string& text,
             final_clean = "ih";
         }
 
-        if (!initial.empty()) { phonemes.push_back(initial); if (out_tones) out_tones->push_back(0); }
+        // MeloTTS Chinese G2P: zero-initial syllables (e.g. 爱/安/我) get an
+        // explicit `AA` token prepended. Without it, the phoneme count
+        // mismatches the model's training-time layout.
+        if (initial.empty() && !final_clean.empty()) {
+          phonemes.push_back("AA");
+          if (out_tones) out_tones->push_back(tone);
+        }
+
+        if (!initial.empty()) { phonemes.push_back(initial); if (out_tones) out_tones->push_back(tone); }
         if (!final_clean.empty()) { phonemes.push_back(final_clean); if (out_tones) out_tones->push_back(tone); }
+
+        hanzi_spans.push_back({begin_idx, phonemes.size(), tone});
+        if (out_word2ph) out_word2ph->push_back((int32_t)(phonemes.size() - begin_idx));
       } else {
         phonemes.push_back("UNK");
         if (out_tones) out_tones->push_back(0);
+        hanzi_spans.push_back({phonemes.size() - 1, phonemes.size(), 0});
+        if (out_word2ph) out_word2ph->push_back(1);
       }
     } else if (cp == ' ' || cp == '\t' || cp == '\n') {
-      phonemes.push_back("sp");
-	      if (out_tones) out_tones->push_back(0);
+      // spaces ignored in Chinese
     } else if (cp == '.' || cp == 0x3002) {  // period or Chinese period
       phonemes.push_back(".");
-      phonemes.push_back("sil");
+      if (out_tones) out_tones->push_back(0);
+      if (out_word2ph) out_word2ph->push_back(1);
     } else if (cp == ',' || cp == 0xFF0C) {
       phonemes.push_back(",");
-      phonemes.push_back("sp");
+      if (out_tones) out_tones->push_back(0);
+      if (out_word2ph) out_word2ph->push_back(1);
     } else if (cp == '!' || cp == 0xFF01) {
       phonemes.push_back("!");
+      if (out_tones) out_tones->push_back(0);
+      if (out_word2ph) out_word2ph->push_back(1);
     } else if (cp == '?' || cp == 0xFF1F) {
       phonemes.push_back("?");
+      if (out_tones) out_tones->push_back(0);
+      if (out_word2ph) out_word2ph->push_back(1);
     } else if (cp < 0x80 && std::isalpha(static_cast<char>(cp))) {
       // English word embedded in Chinese text — collect full word
       std::string word;
@@ -313,8 +383,35 @@ std::vector<std::string> TextFrontend::ChineseG2P(const std::string& text,
           break;
         }
       }
+      size_t before = phonemes.size();
       auto en_phs = EnglishG2P(word);
       phonemes.insert(phonemes.end(), en_phs.begin(), en_phs.end());
+      // Treat the entire English word as a single logical unit. NOTE: BERT
+      // WordPiece may split it into multiple subwords; alignment with BERT
+      // for mixed Chinese-English text is approximate.
+      if (out_word2ph) out_word2ph->push_back((int32_t)(phonemes.size() - before));
+    }
+  }
+
+  // --- Third-tone sandhi ---
+  // Mandarin rule: when two third-tone syllables are adjacent, the first
+  // becomes second tone. Without word boundaries we apply pairwise across
+  // the sequence (greedy left-to-right). This matches pypinyin's default
+  // tone3 sandhi for most short utterances.
+  if (out_tones && hanzi_spans.size() >= 2) {
+    std::vector<bool> changed(hanzi_spans.size(), false);
+    for (size_t i = 0; i + 1 < hanzi_spans.size(); i++) {
+      if (changed[i]) continue;
+      if (hanzi_spans[i].tone == 3 && hanzi_spans[i + 1].tone == 3) {
+        // Change tones of hanzi_spans[i] phonemes from 3 to 2
+        for (size_t k = hanzi_spans[i].begin; k < hanzi_spans[i].end; k++) {
+          if (k < out_tones->size() && (*out_tones)[k] == 3) {
+            (*out_tones)[k] = 2;
+          }
+        }
+        hanzi_spans[i].tone = 2;
+        changed[i] = true;
+      }
     }
   }
 
@@ -350,13 +447,18 @@ std::vector<std::string> TextFrontend::EnglishG2P(const std::string& text) const
     }
 
     std::string lower = to_lower(token);
+    std::vector<std::string> word_phs;
     auto it = en_lexicon_.find(lower);
     if (it != en_lexicon_.end()) {
-      phonemes.insert(phonemes.end(), it->second.begin(), it->second.end());
+      word_phs = it->second;
     } else {
-      // Rule-based fallback
-      auto fallback = EnglishRuleFallback(lower);
-      phonemes.insert(phonemes.end(), fallback.begin(), fallback.end());
+      word_phs = EnglishRuleFallback(lower);
+    }
+    // OpenVoice2/MeloTTS English symbols are lowercase ARPABET (hh, ah, l, ow, ...).
+    // CMU dict + rule fallback return uppercase, so lowercase before lookup.
+    for (auto& ph : word_phs) {
+      ph = to_lower(ph);
+      phonemes.push_back(ph);
     }
 
     // Add punctuation
@@ -364,7 +466,7 @@ std::vector<std::string> TextFrontend::EnglishG2P(const std::string& text) const
       phonemes.push_back(std::string(1, c));
     }
 
-    phonemes.push_back("sp");  // word boundary
+    phonemes.push_back("_");  // word boundary (blank token, matches symbol table)
   }
 
 
@@ -412,74 +514,116 @@ std::vector<std::string> TextFrontend::EnglishRuleFallback(const std::string& wo
 
 std::vector<int32_t> TextFrontend::TextToPhonemeIds(const std::string& text,
                                                      const std::string& language,
-                                                     std::vector<int32_t>* out_tones) const {
-  std::vector<std::string> phonemes;
+                                                     std::vector<int32_t>* out_tones,
+                                                     std::vector<int32_t>* out_lang_ids,
+                                                     int language_id,
+                                                     bool add_blank,
+                                                     std::vector<int32_t>* out_word2ph) const {
+  // Auto-detect Chinese characters: if text contains CJK codepoints, use zh G2P
+  // regardless of language parameter (handles the case where language defaults to "English")
+  bool has_chinese = false;
+  {
+    const char* p = text.c_str();
+    const char* end = p + text.size();
+    while (p < end) {
+      uint32_t cp = utf8_decode_char(p, end);
+      if (is_chinese_char(cp)) { has_chinese = true; break; }
+    }
+  }
+  bool use_zh = has_chinese || language == "zh" || language == "ZH";
 
-  if (language == "zh" || language == "ZH") {
-    phonemes = ChineseG2P(text, out_tones);
+  std::vector<std::string> phonemes;
+  std::vector<int32_t> tones_local;
+  std::vector<int32_t>* tones_ptr = out_tones ? out_tones : &tones_local;
+  tones_ptr->clear();
+
+  std::vector<int32_t> word2ph_local;
+  std::vector<int32_t>* w2p_ptr = out_word2ph ? out_word2ph : &word2ph_local;
+  w2p_ptr->clear();
+
+  if (use_zh) {
+    phonemes = ChineseG2P(text, tones_ptr, w2p_ptr);
   } else {
     phonemes = EnglishG2P(text);
-    if (out_tones) out_tones->assign(phonemes.size(), 0);
+    tones_ptr->assign(phonemes.size(), 0);
+    // Fallback: lump all English phonemes under one logical unit. This is
+    // only used when BERT alignment is not needed (en-only path).
+    if (!phonemes.empty()) w2p_ptr->push_back((int32_t)phonemes.size());
   }
 
-  // Convert phonemes to IDs, interspersing blanks for Chinese
-  std::vector<int32_t> ids;
-
-  // Get blank ID (used for interspersion in Chinese)
-  int32_t blank_id = 0;
+  // Get special IDs
+  int32_t blank_id = 0;  // "_"
   auto blank_it = phoneme_to_id_.find("_");
   if (blank_it != phoneme_to_id_.end()) blank_id = blank_it->second;
-
-  int32_t unk_id = 3;  // default <unk> ID
-  auto unk_it = phoneme_to_id_.find("<unk>");
+  int32_t unk_id = 0;
+  auto unk_it = phoneme_to_id_.find("UNK");
   if (unk_it != phoneme_to_id_.end()) unk_id = unk_it->second;
 
-  // Prepare tone list for interspersed output
-  std::vector<int32_t> new_tones;
+  // Step 1: Add leading/trailing `_` to match MeloTTS g2p output convention.
+  std::vector<int32_t> raw_ids;
+  std::vector<int32_t> raw_tones;
+  std::vector<int32_t> raw_langs;
+  raw_ids.reserve(phonemes.size() + 2);
+  raw_tones.reserve(phonemes.size() + 2);
+  raw_langs.reserve(phonemes.size() + 2);
 
-  if (language == "zh" || language == "ZH") {
-    // MeloTTS Chinese: intersperse blank "_" between every phoneme:
-    //   _ p1 _ p2 _ p3 _ ... _ pN _
-    // with tone 0 for blanks, original tone for each phoneme
+  raw_ids.push_back(blank_id);
+  raw_tones.push_back(0);
+  raw_langs.push_back(language_id);
+  for (size_t i = 0; i < phonemes.size(); i++) {
+    auto it = phoneme_to_id_.find(phonemes[i]);
+    raw_ids.push_back(it != phoneme_to_id_.end() ? it->second : unk_id);
+    raw_tones.push_back(i < tones_ptr->size() ? (*tones_ptr)[i] : 0);
+    raw_langs.push_back(language_id);
+  }
+  raw_ids.push_back(blank_id);
+  raw_tones.push_back(0);
+  raw_langs.push_back(language_id);
+
+  // Step 2: If add_blank, intersperse `_` (id=0) between every pair AND at boundaries.
+  // MeloTTS commons.intersperse: result has length 2N+1, with blanks at even indices.
+  // Tones and lang_ids for the interspersed blanks are 0.
+  std::vector<int32_t> ids;
+  if (add_blank) {
+    size_t n = raw_ids.size();
+    ids.reserve(2 * n + 1);
+    if (out_tones) { out_tones->clear(); out_tones->reserve(2 * n + 1); }
+    if (out_lang_ids) { out_lang_ids->clear(); out_lang_ids->reserve(2 * n + 1); }
     ids.push_back(blank_id);
-    if (out_tones) new_tones.push_back(0);
-
-    for (size_t i = 0; i < phonemes.size(); i++) {
-      auto it = phoneme_to_id_.find(phonemes[i]);
-      ids.push_back(it != phoneme_to_id_.end() ? it->second : unk_id);
-      ids.push_back(blank_id);
-      if (out_tones) {
-        int t = (i < out_tones->size()) ? (*out_tones)[i] : 0;
-        new_tones.push_back(t);
-        new_tones.push_back(0);
-      }
-    }
-    if (out_tones) *out_tones = std::move(new_tones);
-  } else {
-    // English: just map directly (no interspersion needed)
-    for (const auto& ph : phonemes) {
-      auto it = phoneme_to_id_.find(ph);
-      if (it != phoneme_to_id_.end()) {
-        ids.push_back(it->second);
-      } else {
-        ids.push_back(unk_id);
-      }
-    }
-  }
-
-  // Add <sos> at beginning
-  auto sos_it = phoneme_to_id_.find("<sos>");
-  if (sos_it != phoneme_to_id_.end()) {
-    ids.insert(ids.begin(), sos_it->second);
-    if (out_tones) out_tones->insert(out_tones->begin(), 0);
-  }
-
-  // Add <eos> at end
-  auto eos_it = phoneme_to_id_.find("<eos>");
-  if (eos_it != phoneme_to_id_.end()) {
-    ids.push_back(eos_it->second);
     if (out_tones) out_tones->push_back(0);
+    if (out_lang_ids) out_lang_ids->push_back(0);
+    for (size_t i = 0; i < n; i++) {
+      ids.push_back(raw_ids[i]);
+      if (out_tones) out_tones->push_back(raw_tones[i]);
+      if (out_lang_ids) out_lang_ids->push_back(raw_langs[i]);
+      ids.push_back(blank_id);
+      if (out_tones) out_tones->push_back(0);
+      if (out_lang_ids) out_lang_ids->push_back(0);
+    }
+  } else {
+    ids = std::move(raw_ids);
+    if (out_tones) *out_tones = std::move(raw_tones);
+    if (out_lang_ids) *out_lang_ids = std::move(raw_langs);
+  }
+
+  // Post-process word2ph: prepend 1 for [CLS] and append 1 for [SEP] (MeloTTS
+  // convention so word2ph aligns with BERT subwords including specials).
+  // If add_blank: word2ph *= 2 (each entry now spans both the phoneme and
+  // the interspersed blank that follows), then word2ph[0] += 1 to account
+  // for the extra leading blank inserted at index 0.
+  if (out_word2ph) {
+    std::vector<int32_t> w2p;
+    w2p.reserve(w2p_ptr->size() + 2);
+    w2p.push_back(1);  // [CLS]
+    for (int32_t c : *w2p_ptr) w2p.push_back(c);
+    w2p.push_back(1);  // [SEP]
+    if (add_blank) {
+      for (auto& c : w2p) c *= 2;
+      w2p[0] += 1;
+    }
+    *out_word2ph = std::move(w2p);
   }
 
   return ids;
 }
+

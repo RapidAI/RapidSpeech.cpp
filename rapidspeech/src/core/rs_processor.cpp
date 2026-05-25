@@ -13,6 +13,7 @@ RSProcessor::RSProcessor(std::shared_ptr<ISpeechModel> model,
     const auto &meta = model_->GetMeta();
     config.sample_rate = meta.audio_sample_rate;
     config.n_mels = meta.n_mels;
+    config.window_type = meta.window_type;
 
     // SenseVoice specific frontend config
     config.use_lfr = true;

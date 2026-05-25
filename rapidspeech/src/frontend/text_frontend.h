@@ -30,9 +30,15 @@ public:
   /// Convert text to phoneme IDs for the given language.
   /// language: "zh", "en" (default: "zh")
   /// Returns phoneme ID sequence suitable for the TTS text encoder.
+  /// If add_blank=true (MeloTTS default), interleaves `_` (id=0) between every phoneme;
+  /// out_lang_ids per-phoneme will be 0 for blank tokens, language_id for real phonemes.
   std::vector<int32_t> TextToPhonemeIds(const std::string& text,
                                          const std::string& language = "zh",
-                                         std::vector<int32_t>* out_tones = nullptr) const;
+                                         std::vector<int32_t>* out_tones = nullptr,
+                                         std::vector<int32_t>* out_lang_ids = nullptr,
+                                         int language_id = 0,
+                                         bool add_blank = true,
+                                         std::vector<int32_t>* out_word2ph = nullptr) const;
 
   /// Get vocabulary size (for model validation)
   int VocabSize() const { return static_cast<int>(phoneme_to_id_.size()); }
@@ -49,7 +55,8 @@ private:
 
   // Internal methods
   std::vector<std::string> ChineseG2P(const std::string& text,
-                                std::vector<int32_t>* out_tones = nullptr) const;
+                                std::vector<int32_t>* out_tones = nullptr,
+                                std::vector<int32_t>* out_word2ph = nullptr) const;
   std::vector<std::string> EnglishG2P(const std::string& text) const;
   std::vector<std::string> EnglishRuleFallback(const std::string& word) const;
 

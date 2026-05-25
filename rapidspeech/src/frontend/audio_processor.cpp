@@ -48,11 +48,26 @@ int AudioProcessor::RoundToPowerOfTwo(int n) {
 }
 
 void AudioProcessor::InitTables() {
-  // 1. Hamming Window
-  hamming_window_.resize(config_.frame_size);
-  for (int i = 0; i < config_.frame_size; i++) {
-    hamming_window_[i] =
-        0.54 - 0.46 * cos((2.0 * M_PI * i) / (config_.frame_size));
+  // 1. Analysis window — chosen by config_.window_type.
+  //    HAMMING (periodic, default): 0.54 - 0.46*cos(2*pi*i / N)
+  //    POVEY (Kaldi):               pow(0.5 - 0.5*cos(2*pi*i / (N-1)), 0.85)
+  analysis_window_.resize(config_.frame_size);
+  const int N = config_.frame_size;
+  switch (config_.window_type) {
+  case WindowType::POVEY: {
+    const double denom = (N > 1) ? (double)(N - 1) : 1.0;
+    for (int i = 0; i < N; i++) {
+      const double v = 0.5 - 0.5 * std::cos((2.0 * M_PI * i) / denom);
+      analysis_window_[i] = std::pow(v, 0.85);
+    }
+    break;
+  }
+  case WindowType::HAMMING:
+  default:
+    for (int i = 0; i < N; i++) {
+      analysis_window_[i] = 0.54 - 0.46 * std::cos((2.0 * M_PI * i) / N);
+    }
+    break;
   }
 
   // 2. FFT Tables
@@ -138,7 +153,7 @@ void AudioProcessor::ProcessFrame(int frame_idx,
 
   // 4. Hamming window
   for (int j = 0; j < config_.frame_size; j++) {
-    window_buf[j] *= hamming_window_[j];
+    window_buf[j] *= analysis_window_[j];
   }
 
   // 5. FFT
