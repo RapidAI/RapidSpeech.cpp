@@ -1,6 +1,7 @@
 #include "llm_model.h"
 #include "ggml-backend.h"
 #include "gguf.h"
+#include "utils/rs_log.h"
 #include <chrono>
 #include <cstring>
 #include <fstream>
@@ -10,12 +11,11 @@
 // ============================================
 // Logging Helpers
 // ============================================
+// Route through rs_log so the framework-wide log level controls visibility.
 
-#define LLM_LOG_INFO(fmt, ...) std::printf("[LLM] " fmt "\n", ##__VA_ARGS__)
-#define LLM_LOG_ERROR(fmt, ...)                                                \
-  std::fprintf(stderr, "[LLM] Error: " fmt "\n", ##__VA_ARGS__)
-#define LLM_LOG_WARN(fmt, ...)                                                 \
-  std::fprintf(stderr, "[LLM] Warning: " fmt "\n", ##__VA_ARGS__)
+#define LLM_LOG_INFO(fmt, ...) RS_LOG_INFO("[LLM] " fmt, ##__VA_ARGS__)
+#define LLM_LOG_ERROR(fmt, ...) RS_LOG_ERR("[LLM] " fmt, ##__VA_ARGS__)
+#define LLM_LOG_WARN(fmt, ...) RS_LOG_WARN("[LLM] " fmt, ##__VA_ARGS__)
 
 // ============================================
 // Model Registry

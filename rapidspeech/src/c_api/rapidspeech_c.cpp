@@ -1,12 +1,14 @@
 #include "core/rs_context.h"
 #include "core/rs_model.h"
 #include "core/rs_processor.h"
+#include "arch/funasr-nano.h"
 #include "arch/omnivoice.h"
 #include "rapidspeech.h"
 #include "utils/rs_log.h"
 #include <cstdarg>
 
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -596,15 +598,20 @@ RS_API void rs_set_imatrix_callback(rs_context_t *ctx,
                                                       struct ggml_cgraph *gf),
                                      void *userdata) {
     if (!ctx || !ctx->model) return;
-    auto *omnivoice = dynamic_cast<OmniVoiceModel *>(ctx->model.get());
-    if (!omnivoice) return;
 
+    std::function<void(struct ggml_cgraph *)> cb;
     if (callback) {
-        omnivoice->set_imatrix_callback(
-            [callback, userdata](struct ggml_cgraph *gf) {
-                callback(userdata, gf);
-            });
-    } else {
-        omnivoice->set_imatrix_callback(nullptr);
+        cb = [callback, userdata](struct ggml_cgraph *gf) {
+            callback(userdata, gf);
+        };
+    }
+
+    if (auto *omnivoice = dynamic_cast<OmniVoiceModel *>(ctx->model.get())) {
+        omnivoice->set_imatrix_callback(cb);
+        return;
+    }
+    if (auto *funasr = dynamic_cast<FunASRNanoModel *>(ctx->model.get())) {
+        funasr->set_imatrix_callback(cb);
+        return;
     }
 }
