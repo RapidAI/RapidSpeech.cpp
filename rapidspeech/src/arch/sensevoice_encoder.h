@@ -3,6 +3,7 @@
 #include "core/rs_context.h"
 #include "core/rs_model.h"
 #include <cmath>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -86,6 +87,11 @@ public:
               ggml_backend_sched_t sched);
   virtual bool MapTensors(std::map<std::string, struct ggml_tensor *> &tensors);
 
+  // Imatrix activation collection: invoked after each graph compute when set.
+  void set_imatrix_callback(std::function<void(struct ggml_cgraph *)> cb) {
+    imatrix_cb_ = std::move(cb);
+  }
+
 private:
   struct ggml_context *ctx_weights_;
   // Optimization: Cache for positional encodings to avoid re-computing sin/cos
@@ -97,6 +103,9 @@ private:
   // pointers from confusing the backend scheduler.
   struct ggml_context *cached_ctx_ = nullptr;
   struct ggml_cgraph *cached_gf_ = nullptr;
+
+  // Imatrix collection callback (post-compute)
+  std::function<void(struct ggml_cgraph *)> imatrix_cb_;
 
   // Helper to resize and pre-compute the table
   void ensure_pos_encoding_size(int required_len, int dim);

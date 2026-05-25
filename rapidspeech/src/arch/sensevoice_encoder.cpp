@@ -424,6 +424,10 @@ bool SenseVoiceEncoderModel::Encode(const std::vector<float> &input_frames,
     return false;
   }
 
+  if (imatrix_cb_) {
+    imatrix_cb_(cached_gf_);
+  }
+
   // --- State Persistence Logic ---
   if (sv_state.encoder_out == nullptr ||
       sv_state.encoder_out->ne[0] != cur->ne[0] ||

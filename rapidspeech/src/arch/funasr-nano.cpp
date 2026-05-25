@@ -8,6 +8,7 @@
 #include "utils/debug_utils.h"
 #include "utils/rs_log.h"
 #include "utils/rs_wav.h"
+#include <cstdlib>
 #include <functional>
 #include <unordered_set>
 
@@ -41,6 +42,54 @@ struct FunASRNanoState : public RSState {
   }
 };
 
+static int funasr_utf8_decode(const char *p, size_t avail, uint32_t *cp) {
+  if (avail == 0)
+    return 0;
+  unsigned char c0 = (unsigned char)p[0];
+  if (c0 < 0x80) {
+    *cp = c0;
+    return 1;
+  }
+  if ((c0 >> 5) == 0x6 && avail >= 2) {
+    *cp = ((uint32_t)(c0 & 0x1F) << 6) | ((uint32_t)(p[1] & 0x3F));
+    return 2;
+  }
+  if ((c0 >> 4) == 0xE && avail >= 3) {
+    *cp = ((uint32_t)(c0 & 0x0F) << 12) |
+          ((uint32_t)(p[1] & 0x3F) << 6) | (uint32_t)(p[2] & 0x3F);
+    return 3;
+  }
+  if ((c0 >> 3) == 0x1E && avail >= 4) {
+    *cp = ((uint32_t)(c0 & 0x07) << 18) |
+          ((uint32_t)(p[1] & 0x3F) << 12) |
+          ((uint32_t)(p[2] & 0x3F) << 6) | (uint32_t)(p[3] & 0x3F);
+    return 4;
+  }
+  *cp = c0;
+  return 1;
+}
+
+static std::string decode_ctc_token_bytes(const std::string &token) {
+  if (token.empty() || token[0] == '<')
+    return "";
+
+  std::string bytes;
+  bytes.reserve(token.size());
+  for (size_t i = 0; i < token.size();) {
+    uint32_t cp = 0;
+    int n = funasr_utf8_decode(token.data() + i, token.size() - i, &cp);
+    if (n <= 0)
+      break;
+    if (cp <= 0xFF) {
+      bytes.push_back((char)cp);
+    } else {
+      bytes.append(token.data() + i, n);
+    }
+    i += n;
+  }
+  return bytes;
+}
+
 // --- FunASRNanoModel Implementation ---
 
 FunASRNanoModel::FunASRNanoModel()
@@ -70,6 +119,10 @@ bool FunASRNanoModel::Load(const std::unique_ptr<rs_context_t> &ctx,
   // 1. Load Hyperparameters from GGUF KV
   hparams_.n_vocab = gguf_get_val_i32(
       ctx_gguf, gguf_find_key(ctx_gguf, "tokenizer.vocab_size"));
+  int ctc_odim_idx = gguf_find_key(ctx_gguf, "ctc.odim");
+  if (ctc_odim_idx != -1) {
+    hparams_.n_ctc_vocab = gguf_get_val_i32(ctx_gguf, ctc_odim_idx);
+  }
   hparams_.n_encoder_hidden_state = gguf_get_val_i32(
       ctx_gguf, gguf_find_key(ctx_gguf, "encoder.output_size"));
   hparams_.n_encoder_linear_units = gguf_get_val_i32(
@@ -130,13 +183,27 @@ bool FunASRNanoModel::Load(const std::unique_ptr<rs_context_t> &ctx,
   meta_.n_mels = hparams_.n_mels;
   meta_.vocab_size = hparams_.n_vocab;
 
-  // 2. Load Vocabulary
-  const int token_idx = gguf_find_key(ctx_gguf, "tokenizer.ggml.tokens");
+  // 2. Load CTC vocabulary.  Combined FunASRNano+Qwen GGUFs keep the Qwen
+  // tokenizer under tokenizer.ggml.tokens; CTC needs its own token table.
+  int token_idx = gguf_find_key(ctx_gguf, "ctc.tokenizer.ggml.tokens");
+  if (token_idx == -1) {
+    int generic_token_idx = gguf_find_key(ctx_gguf, "tokenizer.ggml.tokens");
+    if (generic_token_idx != -1 &&
+        gguf_get_arr_n(ctx_gguf, generic_token_idx) == hparams_.n_ctc_vocab) {
+      token_idx = generic_token_idx;
+    }
+  }
   if (token_idx != -1) {
     int n_vocab = gguf_get_arr_n(ctx_gguf, token_idx);
     for (int i = 0; i < n_vocab; i++) {
       vocab_.id_to_token[i] = gguf_get_arr_str(ctx_gguf, token_idx, i);
     }
+    vocab_.n_vocab = n_vocab;
+    vocab_.has_ctc_tokens = true;
+  } else {
+    RS_LOG_WARN("FunASRNano: CTC token table missing; CTC/partial text will "
+                "be suppressed. Reconvert GGUF to include "
+                "ctc.tokenizer.ggml.tokens.");
   }
 
   // 3. Extract CMVN from GGUF metadata
@@ -314,6 +381,14 @@ bool FunASRNanoModel::Encode(const std::vector<float> &input_frames,
   return encoder_->Encode(input_frames, state, sched);
 }
 
+void FunASRNanoModel::set_imatrix_callback(
+    std::function<void(struct ggml_cgraph *)> cb) {
+  imatrix_cb_ = cb;
+  if (encoder_) {
+    encoder_->set_imatrix_callback(cb);
+  }
+}
+
 static struct ggml_tensor *
 decoder_forward(const FunASRNanoHParams &hparams, struct ggml_context *ctx,
                 struct ggml_tensor *cur, FunASRNanoTransformerDecoder &layers) {
@@ -438,26 +513,25 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   auto &sv_state = static_cast<FunASRNanoState &>(state);
   if (!sv_state.encoder_out || !llm_model_)
     return false;
+  const bool debug_decode = std::getenv("RS_DEBUG_ASR_DECODE") != nullptr;
 
   const int audio_T = sv_state.encoder_out->ne[1];     // Audio sequence length
   const int encoder_dim = sv_state.encoder_out->ne[0]; // Encoder dim (512)
   const int llm_dim = llm_model_->hparams().n_embd;    // Qwen3 hidden dim
 
-  // Build prompt
-  std::string user_input = "<|im_start|>system\nYou are a helpful "
-                           "assistant.<|im_end|>\n<|im_start|>user\n" +
-                           user_input_prompt_;
-  std::string suffix_input = "<|im_end|>\n<|im_start|>assistant\n";
-  // Tokenize user_input
-  std::vector<int32_t> prefix_tokens;
-  std::vector<int32_t> suffix_tokens;
-  if (llm_model_) {
-    prefix_tokens = llm_model_->vocab().tokenize(user_input, false);
+  if (cached_prefix_tokens_.empty() ||
+      cached_user_input_prompt_ != user_input_prompt_) {
+    std::string user_input = "<|im_start|>system\nYou are a helpful "
+                             "assistant.<|im_end|>\n<|im_start|>user\n" +
+                             user_input_prompt_;
+    std::string suffix_input = "<|im_end|>\n<|im_start|>assistant\n";
+    cached_prefix_tokens_ = llm_model_->vocab().tokenize(user_input, false);
+    cached_suffix_tokens_ = llm_model_->vocab().tokenize(suffix_input, false);
+    cached_user_input_prompt_ = user_input_prompt_;
   }
+  const std::vector<int32_t> &prefix_tokens = cached_prefix_tokens_;
+  const std::vector<int32_t> &suffix_tokens = cached_suffix_tokens_;
 
-  if (llm_model_) {
-    suffix_tokens = llm_model_->vocab().tokenize(suffix_input, false);
-  }
   int audio_insert_idx = (int)prefix_tokens.size();
   int total_T = audio_insert_idx + audio_T + (int)suffix_tokens.size();
 
@@ -535,6 +609,10 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
     return false;
   }
 
+  if (imatrix_cb_) {
+    imatrix_cb_(gf_proj);
+  }
+
   // Get combined embeddings
   std::vector<float> llm_embeds_host(ggml_nelements(llm_embeds));
   ggml_backend_tensor_get(llm_embeds, llm_embeds_host.data(), 0,
@@ -595,8 +673,10 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   }
   if (positions_tensor) {
     result->set_position_ids(positions_tensor, positions.data(), total_T);
-    RS_LOG_INFO("Prefill: set position_ids, first=%d last=%d, n_tokens=%d",
-                (int)positions[0], (int)positions[total_T - 1], total_T);
+    if (debug_decode) {
+      RS_LOG_DEBUG("Prefill: set position_ids, first=%d last=%d, n_tokens=%d",
+                   (int)positions[0], (int)positions[total_T - 1], total_T);
+    }
   } else {
     RS_LOG_ERR("Prefill: position_ids tensor not found!");
   }
@@ -605,10 +685,12 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   ggml_tensor *causal_mask_tensor = result->get_input_tensor("causal_mask");
   if (causal_mask_tensor) {
     result->set_causal_mask(causal_mask_tensor, total_T, 0);
-    RS_LOG_INFO("Prefill: set causal_mask, shape [%lld,%lld] type=%s",
-                (long long)causal_mask_tensor->ne[0],
-                (long long)causal_mask_tensor->ne[1],
-                ggml_type_name(causal_mask_tensor->type));
+    if (debug_decode) {
+      RS_LOG_DEBUG("Prefill: set causal_mask, shape [%lld,%lld] type=%s",
+                   (long long)causal_mask_tensor->ne[0],
+                   (long long)causal_mask_tensor->ne[1],
+                   ggml_type_name(causal_mask_tensor->type));
+    }
   } else {
     RS_LOG_ERR("Prefill: causal_mask tensor not found!");
   }
@@ -618,6 +700,10 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
     RS_LOG_ERR("DecodeWithLLM: LLM prefill compute failed");
     ggml_free(ctx_llm);
     return false;
+  }
+
+  if (imatrix_cb_) {
+    imatrix_cb_(result->get_graph());
   }
 
   // 10. Get logits - now only the LAST token position is output (optimised)
@@ -635,7 +721,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
                           logits_host.size() * sizeof(float));
 
   // Diagnostics: check logits range at last position
-  {
+  if (debug_decode) {
     float max_logit = -1e30f, min_logit = 1e30f;
     int max_idx = 0;
     int nan_count = 0, inf_count = 0;
@@ -656,14 +742,16 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
       if (val < min_logit)
         min_logit = val;
     }
-    RS_LOG_INFO("Prefill logits at last pos: min=%.4f max=%.4f max_idx=%d "
-                "nan=%d inf=%d (n_vocab=%d)",
-                min_logit, max_logit, max_idx, nan_count, inf_count, n_vocab);
+    RS_LOG_DEBUG("Prefill logits at last pos: min=%.4f max=%.4f max_idx=%d "
+                 "nan=%d inf=%d (n_vocab=%d)",
+                 min_logit, max_logit, max_idx, nan_count, inf_count, n_vocab);
   }
 
   std::vector<int32_t> token_ids;
 
-  RS_LOG_INFO("Sampling from last position (prefill output = 1 token)");
+  if (debug_decode) {
+    RS_LOG_DEBUG("Sampling from last position (prefill output = 1 token)");
+  }
 
   // Greedy sample from the single logits row
   int32_t best_token = 0;
@@ -681,9 +769,12 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   float eos_logit = (eos_token_id >= 0 && eos_token_id < n_vocab)
                         ? logits_host[eos_token_id]
                         : -INFINITY;
-  RS_LOG_INFO("First token: %d (%s) | EOS=%d logit=%.4f | top_logit=%.4f id=%d",
-              best_token, llm_model_->vocab().decode(best_token).c_str(),
-              eos_token_id, eos_logit, best_prob, best_token);
+  if (debug_decode) {
+    RS_LOG_DEBUG(
+        "First token: %d (%s) | EOS=%d logit=%.4f | top_logit=%.4f id=%d",
+        best_token, llm_model_->vocab().decode(best_token).c_str(),
+        eos_token_id, eos_logit, best_prob, best_token);
+  }
 
   // Extract K/V per layer from output tensors and store in host cache
   const auto &lp = llm_model_->hparams();
@@ -716,7 +807,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   }
 
   // Verify KV cache data integrity after prefill
-  {
+  if (debug_decode) {
     float k_sum = 0.0f, v_sum = 0.0f;
     if (!host_kv_cache_k_.empty() && !host_kv_cache_k_[0].empty()) {
       size_t check_n = 16;
@@ -727,7 +818,7 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
         v_sum += host_kv_cache_v_[0][i];
       }
     }
-    RS_LOG_INFO(
+    RS_LOG_DEBUG(
         "Prefill KV cache: layer0 K_sum(16)=%.4f V_sum(16)=%.4f, n_cached=%d",
         k_sum, v_sum, n_cached_tokens_);
   }
@@ -817,14 +908,56 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   }
 
   // ==========================================
+  // Pre-warm gallocr: reserve GPU compute buffer at maximum size.
+  //
+  // Each decode step grows n_kv_cache by 1 (causal mask and KV-concat tensors
+  // grow with it).  Without this warmup, ggml_gallocr_needs_realloc() returns
+  // true every single step, triggering ggml_gallocr_reserve() which frees and
+  // re-allocates the GPU scratch buffer via the Metal/CUDA driver.  That is an
+  // expensive syscall that happens MAX_DECODE_TOKENS (512) times per segment.
+  // Over a long session the repeated alloc/free fragments GPU memory so each
+  // reallocation becomes progressively slower — the direct cause of rising RTF.
+  //
+  // By pre-warming with the LARGEST decode graph (n_kv_cache = n_kv_max - 1),
+  // the gallocr records size_max at the maximum values for every tensor.
+  // All subsequent decode steps see tensors whose sizes are <= size_max, so
+  // ggml_gallocr_needs_realloc() stays false and the GPU scratch buffer is
+  // never reallocated inside the loop.
+  {
+    llm_build_opts warmup_opts;
+    warmup_opts.output_mode   = llm_output_mode::OUTPUT_LOGITS;
+    warmup_opts.skip_embeddings = false;
+    warmup_opts.use_kv_cache  = true;
+    warmup_opts.is_decode_step = true;
+    warmup_opts.n_kv_cache    = n_kv_max - 1;
+    warmup_opts.n_kv_max      = n_kv_max;
+    warmup_opts.causal_mask   = true;
+    warmup_opts.gpu_kv_k      = gpu_kv_k_vec.data();
+    warmup_opts.gpu_kv_v      = gpu_kv_v_vec.data();
+
+    llm_pos warmup_pos  = (llm_pos)(n_kv_max - 1 + 2);
+    int32_t dummy_token = 0;
+    auto warmup_result  = llm_graph_builder_->build_graph(
+        &dummy_token, 1, nullptr, &warmup_pos, &warmup_opts);
+    if (warmup_result) {
+      // sched_reserve calls sched_reset internally; gallocr size_max persists.
+      ggml_backend_sched_reserve(sched, warmup_result->get_graph());
+    }
+  }
+
+  // ==========================================
   // Autoregressive decode loop (with GPU-persistent KV cache)
   // ==========================================
+  std::vector<float> kv_stage_k(kv_dim);
+  std::vector<float> kv_stage_v(kv_dim);
 
   for (int step = 0; step < MAX_DECODE_TOKENS; ++step) {
     llm_pos decode_pos = (llm_pos)(n_cached_tokens_ + 2);
-    RS_LOG_INFO("Decode step %d: pos=%d, n_cached=%d, input_token=%d (%s)",
-                step, (int)decode_pos, n_cached_tokens_, best_token,
-                llm_model_->vocab().decode(best_token).c_str());
+    if (debug_decode) {
+      RS_LOG_DEBUG("Decode step %d: pos=%d, n_cached=%d, input_token=%d (%s)",
+                   step, (int)decode_pos, n_cached_tokens_, best_token,
+                   llm_model_->vocab().decode(best_token).c_str());
+    }
 
     llm_build_opts dec_opts;
     dec_opts.output_mode = llm_output_mode::OUTPUT_LOGITS;
@@ -881,6 +1014,10 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
         GGML_STATUS_SUCCESS) {
       RS_LOG_ERR("Decode graph compute failed at step %d", step);
       break;
+    }
+
+    if (imatrix_cb_) {
+      imatrix_cb_(dec_result->get_graph());
     }
 
     // Extract logits and sample next token
@@ -952,23 +1089,15 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
         const size_t new_col_bytes = (size_t)kv_dim * sizeof(float);
         const size_t col_offset =
             (size_t)n_cached_tokens_ * kv_dim * sizeof(float);
-        host_kv_cache_k_[il].resize((n_cached_tokens_ + 1) * kv_dim);
-        host_kv_cache_v_[il].resize((n_cached_tokens_ + 1) * kv_dim);
-        ggml_backend_tensor_get(
-            k_out, host_kv_cache_k_[il].data() + n_cached_tokens_ * kv_dim,
-            col_offset, new_col_bytes);
-        ggml_backend_tensor_get(
-            v_out, host_kv_cache_v_[il].data() + n_cached_tokens_ * kv_dim,
-            col_offset, new_col_bytes);
+        ggml_backend_tensor_get(k_out, kv_stage_k.data(), col_offset,
+                                new_col_bytes);
+        ggml_backend_tensor_get(v_out, kv_stage_v.data(), col_offset,
+                                new_col_bytes);
 
         // Write new column to GPU-persistent buffer for next step's view
-        ggml_backend_tensor_set(gpu_kv_k_vec[il],
-                                host_kv_cache_k_[il].data() +
-                                    n_cached_tokens_ * kv_dim,
+        ggml_backend_tensor_set(gpu_kv_k_vec[il], kv_stage_k.data(),
                                 col_offset, new_col_bytes);
-        ggml_backend_tensor_set(gpu_kv_v_vec[il],
-                                host_kv_cache_v_[il].data() +
-                                    n_cached_tokens_ * kv_dim,
+        ggml_backend_tensor_set(gpu_kv_v_vec[il], kv_stage_v.data(),
                                 col_offset, new_col_bytes);
       }
     }
@@ -1080,6 +1209,10 @@ bool FunASRNanoModel::DecodeWithoutLLM(RSState &state,
     ggml_free(ctx0);
     return false;
   }
+
+  if (imatrix_cb_) {
+    imatrix_cb_(gf);
+  }
   // print_tensor(output_node);
   if (beam_size <= 1) {
     raw_ids.resize(T);
@@ -1105,6 +1238,9 @@ void FunASRNanoModel::SetCTCPrecheck(bool enable) {
 
 void FunASRNanoModel::SetUserInputPrompt(const std::string &prompt) {
   user_input_prompt_ = prompt;
+  cached_user_input_prompt_.clear();
+  cached_prefix_tokens_.clear();
+  cached_suffix_tokens_.clear();
 }
 
 /**
@@ -1151,6 +1287,9 @@ bool FunASRNanoModel::Decode(RSState &state, ggml_backend_sched_t sched) {
       ggml_backend_tensor_copy(sv_state.encoder_out, enc_in);
       if (ggml_backend_sched_graph_compute(sched, gf_ctc) ==
           GGML_STATUS_SUCCESS) {
+        if (imatrix_cb_) {
+          imatrix_cb_(gf_ctc);
+        }
         int T = sv_state.encoder_out->ne[1];
         raw_ids.resize(T);
         ggml_backend_tensor_get(cur, raw_ids.data(), 0,
@@ -1189,8 +1328,13 @@ bool FunASRNanoModel::Decode(RSState &state, ggml_backend_sched_t sched) {
 
   // Convert token IDs to text (for non-LLM path)
   if (!runtime_use_llm_ || !llm_model_) {
-    for (auto id : sv_state.ids) {
-      sv_state.tokens.push_back(this->vocab_.id_to_token[id]);
+    if (vocab_.has_ctc_tokens) {
+      for (auto id : sv_state.ids) {
+        auto it = vocab_.id_to_token.find(id);
+        if (it != vocab_.id_to_token.end()) {
+          sv_state.tokens.push_back(decode_ctc_token_bytes(it->second));
+        }
+      }
     }
   }
 

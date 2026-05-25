@@ -6,6 +6,7 @@
 #include "llm_model.h"
 #include "qwen3.h"
 #include "sensevoice_encoder.h"
+#include <functional>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -19,6 +20,7 @@ struct SenseVoiceEncoder;
  */
 struct FunASRNanoHParams {
   int32_t n_vocab = 0;
+  int32_t n_ctc_vocab = 0;
   int32_t n_encoder_hidden_state = 512;
   int32_t n_encoder_linear_units = 2048;
   int32_t n_encoder_attention_heads = 8;
@@ -54,6 +56,7 @@ struct FunASRNanoVocab {
   std::unordered_map<int, std::string> id_to_token;
   int n_vocab = 0;
   int blank_id = 60514;
+  bool has_ctc_tokens = false;
 };
 
 struct TransformerDecoder {
@@ -103,10 +106,18 @@ public:
 
   void SetUserInputPrompt(const std::string &prompt) override;
 
+  // Imatrix activation collection: invoked after each graph compute when set.
+  // Forwarded to the SenseVoice encoder too so encoder-side mul_mat nodes are
+  // captured.
+  void set_imatrix_callback(std::function<void(struct ggml_cgraph *)> cb);
+
 private:
   bool runtime_use_llm_ = true; // runtime toggle, initialized from hparams
   bool ctc_precheck_ = false;   // CTC pre-check before LLM (disabled by default)
   std::string user_input_prompt_;
+  std::string cached_user_input_prompt_;
+  std::vector<int32_t> cached_prefix_tokens_;
+  std::vector<int32_t> cached_suffix_tokens_;
   RSModelMeta meta_;
   FunASRNanoHParams hparams_;
   FunASRNanoVocab vocab_;
@@ -130,6 +141,9 @@ private:
   std::vector<int32_t> raw_ids;
   std::vector<float> host_log_probs;
   int beam_size = 1;
+
+  // Imatrix collection callback (post-compute on every graph in the pipeline).
+  std::function<void(struct ggml_cgraph *)> imatrix_cb_;
 
   bool MapTensors(std::map<std::string, struct ggml_tensor *> &tensors);
   bool SetLayerWeights(std::vector<SenseVoiceLayerEncoder> &layers,
