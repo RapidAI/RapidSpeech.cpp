@@ -36,12 +36,15 @@
  */
 
 #include "arch/silero_vad.h"
+#include "arch/fireredvad.h"
 #include "rapidspeech.h"
+#include "utils/rs_log.h"
 #include "utils/rs_wav.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "ggml.h"
 #include "gguf.h"
 
 #ifdef RS_USE_METAL
@@ -58,6 +61,7 @@
 #include <condition_variable>
 #include <csignal>
 #include <cstring>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -72,8 +76,18 @@ static void signal_handler(int) { g_stop_flag.store(true); }
 
 // ─────────────────────────────────────────────────────
 // Logging
+//   LOG_INFO  — always shown, kept terse
+//   LOG_DEBUG — only shown when --verbose / -V is set (or RS_VERBOSE=1)
+//   LOG_ERROR — always shown to stderr
 // ─────────────────────────────────────────────────────
+static bool g_verbose = false;
+
 #define LOG_INFO(fmt, ...) std::printf("[online] " fmt "\n", ##__VA_ARGS__)
+#define LOG_DEBUG(fmt, ...)                                                    \
+  do {                                                                         \
+    if (g_verbose)                                                             \
+      std::printf("[debug] " fmt "\n", ##__VA_ARGS__);                         \
+  } while (0)
 #define LOG_ERROR(fmt, ...)                                                    \
   std::fprintf(stderr, "[online] ERROR: " fmt "\n", ##__VA_ARGS__)
 
@@ -108,6 +122,7 @@ public:
     std::vector<float> pcm;
     float start_s, end_s;
     int index;
+    bool is_partial = false;
   };
 
   SpeechSegmentQueue(float max_dur_s = 60.0f, float warn_dur_s = 15.0f)
@@ -118,6 +133,17 @@ public:
   void push(Segment seg) {
     float seg_dur = seg.end_s - seg.start_s;
     std::lock_guard<std::mutex> lock(mtx_);
+
+    // Keep only the newest partial for a segment.  If the final segment is
+    // ready, any queued partial for the same segment is now stale.
+    for (auto it = segments_.begin(); it != segments_.end();) {
+      if (it->index == seg.index && (it->is_partial || !seg.is_partial)) {
+        queue_dur_s_ -= (it->end_s - it->start_s);
+        it = segments_.erase(it);
+      } else {
+        ++it;
+      }
+    }
 
     while (queue_dur_s_ + seg_dur > max_queue_dur_s_ && !segments_.empty()) {
       auto &oldest = segments_.front();
@@ -349,6 +375,16 @@ static ggml_context *load_gguf_weights(const char *path,
   return ctx;
 }
 
+// Read `general.architecture` from a loaded gguf_context.
+// Returns an empty string if the key is absent.
+static std::string read_gguf_arch(gguf_context *gguf) {
+  if (!gguf) return "";
+  int idx = gguf_find_key(gguf, "general.architecture");
+  if (idx < 0) return "";
+  const char *s = gguf_get_val_str(gguf, idx);
+  return s ? std::string(s) : std::string();
+}
+
 // ─────────────────────────────────────────────────────
 // Cross-platform microphone capture via miniaudio
 // ─────────────────────────────────────────────────────
@@ -427,6 +463,8 @@ struct OnlineArgs {
   int silence_ms = 600;
   int speech_pad_ms = 200;
   int preroll_ms = 500;
+  int partial_ms = 1000;
+  int max_segment_ms = 0; // 0 = disabled; force-flush long segments above this
   float prob_smooth = 0.3f;
   bool two_pass = false;
   bool ctc_precheck = false;
@@ -464,12 +502,18 @@ static bool parse_args(int argc, char **argv, OnlineArgs &args) {
       args.speech_pad_ms = std::stoi(argv[++i]);
     } else if (a == "--preroll-ms" && i + 1 < argc) {
       args.preroll_ms = std::stoi(argv[++i]);
+    } else if (a == "--partial-ms" && i + 1 < argc) {
+      args.partial_ms = std::stoi(argv[++i]);
+    } else if (a == "--max-segment-ms" && i + 1 < argc) {
+      args.max_segment_ms = std::stoi(argv[++i]);
     } else if (a == "--prob-smooth" && i + 1 < argc) {
       args.prob_smooth = std::stof(argv[++i]);
     } else if (a == "--two-pass") {
       args.two_pass = true;
     } else if (a == "--ctc-precheck") {
       args.ctc_precheck = true;
+    } else if (a == "-V" || a == "--verbose") {
+      g_verbose = true;
     } else if (a == "-h" || a == "--help") {
       std::cout
           << "Usage: rs-asr-online -m <asr.gguf> -v <vad.gguf> [options]\n"
@@ -492,6 +536,11 @@ static bool parse_args(int argc, char **argv, OnlineArgs &args) {
              "(default: 200)\n"
              "      --preroll-ms <ms>    Audio buffer kept during silence to "
              "avoid onset clipping (default: 500)\n"
+             "      --partial-ms <ms>    2-pass mode: interval for CTC "
+             "partial updates (default: 1000, 0=disable)\n"
+             "      --max-segment-ms <ms> Force-finalize a segment after this "
+             "much continuous speech (default: 0=disable; try 10000 for "
+             "newscasts to avoid long-segment stalls)\n"
              "      --prob-smooth <f>    EMA alpha for VAD prob smoothing "
              "(0=disable, default: 0.3)\n"
              "      --mic-chunk-ms <ms>  Mic read chunk size (default: 32)\n"
@@ -499,6 +548,8 @@ static bool parse_args(int argc, char **argv, OnlineArgs &args) {
              "rescore (FunASRNano)\n"
              "      --ctc-precheck       CTC pre-check before LLM to skip "
              "silence (reduces hallucination)\n"
+             "  -V, --verbose            Show debug logs and per-segment "
+             "stats (also: RS_VERBOSE=1)\n"
              "  -h, --help               Show this help\n"
           << std::endl;
       return false;
@@ -532,6 +583,8 @@ struct StreamState {
   int silence_frames = 0;
   int speech_start_offset = 0;
   int total_samples_read = 0;
+  int current_segment_index = 0;
+  int last_partial_samples = 0;
 
   // --- Pre-roll buffer: retains recent audio during silence so that ---
   // speech onset isn't truncated.  Works as a sliding window that is
@@ -547,6 +600,12 @@ struct StreamState {
   float adaptive_silence_ms = 600.0f; // current effective threshold
   float base_silence_ms = 600.0f;     // user-configured baseline
   std::deque<float> recent_seg_durs;  // last few segment durations (seconds)
+
+  // --- Soft endpoint search around max_segment_ms cap ---
+  // Track the lowest-VAD-probability frame within the search window before
+  // the hard cap so we can cut at a relative dip instead of mid-word.
+  int soft_cut_best_offset = -1; // sample offset within speech_buf, -1 = none
+  float soft_cut_best_prob = 1.0f;
 };
 
 // ─────────────────────────────────────────────────────
@@ -554,7 +613,8 @@ struct StreamState {
 // ─────────────────────────────────────────────────────
 static bool process_segment(rs_context_t *asr_ctx,
                             const std::vector<float> &pcm, float start_s,
-                            float end_s, int seg_index, bool two_pass) {
+                            float end_s, int seg_index, bool two_pass,
+                            bool is_partial) {
   if (pcm.empty())
     return false;
 
@@ -582,7 +642,7 @@ static bool process_segment(rs_context_t *asr_ctx,
   }
 
   // ── First pass: CTC decode (fast, no LLM) ──
-  if (two_pass)
+  if (two_pass || is_partial)
     rs_set_use_llm(asr_ctx, false);
 
   int32_t status = rs_process(asr_ctx);
@@ -590,13 +650,23 @@ static bool process_segment(rs_context_t *asr_ctx,
   if (status > 0)
     text = rs_get_text_output(asr_ctx);
 
-  if (two_pass) {
-    // Print interim (CTC) result — dimmed
-    std::cout << "\n"
-              << Color::c(Color::Grey) << "[" << format_timestamp(start_s)
-              << " → " << format_timestamp(end_s) << "]"
-              << Color::c(Color::Reset) << "  " << Color::c(Color::Dim)
-              << "1st: " << (text && text[0] ? text : "(silence)")
+  // ANSI: \r returns to col 0, \033[K clears to end of line — used to
+  // wipe any prior streaming/partial/VAD progress line cleanly.
+  const char *CLEAR_LINE = Color::enabled ? "\r\033[K" : "\r";
+
+  if (is_partial) {
+    // Streaming partial result — single overwriting line, indented + dim.
+    std::cout << CLEAR_LINE << "  " << Color::c(Color::Grey) << "["
+              << format_timestamp(end_s) << "] " << Color::c(Color::Reset)
+              << Color::c(Color::Dim)
+              << (text && text[0] ? text : "(listening)") << " …"
+              << Color::c(Color::Reset) << std::flush;
+  } else if (two_pass) {
+    // Interim (CTC) result — dimmed, overwrites the partial line.
+    std::cout << CLEAR_LINE << "  " << Color::c(Color::Grey) << "["
+              << format_timestamp(start_s) << " → " << format_timestamp(end_s)
+              << "] " << Color::c(Color::Reset) << Color::c(Color::Dim)
+              << (text && text[0] ? text : "(silence)")
               << Color::c(Color::Reset) << std::flush;
 
     // ── Second pass: LLM rescore ──
@@ -617,20 +687,21 @@ static bool process_segment(rs_context_t *asr_ctx,
         1e6f;
     float rtf = seg_dur > 0 ? elapsed / seg_dur : 0.f;
 
-    // Final result — bold, overwrites the interim line visually
-    std::cout << "\r"
-              << Color::c(Color::Cyan) << "[" << format_timestamp(start_s)
-              << " → " << format_timestamp(end_s) << "]"
-              << Color::c(Color::Reset) << "  " << Color::c(Color::Bold)
+    // Final result — overwrite interim with bold text.
+    std::cout << CLEAR_LINE << Color::c(Color::Cyan) << "["
+              << format_timestamp(start_s) << " → " << format_timestamp(end_s)
+              << "] " << Color::c(Color::Reset) << Color::c(Color::Bold)
               << (final_text && final_text[0] ? final_text : "(no speech)")
               << Color::c(Color::Reset) << "\n";
 
-    std::cout << Color::c(Color::Grey) << "  seg #" << seg_index << " | "
-              << std::fixed << std::setprecision(2) << seg_dur << "s"
-              << " | total: " << elapsed << "s"
-              << " (LLM: " << std::setprecision(2) << llm_elapsed << "s)"
-              << " | RTF: " << std::setprecision(3) << rtf
-              << Color::c(Color::Reset) << std::endl;
+    if (g_verbose) {
+      std::cout << Color::c(Color::Grey) << "  seg #" << seg_index << " · "
+                << std::fixed << std::setprecision(2) << seg_dur << "s · total "
+                << elapsed << "s (LLM " << std::setprecision(2) << llm_elapsed
+                << "s) · RTF " << std::setprecision(3) << rtf
+                << Color::c(Color::Reset) << "\n";
+    }
+    std::cout.flush();
   } else {
     auto t1 = std::chrono::steady_clock::now();
     float elapsed =
@@ -639,24 +710,29 @@ static bool process_segment(rs_context_t *asr_ctx,
     float rtf = seg_dur > 0 ? elapsed / seg_dur : 0.f;
 
     if (text && text[0]) {
-      std::cout << "\n"
-                << Color::c(Color::Cyan) << "[" << format_timestamp(start_s)
-                << " → " << format_timestamp(end_s) << "]"
-                << Color::c(Color::Reset) << "  " << Color::c(Color::Bold)
-                << text << Color::c(Color::Reset) << "\n";
-    } else {
-      std::cout << "\n"
-                << Color::c(Color::Grey) << "[" << format_timestamp(start_s)
-                << " → " << format_timestamp(end_s) << "]"
-                << Color::c(Color::Reset) << "  " << Color::c(Color::Dim)
+      std::cout << CLEAR_LINE << Color::c(Color::Cyan) << "["
+                << format_timestamp(start_s) << " → "
+                << format_timestamp(end_s) << "] " << Color::c(Color::Reset)
+                << Color::c(Color::Bold) << text << Color::c(Color::Reset)
+                << "\n";
+    } else if (g_verbose) {
+      // Suppress empty-segment noise unless verbose.
+      std::cout << CLEAR_LINE << Color::c(Color::Grey) << "["
+                << format_timestamp(start_s) << " → "
+                << format_timestamp(end_s) << "] " << Color::c(Color::Dim)
                 << "(no speech recognized)" << Color::c(Color::Reset) << "\n";
+    } else {
+      // Quietly wipe any leftover partial/VAD line.
+      std::cout << CLEAR_LINE;
     }
 
-    std::cout << Color::c(Color::Grey) << "  seg #" << seg_index << " | "
-              << std::fixed << std::setprecision(2) << seg_dur << "s"
-              << " | ASR: " << elapsed << "s"
-              << " | RTF: " << std::setprecision(3) << rtf
-              << Color::c(Color::Reset) << std::endl;
+    if (g_verbose) {
+      std::cout << Color::c(Color::Grey) << "  seg #" << seg_index << " · "
+                << std::fixed << std::setprecision(2) << seg_dur << "s · ASR "
+                << elapsed << "s · RTF " << std::setprecision(3) << rtf
+                << Color::c(Color::Reset) << "\n";
+    }
+    std::cout.flush();
   }
 
   rs_reset(asr_ctx);
@@ -723,8 +799,9 @@ static void asr_worker(const std::string &model_path, int n_threads,
     }
 
     process_segment(asr_ctx, seg.pcm, seg.start_s, seg.end_s, seg.index,
-                    two_pass);
-    seg_processed++;
+                    two_pass, seg.is_partial);
+    if (!seg.is_partial)
+      seg_processed++;
 
     if (queue.check_and_clear_slow_warning()) {
       std::cerr << Color::c(Color::Yellow)
@@ -737,6 +814,226 @@ static void asr_worker(const std::string &model_path, int n_threads,
   rs_free(asr_ctx);
   rs_clear_error();
   worker_done = true;
+}
+
+// ─────────────────────────────────────────────────────
+// FireRedVAD streaming state.
+//
+// FireRedVAD's postprocessor (4-state DFSMN state machine) emits
+// `is_speech_end` events with absolute (start_frame, end_frame) at
+// 100 Hz. We keep a rolling PCM buffer (with global sample offset)
+// and slice out segments by frame -> sample mapping.
+// ─────────────────────────────────────────────────────
+struct FireredStreamState {
+  std::deque<float> audio_buf;          // rolling PCM
+  int64_t audio_buf_start_sample = 0;   // global sample index of audio_buf[0]
+  int64_t total_samples_read = 0;
+  // Two-pass partial streaming state.
+  // current_seg_idx != 0 while a speech segment is in progress (between
+  // is_speech_start and is_speech_end). last_partial_sample is the global
+  // sample index at which the most recent partial was emitted.
+  int current_seg_idx = 0;
+  int64_t last_partial_sample = 0;
+};
+
+static bool process_vad_chunk_firered(
+    const float *chunk, int chunk_samples, FireRedVadModel &vad_model,
+    FireRedVadState &vad_state, FireredStreamState &state,
+    const OnlineArgs &args, SpeechSegmentQueue &queue,
+    std::atomic<int> &seg_counter) {
+  const int SAMPLE_RATE = 16000;
+  const int SAMPLES_PER_FRAME = 160;  // 10 ms shift @ 16 kHz
+
+  // Append to rolling PCM buffer.
+  state.audio_buf.insert(state.audio_buf.end(), chunk, chunk + chunk_samples);
+  state.total_samples_read += chunk_samples;
+
+  std::vector<float> pcm_chunk(chunk, chunk + chunk_samples);
+  auto results = vad_model.DetectStreamingChunk(pcm_chunk, vad_state);
+
+  // Per-frame progress in verbose mode.
+  if (g_verbose && !results.empty()) {
+    const auto &last = results.back();
+    float pos_s = (float)state.total_samples_read / SAMPLE_RATE;
+    if (last.is_speech) {
+      std::cout << "\r" << Color::c(Color::Green) << "["
+                << format_timestamp(pos_s) << "] "
+                << "▌SPEECH  p=" << std::fixed << std::setprecision(3)
+                << last.smoothed_prob << Color::c(Color::Reset) << "  "
+                << std::flush;
+    } else {
+      std::cout << "\r" << Color::c(Color::Grey) << "["
+                << format_timestamp(pos_s) << "] "
+                << "·silence p=" << std::fixed << std::setprecision(3)
+                << last.smoothed_prob << Color::c(Color::Reset) << "  "
+                << std::flush;
+    }
+  }
+
+  // Apply explicit speech_pad_ms (rewind start) and trailing pad (extend end)
+  // for consistency with the Silero path's CLI options.
+  const int pad_pre_samples = (args.speech_pad_ms * SAMPLE_RATE) / 1000;
+
+  int64_t latest_extracted_end_sample = 0;
+  for (const auto &r : results) {
+    if (r.is_speech_start) {
+      // New segment begins — assign a stable index that all partials and the
+      // final will share. The queue dedups partials when a final with the
+      // same index arrives.
+      state.current_seg_idx = ++seg_counter;
+      // Anchor the partial cadence to the segment's true start so the first
+      // partial fires after partial_ms of speech, not immediately.
+      if (r.speech_start_frame > 0) {
+        state.last_partial_sample =
+            (int64_t)(r.speech_start_frame - 1) * SAMPLES_PER_FRAME;
+      } else {
+        state.last_partial_sample = state.total_samples_read;
+      }
+    }
+
+    if (!r.is_speech_end) continue;
+    if (r.speech_start_frame <= 0 || r.speech_end_frame <= 0) continue;
+
+    int64_t start_sample =
+        (int64_t)(r.speech_start_frame - 1) * SAMPLES_PER_FRAME;
+    int64_t end_sample = (int64_t)r.speech_end_frame * SAMPLES_PER_FRAME;
+    start_sample = std::max<int64_t>(0, start_sample - pad_pre_samples);
+
+    int64_t buf_start = start_sample - state.audio_buf_start_sample;
+    int64_t buf_end = end_sample - state.audio_buf_start_sample;
+    if (buf_start < 0) buf_start = 0;
+    if (buf_end > (int64_t)state.audio_buf.size())
+      buf_end = (int64_t)state.audio_buf.size();
+    if (buf_end <= buf_start) continue;
+
+    std::vector<float> seg_pcm;
+    seg_pcm.reserve((size_t)(buf_end - buf_start));
+    auto it_begin = state.audio_buf.begin() + buf_start;
+    auto it_end = state.audio_buf.begin() + buf_end;
+    seg_pcm.insert(seg_pcm.end(), it_begin, it_end);
+
+    // Reuse the index assigned at is_speech_start so any prior partials are
+    // superseded by this final. If we somehow missed a start event, mint one.
+    int idx = state.current_seg_idx != 0 ? state.current_seg_idx : ++seg_counter;
+    state.current_seg_idx = 0;
+    state.last_partial_sample = 0;
+    float start_s = (float)start_sample / SAMPLE_RATE;
+    float end_s = (float)end_sample / SAMPLE_RATE;
+    queue.push({std::move(seg_pcm), start_s, end_s, idx, false});
+
+    latest_extracted_end_sample =
+        std::max(latest_extracted_end_sample, end_sample);
+  }
+
+  // ---- Partial emission for --two-pass mode ----
+  // After processing the chunk's events, if we're still inside an active
+  // segment and partial_ms worth of audio has accumulated since the last
+  // partial, emit a CTC-fast partial covering [speech_start .. now].
+  if (args.two_pass && args.partial_ms > 0 && state.current_seg_idx != 0 &&
+      vad_state.last_speech_start_frame > 0) {
+    const int64_t partial_interval_samples =
+        (int64_t)args.partial_ms * SAMPLE_RATE / 1000;
+    int64_t now_sample = state.total_samples_read;
+    if (partial_interval_samples > 0 &&
+        now_sample - state.last_partial_sample >= partial_interval_samples) {
+      constexpr float PARTIAL_BACKOFF_S = 5.0f;
+      if (queue.duration() < PARTIAL_BACKOFF_S) {
+        int64_t start_sample =
+            (int64_t)(vad_state.last_speech_start_frame - 1) * SAMPLES_PER_FRAME;
+        start_sample = std::max<int64_t>(0, start_sample - pad_pre_samples);
+
+        int64_t buf_start = start_sample - state.audio_buf_start_sample;
+        int64_t buf_end = now_sample - state.audio_buf_start_sample;
+        if (buf_start < 0) buf_start = 0;
+        if (buf_end > (int64_t)state.audio_buf.size())
+          buf_end = (int64_t)state.audio_buf.size();
+        if (buf_end > buf_start) {
+          std::vector<float> seg_pcm(state.audio_buf.begin() + buf_start,
+                                     state.audio_buf.begin() + buf_end);
+          float start_s = (float)start_sample / SAMPLE_RATE;
+          float end_s = (float)now_sample / SAMPLE_RATE;
+          queue.push({std::move(seg_pcm), start_s, end_s,
+                      state.current_seg_idx, true});
+          state.last_partial_sample = now_sample;
+        }
+      }
+    }
+  }
+
+  // Trim the rolling buffer. When in active speech we must keep audio back
+  // to the current segment's start (potentially up to max_speech_frame = 20 s
+  // in default config). When idle we only need a small head-of-segment pad.
+  int64_t keep_from_sample = state.total_samples_read;
+  if (vad_state.last_speech_start_frame > 0 &&
+      (vad_state.fsm_state == VadFsmState::SPEECH ||
+       vad_state.fsm_state == VadFsmState::POSSIBLE_SPEECH ||
+       vad_state.fsm_state == VadFsmState::POSSIBLE_SILENCE)) {
+    int64_t cur_seg_start =
+        (int64_t)(vad_state.last_speech_start_frame - 1) * SAMPLES_PER_FRAME;
+    keep_from_sample = std::min(keep_from_sample, cur_seg_start);
+  } else {
+    // Idle: keep a generous head pad (covers pad_start_frame + smoothing).
+    const int64_t IDLE_KEEP_SAMPLES = SAMPLE_RATE; // 1 s
+    keep_from_sample =
+        std::max<int64_t>(0, state.total_samples_read - IDLE_KEEP_SAMPLES);
+  }
+  // Also account for speech_pad_ms preroll.
+  keep_from_sample =
+      std::max<int64_t>(0, keep_from_sample - pad_pre_samples);
+  // Never drop audio we just emitted past, redundantly safe.
+  keep_from_sample =
+      std::max(keep_from_sample, latest_extracted_end_sample);
+
+  if (keep_from_sample > state.audio_buf_start_sample) {
+    int64_t to_drop = keep_from_sample - state.audio_buf_start_sample;
+    if (to_drop > (int64_t)state.audio_buf.size())
+      to_drop = (int64_t)state.audio_buf.size();
+    state.audio_buf.erase(state.audio_buf.begin(),
+                          state.audio_buf.begin() + (size_t)to_drop);
+    state.audio_buf_start_sample += to_drop;
+  }
+
+  return true;
+}
+
+// Emit any unfinished trailing speech at EOF. Mirrors the "Flush remaining
+// speech" behavior of the Silero path.
+static void flush_firered_tail(FireRedVadModel & /*vad_model*/,
+                               FireRedVadState &vad_state,
+                               FireredStreamState &state,
+                               SpeechSegmentQueue &queue,
+                               std::atomic<int> &seg_counter,
+                               const OnlineArgs &args) {
+  const int SAMPLE_RATE = 16000;
+  const int SAMPLES_PER_FRAME = 160;
+
+  const bool in_speech =
+      (vad_state.fsm_state == VadFsmState::SPEECH ||
+       vad_state.fsm_state == VadFsmState::POSSIBLE_SPEECH ||
+       vad_state.fsm_state == VadFsmState::POSSIBLE_SILENCE);
+  if (!in_speech || vad_state.last_speech_start_frame <= 0) return;
+
+  const int pad_pre_samples = (args.speech_pad_ms * SAMPLE_RATE) / 1000;
+  int64_t start_sample =
+      (int64_t)(vad_state.last_speech_start_frame - 1) * SAMPLES_PER_FRAME;
+  start_sample = std::max<int64_t>(0, start_sample - pad_pre_samples);
+  int64_t end_sample = state.total_samples_read;
+
+  int64_t buf_start = start_sample - state.audio_buf_start_sample;
+  int64_t buf_end = end_sample - state.audio_buf_start_sample;
+  if (buf_start < 0) buf_start = 0;
+  if (buf_end > (int64_t)state.audio_buf.size())
+    buf_end = (int64_t)state.audio_buf.size();
+  if (buf_end <= buf_start) return;
+
+  std::vector<float> seg_pcm(state.audio_buf.begin() + buf_start,
+                             state.audio_buf.begin() + buf_end);
+  int idx = state.current_seg_idx != 0 ? state.current_seg_idx : ++seg_counter;
+  state.current_seg_idx = 0;
+  state.last_partial_sample = 0;
+  float start_s = (float)start_sample / SAMPLE_RATE;
+  float end_s = (float)end_sample / SAMPLE_RATE;
+  queue.push({std::move(seg_pcm), start_s, end_s, idx, false});
 }
 
 // ─────────────────────────────────────────────────────
@@ -792,20 +1089,24 @@ process_vad_chunk(const float *chunk, int chunk_samples,
   if (silence_frames_limit < 1)
     silence_frames_limit = 1;
 
-  // Progress indicator (shows raw prob for debugging)
-  float pos_s = (float)state.total_samples_read / SAMPLE_RATE;
-  if (is_speech) {
-    std::cout << "\r" << Color::c(Color::Green) << "["
-              << format_timestamp(pos_s) << "] "
-              << "▌SPEECH  p=" << std::fixed << std::setprecision(3)
-              << state.smoothed_prob
-              << Color::c(Color::Reset) << "  " << std::flush;
-  } else {
-    std::cout << "\r" << Color::c(Color::Grey) << "[" << format_timestamp(pos_s)
-              << "] "
-              << "·silence p=" << std::fixed << std::setprecision(3)
-              << state.smoothed_prob
-              << Color::c(Color::Reset) << "  " << std::flush;
+  // Per-frame progress indicator — only shown in verbose mode.
+  // Otherwise we keep the terminal quiet between segments so that
+  // partial / final transcripts remain visually clean.
+  if (g_verbose) {
+    float pos_s = (float)state.total_samples_read / SAMPLE_RATE;
+    if (is_speech) {
+      std::cout << "\r" << Color::c(Color::Green) << "["
+                << format_timestamp(pos_s) << "] "
+                << "▌SPEECH  p=" << std::fixed << std::setprecision(3)
+                << state.smoothed_prob << Color::c(Color::Reset) << "  "
+                << std::flush;
+    } else {
+      std::cout << "\r" << Color::c(Color::Grey) << "["
+                << format_timestamp(pos_s) << "] "
+                << "·silence p=" << std::fixed << std::setprecision(3)
+                << state.smoothed_prob << Color::c(Color::Reset) << "  "
+                << std::flush;
+    }
   }
 
   // --- A. Pre-roll buffer management ---
@@ -826,6 +1127,10 @@ process_vad_chunk(const float *chunk, int chunk_samples,
     state.silence_frames = 0;
     if (!state.in_speech) {
       state.in_speech = true;
+      if (args.two_pass) {
+        state.current_segment_index = ++seg_counter;
+        state.last_partial_samples = 0;
+      }
 
       // Flush pre-roll buffer into speech_buf so the segment starts
       // with audio from *before* the VAD trigger point.
@@ -849,9 +1154,39 @@ process_vad_chunk(const float *chunk, int chunk_samples,
       int extra_pad_samples = (args.speech_pad_ms * SAMPLE_RATE) / 1000;
       state.speech_start_offset =
           std::max(0, state.speech_start_offset - extra_pad_samples);
+
+      // Fresh segment — reset soft-cut tracking.
+      state.soft_cut_best_offset = -1;
+      state.soft_cut_best_prob = 1.0f;
     }
     state.speech_buf.insert(state.speech_buf.end(), chunk,
                             chunk + chunk_samples);
+
+    if (args.two_pass && args.partial_ms > 0) {
+      const int partial_interval_samples =
+          (args.partial_ms * SAMPLE_RATE) / 1000;
+      if (partial_interval_samples > 0 &&
+          (int)state.speech_buf.size() - state.last_partial_samples >=
+              partial_interval_samples) {
+        // Throttle partials when the ASR queue is backed up.  Partials are
+        // best-effort and re-decoding the full speech_buf on every push
+        // starves the worker when speech is fast and continuous.  We do NOT
+        // advance last_partial_samples on skip, so as soon as the queue
+        // drains we push the most up-to-date partial available.
+        constexpr float PARTIAL_BACKOFF_S = 5.0f;
+        if (queue.duration() < PARTIAL_BACKOFF_S) {
+          float start_s = (float)state.speech_start_offset / SAMPLE_RATE;
+          float end_s =
+              (float)(state.total_samples_read + chunk_samples) / SAMPLE_RATE;
+          queue.push({state.speech_buf, start_s, end_s,
+                      state.current_segment_index, true});
+          state.last_partial_samples = (int)state.speech_buf.size();
+        } else {
+          LOG_DEBUG("partial skipped: queue depth %.1fs >= %.1fs",
+                    queue.duration(), PARTIAL_BACKOFF_S);
+        }
+      }
+    }
   } else {
     if (state.in_speech) {
       state.speech_buf.insert(state.speech_buf.end(), chunk,
@@ -859,7 +1194,7 @@ process_vad_chunk(const float *chunk, int chunk_samples,
       ++state.silence_frames;
 
       if (state.silence_frames >= silence_frames_limit) {
-        int idx = ++seg_counter;
+        int idx = args.two_pass ? state.current_segment_index : ++seg_counter;
         float start_s = (float)state.speech_start_offset / SAMPLE_RATE;
         float end_s = (float)state.total_samples_read / SAMPLE_RATE;
         float seg_dur = end_s - start_s;
@@ -883,11 +1218,97 @@ process_vad_chunk(const float *chunk, int chunk_samples,
               state.base_silence_ms * ADAPT_ALPHA * 0.5f;
         }
 
-        queue.push({std::move(state.speech_buf), start_s, end_s, idx});
+        queue.push({std::move(state.speech_buf), start_s, end_s, idx, false});
 
         state.in_speech = false;
+        state.current_segment_index = 0;
+        state.last_partial_samples = 0;
         state.speech_buf.clear();
         state.silence_frames = 0;
+      }
+    }
+  }
+
+  // --- D. Soft max-segment cap ---
+  // Placed AFTER the is_speech / silence branches so it sees the smoothed
+  // prob from both paths — especially the deep dips that VAD classifies as
+  // brief silence-within-speech (prob < exit_threshold).  In long continuous
+  // speech (newscasters), partials re-decode the whole buffer and the final
+  // CTC+LLM rescore on a 30s+ buffer stalls the worker, so once the segment
+  // enters the search window approaching the cap we hunt for a VAD prob dip
+  // (an inter-word gap) and cut there instead of chopping mid-word.
+  if (state.in_speech && args.max_segment_ms > 0) {
+    const int max_samples = (args.max_segment_ms * SAMPLE_RATE) / 1000;
+    int search_ms = args.max_segment_ms / 4; // 25% of max
+    if (search_ms < 1000) search_ms = 1000;
+    if (search_ms > 2000) search_ms = 2000;
+    const int search_samples = (search_ms * SAMPLE_RATE) / 1000;
+    const int search_start = std::max(0, max_samples - search_samples);
+    const float soft_threshold =
+        std::max(0.05f, args.vad_threshold - 0.2f);
+    const int seg_size = (int)state.speech_buf.size();
+
+    if (seg_size >= search_start) {
+      // Track the lowest-prob frame seen in the search window.
+      if (state.smoothed_prob < state.soft_cut_best_prob) {
+        state.soft_cut_best_prob = state.smoothed_prob;
+        state.soft_cut_best_offset = seg_size; // end of just-inserted chunk
+      }
+
+      int cut_at = -1;
+      const char *cut_reason = nullptr;
+      bool is_dip_cut = false;
+      if (state.smoothed_prob < soft_threshold) {
+        cut_at = seg_size;
+        cut_reason = "dip";
+        is_dip_cut = true;
+      } else if (seg_size >= max_samples) {
+        cut_at = (state.soft_cut_best_offset > 0)
+                     ? state.soft_cut_best_offset
+                     : seg_size;
+        cut_reason = (cut_at == seg_size) ? "cap" : "best";
+      }
+
+      if (cut_at > 0) {
+        int idx =
+            args.two_pass ? state.current_segment_index : ++seg_counter;
+        float start_s = (float)state.speech_start_offset / SAMPLE_RATE;
+        float end_s =
+            (float)(state.speech_start_offset + cut_at) / SAMPLE_RATE;
+
+        std::vector<float> final_buf(state.speech_buf.begin(),
+                                     state.speech_buf.begin() + cut_at);
+        std::vector<float> tail(state.speech_buf.begin() + cut_at,
+                                state.speech_buf.end());
+
+        LOG_DEBUG("max-seg cut at %.2fs/%.2fs (%s, prob=%.3f, tail=%dms)",
+                  (float)cut_at / SAMPLE_RATE,
+                  (float)seg_size / SAMPLE_RATE, cut_reason,
+                  state.soft_cut_best_prob,
+                  (int)tail.size() * 1000 / SAMPLE_RATE);
+
+        queue.push({std::move(final_buf), start_s, end_s, idx, false});
+
+        if (is_dip_cut) {
+          // Clean break — treat the dip as a natural endpoint.  Drop the
+          // (likely empty) tail and let the normal in_speech entry path
+          // start a new segment with preroll when speech resumes.
+          state.speech_buf.clear();
+          state.in_speech = false;
+          state.current_segment_index = 0;
+        } else {
+          // Contiguous cap/best cut — keep the tail as the start of the
+          // next segment (no preroll, no silence transition).
+          state.speech_buf = std::move(tail);
+          state.speech_start_offset += cut_at;
+          if (args.two_pass) {
+            state.current_segment_index = ++seg_counter;
+          }
+        }
+        state.silence_frames = 0;
+        state.last_partial_samples = 0;
+        state.soft_cut_best_offset = -1;
+        state.soft_cut_best_prob = 1.0f;
       }
     }
   }
@@ -908,6 +1329,21 @@ int main(int argc, char **argv) {
   OnlineArgs args;
   if (!parse_args(argc, argv, args))
     return 1;
+
+  // Allow enabling verbose mode via env var too (e.g. RS_VERBOSE=1).
+  if (!g_verbose) {
+    const char *v = std::getenv("RS_VERBOSE");
+    if (v && (*v == '1' || *v == 't' || *v == 'T' || *v == 'y' || *v == 'Y'))
+      g_verbose = true;
+  }
+
+  // Silence framework + ggml chatter unless --verbose is set.  Without this,
+  // model loading prints dozens of internal lines that visually drown out the
+  // partial/final transcripts we want to highlight.
+  if (!g_verbose) {
+    rs_log_set_level(RSLogLevel::RS_LOG_LEVEL_WARN);
+    ggml_log_set([](enum ggml_log_level, const char *, void *) {}, nullptr);
+  }
 
   const int SAMPLE_RATE = 16000;
   const int VAD_WINDOW = 512;
@@ -930,28 +1366,62 @@ int main(int argc, char **argv) {
   if (!vad_data)
     return 1;
 
-  auto vad_model = std::make_shared<SileroVadModel>();
-  if (!vad_model->LoadDirect(vad_data, vad_gguf, vad_backend.backend)) {
-    LOG_ERROR("Failed to load Silero VAD weights");
-    return 1;
+  // Detect VAD architecture from GGUF metadata.
+  // Silero VAD: "silero-vad"  ·  FireRedVAD: "firered-vad"
+  const std::string vad_arch = read_gguf_arch(vad_gguf);
+  const bool use_firered =
+      (vad_arch == "firered-vad" || vad_arch == "firered_vad");
+  LOG_INFO("VAD arch: %s",
+           vad_arch.empty() ? "<unknown, defaulting to silero-vad>"
+                            : vad_arch.c_str());
+
+  std::shared_ptr<SileroVadModel> silero_model;
+  std::shared_ptr<SileroVadState> silero_state;
+  std::shared_ptr<FireRedVadModel> firered_model;
+  std::shared_ptr<FireRedVadState> firered_state;
+
+  if (use_firered) {
+    firered_model = std::make_shared<FireRedVadModel>();
+    if (!firered_model->LoadDirect(vad_data, vad_gguf, vad_backend.backend)) {
+      LOG_ERROR("Failed to load FireRedVAD weights");
+      return 1;
+    }
+    firered_model->SetThreshold(args.vad_threshold);
+    LOG_INFO("VAD threshold set to: %.2f", args.vad_threshold);
+    firered_state = std::dynamic_pointer_cast<FireRedVadState>(
+        firered_model->CreateState());
+    if (!firered_state) {
+      LOG_ERROR("Failed to create FireRedVAD state");
+      return 1;
+    }
+  } else {
+    silero_model = std::make_shared<SileroVadModel>();
+    if (!silero_model->LoadDirect(vad_data, vad_gguf, vad_backend.backend)) {
+      LOG_ERROR("Failed to load Silero VAD weights");
+      return 1;
+    }
+    silero_model->SetThreshold(args.vad_threshold);
+    LOG_INFO("VAD threshold set to: %.2f", args.vad_threshold);
+    silero_state = std::dynamic_pointer_cast<SileroVadState>(
+        silero_model->CreateState());
+    if (!silero_state) {
+      LOG_ERROR("Failed to create VAD state");
+      return 1;
+    }
   }
 
-  // Override threshold from command line
-  vad_model->SetThreshold(args.vad_threshold);
-  LOG_INFO("VAD threshold set to: %.2f", args.vad_threshold);
-
-  auto vad_state =
-      std::dynamic_pointer_cast<SileroVadState>(vad_model->CreateState());
-  if (!vad_state) {
-    LOG_ERROR("Failed to create VAD state");
-    return 1;
-  }
-
-  // ── VAD warmup: run a few silent frames to initialize LSTM state ──
+  // ── VAD warmup: run a few silent frames to initialize internal state ──
   LOG_INFO("Warming up VAD with silent frames...");
-  std::vector<float> warmup_silent(VAD_WINDOW, 0.0f);
-  for (int i = 0; i < 3; ++i) {
-    vad_model->Encode(warmup_silent, *vad_state, vad_backend.sched);
+  if (use_firered) {
+    // FireRedVAD: 320ms of silence at 16kHz = 5120 samples (32 frames).
+    std::vector<float> warmup_silent(5120, 0.0f);
+    firered_model->DetectStreamingChunk(warmup_silent, *firered_state);
+    firered_model->Reset(*firered_state);
+  } else {
+    std::vector<float> warmup_silent(VAD_WINDOW, 0.0f);
+    for (int i = 0; i < 3; ++i) {
+      silero_model->Encode(warmup_silent, *silero_state, vad_backend.sched);
+    }
   }
   LOG_INFO("VAD warmup complete.");
 
@@ -994,16 +1464,63 @@ int main(int argc, char **argv) {
   state.prob_smooth_alpha = args.prob_smooth;
   state.base_silence_ms = (float)args.silence_ms;
   state.adaptive_silence_ms = (float)args.silence_ms;
+  FireredStreamState firered_stream_state;
   auto t_start = std::chrono::steady_clock::now();
 
+  // Dispatch: per-chunk step + EOF flush. Both VAD backends share the
+  // mic/wav streaming loops via these closures.
+  std::function<void(const float *, int)> vad_step;
+  std::function<void()> vad_flush;
+  std::function<int64_t()> vad_total_samples;
+
+  if (use_firered) {
+    vad_step = [&](const float *chunk, int n) {
+      process_vad_chunk_firered(chunk, n, *firered_model, *firered_state,
+                                firered_stream_state, args, seg_queue,
+                                seg_counter);
+    };
+    vad_flush = [&]() {
+      flush_firered_tail(*firered_model, *firered_state, firered_stream_state,
+                         seg_queue, seg_counter, args);
+    };
+    vad_total_samples = [&]() {
+      return firered_stream_state.total_samples_read;
+    };
+  } else {
+    vad_step = [&](const float *chunk, int n) {
+      process_vad_chunk(chunk, n, *silero_model, *silero_state,
+                        vad_backend.sched, state, args, seg_queue, seg_counter);
+    };
+    vad_flush = [&]() {
+      if (state.speech_buf.empty()) return;
+      int idx = ++seg_counter;
+      float start_s = (float)state.speech_start_offset / SAMPLE_RATE;
+      float end_s = (float)state.total_samples_read / SAMPLE_RATE;
+      if (g_verbose) {
+        std::cout << "\n[EOF] Flushing remaining speech ("
+                  << state.speech_buf.size() << " samples)";
+      }
+      seg_queue.push({std::move(state.speech_buf), start_s, end_s, idx});
+    };
+    vad_total_samples = [&]() {
+      return (int64_t)state.total_samples_read;
+    };
+  }
+
   LOG_INFO("─────────────────────────────────────────────────────────");
+  char max_seg_buf[32];
+  if (args.max_segment_ms > 0)
+    snprintf(max_seg_buf, sizeof(max_seg_buf), "  max-seg=%dms",
+             args.max_segment_ms);
+  else
+    max_seg_buf[0] = '\0';
   if (args.use_mic) {
-    LOG_INFO("Live mode: microphone input (VAD threshold=%.2f, silence=%dms)%s",
-             args.vad_threshold, args.silence_ms,
+    LOG_INFO("Live mode: microphone   vad=%.2f  silence=%dms%s%s",
+             args.vad_threshold, args.silence_ms, max_seg_buf,
              args.two_pass ? "  [2-pass]" : "");
   } else {
-    LOG_INFO("File mode: %s (VAD threshold=%.2f, silence=%dms)%s",
-             args.wav_path, args.vad_threshold, args.silence_ms,
+    LOG_INFO("File mode: %s   vad=%.2f  silence=%dms%s%s", args.wav_path,
+             args.vad_threshold, args.silence_ms, max_seg_buf,
              args.two_pass ? "  [2-pass]" : "");
   }
   LOG_INFO("─────────────────────────────────────────────────────────");
@@ -1036,8 +1553,7 @@ int main(int argc, char **argv) {
       if (n == 0)
         break;
 
-      process_vad_chunk(vad_buf.data(), (int)n, *vad_model, *vad_state,
-                        vad_backend.sched, state, args, seg_queue, seg_counter);
+      vad_step(vad_buf.data(), (int)n);
 
       // Warn if ring buffer is overrunning (VAD too slow)
       static int overrun_check = 0;
@@ -1056,19 +1572,12 @@ int main(int argc, char **argv) {
     mic.stop();
     audio_ring.stop();
 
-    // Flush remaining speech
-    if (!state.speech_buf.empty()) {
-      int idx = ++seg_counter;
-      float start_s = (float)state.speech_start_offset / SAMPLE_RATE;
-      float end_s = (float)state.total_samples_read / SAMPLE_RATE;
-      std::cout << "\n[EOF] Flushing remaining speech ("
-                << state.speech_buf.size() << " samples)";
-      seg_queue.push({std::move(state.speech_buf), start_s, end_s, idx});
-    }
+    // Flush remaining speech (backend-specific)
+    vad_flush();
 
     // Wait for ASR worker to drain the queue
-    LOG_INFO("Waiting for ASR to finish... (queue depth: %.1fs)",
-             seg_queue.duration());
+    LOG_DEBUG("Waiting for ASR to finish... (queue depth: %.1fs)",
+              seg_queue.duration());
     seg_queue.set_done();
     worker.join();
 
@@ -1108,9 +1617,7 @@ int main(int argc, char **argv) {
       int end = std::min(offset + VAD_WINDOW, n_total);
       int frame_len = end - offset;
 
-      process_vad_chunk(pcm_all.data() + offset, frame_len, *vad_model,
-                        *vad_state, vad_backend.sched, state, args,
-                        seg_queue, seg_counter);
+      vad_step(pcm_all.data() + offset, frame_len);
 
       // Pace to real-time
       auto now = std::chrono::steady_clock::now();
@@ -1124,22 +1631,17 @@ int main(int argc, char **argv) {
       last_frame_time = std::chrono::steady_clock::now();
     }
 
-    // Flush remaining speech
-    if (!state.speech_buf.empty()) {
-      int idx = ++seg_counter;
-      float start_s = (float)state.speech_start_offset / SAMPLE_RATE;
-      float end_s = (float)n_total / SAMPLE_RATE;
-      std::cout << "\n[EOF] Flushing remaining speech ("
-                << state.speech_buf.size() << " samples)";
-      seg_queue.push({std::move(state.speech_buf), start_s, end_s, idx});
-    }
+    // Flush remaining speech (backend-specific)
+    vad_flush();
 
     // Wait for ASR worker to drain the queue
-    std::cout << "\r" << Color::c(Color::Grey)
-              << "Waiting for ASR to finish... "
-              << "(queue: " << seg_counter.load() << " segments, "
-              << seg_processed.load() << " done)" << Color::c(Color::Reset)
-              << std::endl;
+    if (g_verbose) {
+      std::cout << "\r" << Color::c(Color::Grey)
+                << "Waiting for ASR to finish... "
+                << "(queue: " << seg_counter.load() << " segments, "
+                << seg_processed.load() << " done)" << Color::c(Color::Reset)
+                << std::endl;
+    }
     seg_queue.set_done();
     worker.join();
   }
@@ -1149,12 +1651,11 @@ int main(int argc, char **argv) {
       std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start)
           .count() /
       1e6f;
-  float audio_s = (float)state.total_samples_read / SAMPLE_RATE;
+  float audio_s = (float)vad_total_samples() / SAMPLE_RATE;
 
   int dropped = seg_queue.dropped();
   std::cout << "\n─────────────────────────────────────────────────────────\n";
-  LOG_INFO("Done.  Segments: %d/%d  Audio: %.2fs  Wall: %.2fs  Overall-RTF: "
-           "%.3f",
+  LOG_INFO("Done. %d/%d segments · %.2fs audio · %.2fs wall · RTF %.3f",
            seg_processed.load(), seg_counter.load(), audio_s, wall_s,
            audio_s > 0 ? wall_s / audio_s : 0.f);
   if (dropped > 0) {
