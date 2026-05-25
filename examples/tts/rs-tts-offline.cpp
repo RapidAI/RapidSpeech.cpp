@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -42,6 +43,8 @@ struct TtsArgs {
   const char *language = "English";
   const char *ref_path = nullptr;       // reference audio for voice cloning
   const char *ref_text = nullptr;       // transcript of reference audio
+  const char *bert_path = nullptr;      // ZH BERT (1024-dim) GGUF, OpenVoice2 ZH
+  const char *mbert_path = nullptr;     // multilingual BERT (768-dim) GGUF
   int seed = 42;
   int n_steps = 32;
   int n_threads = 4;
@@ -62,6 +65,8 @@ static void print_usage(const char *prog) {
       << "  -o, --output <path>      Output WAV file path (default: output.wav)\n"
       << "      --ref <path>         Reference audio for voice cloning (WAV)\n"
 	      << "      --ref-text <text>    Transcript of the reference audio\n"
+      << "      --bert <path>        ZH BERT GGUF (1024-dim, OpenVoice2 ZH only)\n"
+      << "      --mbert <path>       Multilingual BERT GGUF (768-dim)\n"
       << "      --instruct <text>    Voice description (default: male)\n"
       << "      --lang <lang>        Target language (default: English)\n"
       << "      --seed <n>           Random seed (default: 42)\n"
@@ -85,6 +90,10 @@ static bool parse_args(int argc, char **argv, TtsArgs &args) {
       args.ref_path = argv[++i];
     } else if (a == "--ref-text" && i + 1 < argc) {
       args.ref_text = argv[++i];
+    } else if (a == "--bert" && i + 1 < argc) {
+      args.bert_path = argv[++i];
+    } else if (a == "--mbert" && i + 1 < argc) {
+      args.mbert_path = argv[++i];
     } else if (a == "--instruct" && i + 1 < argc) {
       args.instruct = argv[++i];
     } else if (a == "--lang" && i + 1 < argc) {
@@ -168,6 +177,17 @@ int main(int argc, char **argv) {
   LOG_INFO("RapidSpeech.cpp v%s", rs_get_version());
   LOG_INFO("TTS model: %s", args.model_path);
   LOG_INFO("Threads: %d  GPU: %s", args.n_threads, args.use_gpu ? "ON" : "OFF");
+
+  // BERT paths are consumed by OpenVoice2Model::Load via env vars; setting them
+  // here keeps the C API stable while still exposing a CLI flag to the user.
+  if (args.bert_path && args.bert_path[0]) {
+    setenv("RS_ZH_BERT_PATH", args.bert_path, /*overwrite=*/1);
+    LOG_INFO("ZH BERT: %s", args.bert_path);
+  }
+  if (args.mbert_path && args.mbert_path[0]) {
+    setenv("RS_MBERT_PATH", args.mbert_path, /*overwrite=*/1);
+    LOG_INFO("mBERT:   %s", args.mbert_path);
+  }
 
   rs_init_params_t tts_params = rs_default_params();
   tts_params.model_path = args.model_path;

@@ -4,8 +4,12 @@
 #include "core/rs_model.h"
 #include "frontend/text_frontend.h"
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
+
+// Forward-declare BertModel so this header doesn't pull in ggml.h.
+namespace rapidspeech { class BertModel; }
 
 // =====================================================================
 // OpenVoice2 TTS Model (MeloTTS/VITS base + Tone Color Converter)
@@ -35,7 +39,9 @@ struct OpenVoice2HParams {
   int32_t num_tones       = 11;
   int32_t num_languages   = 4;
   // Streaming chunk size in mel frames (0 = non-streaming)
-  int32_t chunk_mel_frames = 50;  // ~0.58s per chunk at 22050/256
+  int32_t chunk_mel_frames = 0;  // 0 = non-streaming (whole utterance per vocoder call)
+  // HiFiGAN upsample rates (empty = infer from kernel sizes)
+  std::vector<int32_t> upsample_rates;
 };
 
 // --- OpenVoice2 State ---
@@ -64,7 +70,16 @@ struct OpenVoice2State : public RSState {
 
   // Per-phoneme tone IDs for tone embedding lookup
   std::vector<int32_t> tone_ids;
+  // Per-phoneme language IDs (MeloTTS uses 3 for real phonemes, 0 for intersperse blanks)
+  std::vector<int32_t> lang_ids;
   int language_id = 0;
+  int speaker_id = 1;  // spk2id: {'ZH': 1}
+
+  // Optional BERT features (real or precomputed). Layout: [T_phoneme, 1024] / [T_phoneme, 768].
+  // If empty, zeros are fed to bert_proj / ja_bert_proj (matches MeloTTS when BERT disabled).
+  // For ZH the model uses ja_bert (multilingual BERT projected via ja_bert_proj).
+  std::vector<float> bert_features;     // [T_phoneme, 1024]
+  std::vector<float> ja_bert_features;  // [T_phoneme, 768]
 
   // Prior distribution from text encoder proj (per-phoneme)
   std::vector<float> m_p;    // mean: [hidden, T_text]
@@ -147,6 +162,12 @@ public:
   /// Load tone color converter from a separate GGUF file.
   bool LoadConverter(const char* converter_path, ggml_backend_t backend);
 
+  /// Load both BERT models for prosody conditioning. Either path may be null
+  /// (the corresponding BERT branch then feeds zeros, matching MeloTTS when
+  /// BERT is disabled).
+  bool LoadBertModels(const char* zh_bert_path, const char* mbert_path,
+                       bool use_gpu = false);
+
   /// Get audio output chunk. Returns number of samples, 0 if no more.
   int GetAudioOutput(RSState& state, float** out_data);
 
@@ -156,6 +177,11 @@ private:
   OpenVoice2Weights weights_;
   ToneConverterWeights converter_weights_;
   TextFrontend text_frontend_;
+
+  // Optional BERT prosody models. zh_bert_ is 1024-dim, mbert_ is 768-dim;
+  // either or both may be null (corresponding branch then feeds zeros).
+  std::unique_ptr<rapidspeech::BertModel> zh_bert_;
+  std::unique_ptr<rapidspeech::BertModel> mbert_;
 
   bool MapTensors(std::map<std::string, struct ggml_tensor*>& all_tensors);
 
