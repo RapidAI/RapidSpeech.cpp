@@ -46,7 +46,7 @@ public:
     std::vector<uint32_t> positions;  // Position in sequence
     std::vector<uint32_t> kv_indices; // KV cache indices
 
-    uint32_t n_tokens() const { return seq_ids.size(); }
+    uint32_t n_tokens() const { return static_cast<uint32_t>(seq_ids.size()); }
     bool empty() const { return seq_ids.empty(); }
     void clear() {
       seq_ids.clear();

@@ -240,7 +240,7 @@ bool llm_vocab::load_from_gguf(struct gguf_context *ctx_gguf) {
     return false;
   }
 
-  int n_tokens = gguf_get_arr_n(ctx_gguf, token_idx);
+  int n_tokens = static_cast<int>(gguf_get_arr_n(ctx_gguf, token_idx));
 
   tokens_.clear();
   token_to_id_.clear();
@@ -279,7 +279,7 @@ bool llm_vocab::load_from_gguf(struct gguf_context *ctx_gguf) {
   if (merges_idx != -1) {
     bpe_merges_.clear();
     bpe_ranks_.clear();
-    int n_merges = gguf_get_arr_n(ctx_gguf, merges_idx);
+    int n_merges = static_cast<int>(gguf_get_arr_n(ctx_gguf, merges_idx));
     for (int i = 0; i < n_merges; ++i) {
       std::string merge = gguf_get_arr_str(ctx_gguf, merges_idx, i);
       // Merge format: "left right" (space-separated)

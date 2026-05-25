@@ -180,12 +180,19 @@ int main(int argc, char **argv) {
 
   // BERT paths are consumed by OpenVoice2Model::Load via env vars; setting them
   // here keeps the C API stable while still exposing a CLI flag to the user.
+  auto set_env_var = [](const char *name, const char *value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, /*overwrite=*/1);
+#endif
+  };
   if (args.bert_path && args.bert_path[0]) {
-    setenv("RS_ZH_BERT_PATH", args.bert_path, /*overwrite=*/1);
+    set_env_var("RS_ZH_BERT_PATH", args.bert_path);
     LOG_INFO("ZH BERT: %s", args.bert_path);
   }
   if (args.mbert_path && args.mbert_path[0]) {
-    setenv("RS_MBERT_PATH", args.mbert_path, /*overwrite=*/1);
+    set_env_var("RS_MBERT_PATH", args.mbert_path);
     LOG_INFO("mBERT:   %s", args.mbert_path);
   }
 
