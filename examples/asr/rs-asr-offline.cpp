@@ -423,10 +423,19 @@ int main(int argc, char **argv) {
            audio_dur);
 
   if (wav_sr != meta.audio_sample_rate) {
-    LOG_ERROR("WAV sample rate %d != model expected %d", wav_sr,
-              meta.audio_sample_rate);
-    rs_free(asr_ctx);
-    return 1;
+    LOG_INFO("Resampling %d Hz -> %d Hz", wav_sr, meta.audio_sample_rate);
+    std::vector<float> resampled;
+    if (!resample_pcm(pcm, wav_sr, resampled, meta.audio_sample_rate)) {
+      LOG_ERROR("Resampling failed (%d -> %d)", wav_sr,
+                meta.audio_sample_rate);
+      rs_free(asr_ctx);
+      return 1;
+    }
+    pcm = std::move(resampled);
+    wav_sr = meta.audio_sample_rate;
+    audio_dur = (float)pcm.size() / wav_sr;
+    LOG_INFO("Resampled: %zu samples @ %d Hz (%.2f s)", pcm.size(), wav_sr,
+             audio_dur);
   }
 
   // load_wav_file already normalizes to [-1, 1], use as-is
