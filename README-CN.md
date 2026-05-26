@@ -381,6 +381,35 @@ for chunk in chunks:
 
 ------
 
+## 🧪 示例与多语言绑定
+
+每种语言绑定都有独立的示例目录与 README，覆盖从安装、命令行参数到底层 API 的端到端用法。
+
+| 目录 | 覆盖内容 | 文档 |
+|------|----------|------|
+| 🐍 **Python** | `pip install rapidspeech` → 离线 / 流式 ASR（神经 VAD + 2-pass LLM 重打分）、离线 / 流式 TTS、声音克隆 | [`python-api-examples/README.md`](python-api-examples/README.md) |
+| 🌐 **浏览器（WebAssembly）** | 三标签页演示：离线 ASR、麦克风在线 ASR、离线 TTS。本地运行，WebGPU + pthreads | [`wasm-examples/README.md`](wasm-examples/README.md) |
+| 🟩 **Node.js** | 复用 WASM 模块的 CLI：文件 → ASR（可选 VAD + 2-pass）、文本 → TTS（可选声音克隆） | [`node-api-example/README.md`](node-api-example/README.md) |
+| 💻 **C++ CLI** | `rs-asr-offline` / `rs-asr-online` / `rs-tts-offline` / `rs-quantize` | 本 README 上方章节 |
+
+快速预览：
+
+```bash
+# Python —— 带 VAD 切分的 2-pass 转写
+python python-api-examples/asr/asr-offline.py \
+    --model funasr-nano.gguf --audio long.wav \
+    --vad silero-vad.gguf --two-pass
+
+# 浏览器 —— 三个标签页一起跑
+cd wasm-examples && python3 serve.py 8000  # 然后访问 http://localhost:8000
+
+# Node.js —— 同一份 WASM 模块，文件级 ASR/TTS
+node node-api-example/index.js asr -m funasr-nano.gguf -w audio.wav --two-pass
+node node-api-example/index.js tts -m omnivoice.gguf -t "你好世界" --lang Chinese -o out.wav
+```
+
+------
+
 ## 📊 性能基准
 
 测试环境：Apple M1 Pro, funasr-nano-fp16.gguf, 15s 音频

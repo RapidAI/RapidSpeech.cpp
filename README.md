@@ -382,6 +382,37 @@ for chunk in chunks:
 
 ------
 
+## 🧪 Examples & Bindings
+
+End-to-end examples for every language binding live in their own folders, each
+with a dedicated README that walks through installation, CLI flags, and the
+underlying API surface.
+
+| Folder | What it covers | README |
+|--------|----------------|--------|
+| 🐍 **Python** | `pip install rapidspeech` → offline / online ASR (with neural VAD, 2-pass LLM rescoring), offline / streaming TTS, voice cloning | [`python-api-examples/README.md`](python-api-examples/README.md) |
+| 🌐 **Browser (WebAssembly)** | Three-tab demo: offline ASR, mic-driven online ASR, offline TTS. Runs locally with WebGPU + pthreads | [`wasm-examples/README.md`](wasm-examples/README.md) |
+| 🟩 **Node.js** | CLI built on the same WASM module: file → ASR (with optional VAD + 2-pass), text → TTS (with voice cloning) | [`node-api-example/README.md`](node-api-example/README.md) |
+| 💻 **C++ CLI** | `rs-asr-offline` / `rs-asr-online` / `rs-tts-offline` / `rs-quantize` | this README (sections above) |
+
+Quick taste of each:
+
+```bash
+# Python — VAD-segmented 2-pass transcription
+python python-api-examples/asr/asr-offline.py \
+    --model funasr-nano.gguf --audio long.wav \
+    --vad silero-vad.gguf --two-pass
+
+# Browser — three tabs in one page
+cd wasm-examples && python3 serve.py 8000  # then open http://localhost:8000
+
+# Node.js — same WASM module, file-based ASR/TTS
+node node-api-example/index.js asr -m funasr-nano.gguf -w audio.wav --two-pass
+node node-api-example/index.js tts -m omnivoice.gguf -t "Hello world" -o out.wav
+```
+
+------
+
 ## 📊 Performance Benchmarks
 
 Test environment: Apple M1 Pro, funasr-nano-fp16.gguf, 15s audio

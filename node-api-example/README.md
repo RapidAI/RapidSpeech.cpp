@@ -1,9 +1,17 @@
 # RapidSpeech Node.js API Example
 
 Run RapidSpeech locally from Node.js using the WebAssembly build. Both
-**ASR** (speech → text) and **TTS** (text → speech) are supported. No
-network calls after the WASM module is loaded — model and audio never
-leave your machine.
+**ASR** (speech → text, with optional VAD pre-segmentation and 2-pass
+LLM rescoring) and **TTS** (text → speech, with optional voice cloning)
+are supported. No network calls after the WASM module is loaded —
+model and audio never leave your machine.
+
+```
+node-api-example/
+├── index.js        # ASR + TTS CLI (uses ../wasm-examples/rapidspeech-bridge.js)
+├── package.json
+└── README.md       # this file
+```
 
 ## Prerequisites
 
@@ -133,3 +141,12 @@ module. The bridge handles:
   (`pip install rapidspeech`).
 - TTS models are typically much larger than ASR models — make sure
   Node has enough memory (`--max-old-space-size=4096`).
+- `await` is mandatory on `rs.process()`, `rs.redecode()`, and
+  `rs.synthesize()` — they're ASYNCIFY-aware. Forgetting it returns a
+  bare `Promise` and the script silently logs `undefined`.
+
+## See also
+
+- [`../wasm-examples/README.md`](../wasm-examples/README.md) — the browser demo using the same WASM module
+- [`../python-api-examples/README.md`](../python-api-examples/README.md) — native Python bindings (faster, no WASM overhead)
+- [`../README.md`](../README.md) — project overview and C++ CLI usage
