@@ -29,7 +29,12 @@ example searches for it under `wasm-examples/` and the WASM build dir.
 ```bash
 node index.js asr -m model.gguf -w audio.wav
 node index.js asr -m funasr-nano.gguf -w audio.wav --two-pass
+node index.js asr -m funasr-nano.gguf -w audio.wav --no-llm        # CTC-only, fastest
 node index.js asr -m sense-voice-small.gguf -w audio.wav --threads 4 --runs 10
+
+# VAD-segmented (transcribe each detected speech region)
+node index.js asr -m funasr-nano.gguf -w long.wav \
+  --vad silero-vad.gguf --vad-threshold 0.5 --vad-min-seg 0.3 --two-pass
 ```
 
 ### TTS
@@ -54,8 +59,14 @@ node index.js tts -m <model.gguf> -t "text"    [options]
 ASR options:
   -w, --wav <path>          Input WAV file (8/16/24/32-bit PCM, mono/stereo)
   --two-pass                CTC greedy → LLM rescore (FunASRNano)
+  --no-llm                  Disable LLM rescoring (CTC only — fastest)
   --ctc-precheck            Skip LLM on silence using a quick CTC precheck
   -r, --runs <n>            Inference runs (default: 1)
+
+ASR + VAD pre-segmentation:
+  --vad <path>              GGUF VAD model (silero-vad / firered-vad)
+  --vad-threshold <f>       Speech threshold (default: 0.5)
+  --vad-min-seg <s>         Drop segments shorter than this (default: 0.3)
 
 TTS options:
   -t, --text <text>         Text to synthesize
@@ -83,14 +94,19 @@ module. The bridge handles:
    `/model.gguf`, then `rs_wasm_init_ex(path, task_type, threads)`
    loads it.
 2. **ASR pipeline** — `pushAudio()` copies a Float32Array into the WASM
-   heap, `process()` runs encoder + decoder, `get_text()` returns the
-   transcript. `setUseLlm(true)` + `redecode()` performs an LLM second
-   pass on the same encoder output.
-3. **TTS pipeline** — `setTtsParams()` and `setDiffusionSteps()`
-   configure generation, `synthesize(text)` runs the full
+   heap, `await process()` runs encoder + decoder, `get_text()` returns
+   the transcript. `setUseLlm(true)` + `await redecode()` performs an
+   LLM second pass on the same encoder output. `process()` and
+   `redecode()` are async because they may suspend through WebGPU's
+   queue ops under ASYNCIFY — always `await` them.
+3. **VAD pre-segmentation** — `RapidSpeechVAD` loads a silero-vad or
+   firered-vad GGUF, runs at 16 kHz, and emits `{start_s, end_s}`
+   segments. Each segment is then transcribed independently.
+4. **TTS pipeline** — `setTtsParams()` and `setDiffusionSteps()`
+   configure generation, `await synthesize(text)` runs the full
    `push_text → process → get_audio_*` loop and returns a
    Float32Array of PCM at the model's native sample rate.
-4. **Voice cloning** — `pushReferenceAudio()` + `pushReferenceText()`
+5. **Voice cloning** — `pushReferenceAudio()` + `pushReferenceText()`
    provide a reference speaker before synthesis (OmniVoice).
 
 ## API surface (WASM exports)
@@ -102,12 +118,13 @@ module. The bridge handles:
 | `rs_wasm_push_audio(ptr, n)` | Push float32 PCM samples |
 | `rs_wasm_push_text(text)` | Push UTF-8 text for TTS |
 | `rs_wasm_push_reference_audio/text(...)` | Voice cloning |
-| `rs_wasm_process()` | Run one inference step |
-| `rs_wasm_redecode()` | Re-run decoder only (2-pass ASR) |
+| `rs_wasm_process()` | Run one inference step (async — `await` it) |
+| `rs_wasm_redecode()` | Re-run decoder only (2-pass ASR, async) |
 | `rs_wasm_get_text() / get_audio_ptr() / get_audio_len()` | Read outputs |
 | `rs_wasm_set_use_llm / set_ctc_precheck / set_user_input_prompt` | ASR knobs |
 | `rs_wasm_set_tts_params / set_tts_diffusion_steps` | TTS knobs |
 | `rs_wasm_get_sample_rate / get_arch_name / get_version` | Metadata |
+| `rs_wasm_vad_init / push_audio / drain_segments / drain_frames` | VAD streaming API |
 
 ## Notes
 
