@@ -78,7 +78,9 @@ jobs:
             (command -v yum >/dev/null 2>&1 && yum install -y patchelf zip unzip || true)
 
           # Skip legacy Python versions, PyPy, and musllinux (not needed for end users).
-          CIBW_SKIP: cp36-* cp37-* pp* *-musllinux_*
+          # cp38 is dropped because Python 3.8 reached EOL in Oct 2024 and the
+          # sameli/manylinux2014_x86_64_cuda_11.8 image no longer ships a cp38 interpreter.
+          CIBW_SKIP: cp36-* cp37-* cp38-* pp* *-musllinux_*
 
           # Fix NEEDED entries before auditwheel repair on Linux.
           # cmake embeds build-tree paths like "ggml/src/libggml-base.so"
