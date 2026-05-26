@@ -42,20 +42,50 @@ struct IMatrixCollector {
 
             // Only collect for named weight tensors (loaded from GGUF)
             if (!weight->name[0]) continue;
-            // Skip uninitialized activations (e.g. not yet after compute)
-            if (!act->data && !act->buffer) continue;
             // Only F32 activations (full precision)
             if (act->type != GGML_TYPE_F32) continue;
             // Skip trivially small batches
             if (act->ne[1] < 4) continue;
+            // Skip non-contiguous activations (permuted/reshaped views).
+            // Their nb[1] stride and ggml_nbytes do not describe a flat row-major
+            // layout, so both host indexing and ggml_backend_tensor_get would
+            // over-read; on GPU backends the underlying device memory is also
+            // owned by view_src, not act->buffer.
+            if (!ggml_is_contiguous(act)) continue;
+            // Skip view tensors entirely. View tensors have act->buffer == NULL
+            // (the real buffer lives on view_src), so ggml_backend_tensor_get
+            // would null-deref the backend's get_tensor vtable on GPU. The
+            // underlying activation is almost always also fed as src1 of some
+            // other named MUL_MAT, so dropping the view does not lose stats.
+            if (act->view_src) continue;
+            // Skip ops that produce a fresh tensor but whose op is not a real
+            // GGUF-loaded weight (e.g. CONT of a weight inherits the name's
+            // first byte from uninitialised memory in some ggml versions).
+            // Genuine GGUF weights have op == GGML_OP_NONE.
+            if (weight->op != GGML_OP_NONE) continue;
+
+            // Skip uninitialized activations (e.g. not yet after compute)
+            if (!act->buffer && !act->data) continue;
 
             int64_t ncol = act->ne[0];
             int64_t nrows = act->ne[1] * act->ne[2] * act->ne[3];
+            if (ncol <= 0 || nrows <= 0) continue;
 
             std::string name(weight->name);
             auto &e = stats[name];
             if (e.values.empty()) {
                 e.values.resize(ncol, 0.0);
+            } else if ((int64_t)e.values.size() != ncol) {
+                // Same weight name has been seen with a different column count.
+                // Writing into e.values[j] for j >= e.values.size() would walk
+                // off the heap and corrupt the unordered_map's bucket array,
+                // surfacing later as a segfault inside stats[name] on the next
+                // graph. Skip rather than corrupt.
+                fprintf(stderr,
+                        "[imatrix] WARN: ncol mismatch for '%s' (have %zu, got "
+                        "%lld) — skipping\n",
+                        name.c_str(), e.values.size(), (long long)ncol);
+                continue;
             }
 
             // Read activation data (may need GPU→CPU copy)
@@ -69,9 +99,10 @@ struct IMatrixCollector {
                 data = act_data.data();
             } else {
                 data = (const float *)act->data;
+                if (!data) continue;
             }
 
-            // Accumulate squared activations per column
+            // Accumulate squared activations per column (contiguous: nb[1] == ncol*4)
             for (int64_t r = 0; r < nrows; r++) {
                 const float *row = data + r * (act->nb[1] / sizeof(float));
                 for (int64_t j = 0; j < ncol; j++) {
