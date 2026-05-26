@@ -1,18 +1,20 @@
 /**
  * RapidSpeech Node.js API Example
  *
- * Transcribes a WAV file using a GGUF ASR model loaded via WebAssembly.
- * All inference runs locally — no network calls after model load.
+ * Demonstrates both offline ASR and offline TTS on the WASM build of
+ * RapidSpeech. Inference runs locally — no network calls after model load.
  *
  * Usage:
- *   node index.js --model /path/to/model.gguf --wav /path/to/audio.wav
- *   node index.js -m model.gguf -w audio.wav --threads 4 --runs 5
+ *   # ASR
+ *   node index.js asr -m <asr.gguf> -w <audio.wav> [--two-pass] [--runs N]
+ *
+ *   # TTS
+ *   node index.js tts -m <tts.gguf> -t "Hello world" -o out.wav
+ *       [--instruct "female"] [--lang Chinese] [--seed 42] [--n-steps 16]
  *
  * Prerequisites:
  *   Build the WASM module first:
  *     cd rapidspeech/wasm && ./build-wasm.sh
- *   Then copy the build outputs, or run from the project root so that
- *   require('../wasm-examples/rapidspeech-wasm.js') resolves correctly.
  */
 
 'use strict';
@@ -20,29 +22,52 @@
 const fs = require('fs');
 const path = require('path');
 
+const { RapidSpeechWASM, RS_TASK } = require('../wasm-examples/rapidspeech-bridge.js');
+
 // ── CLI Argument Parsing ────────────────────────────────────
-function parseArgs() {
+function parseArgs(argv) {
   const args = {
+    mode: null,         // 'asr' | 'tts'
     model: null,
     wav: null,
+    text: null,
+    output: 'out.wav',
     threads: 2,
     runs: 1,
+    twoPass: false,
+    ctcPrecheck: false,
+    instruct: 'male',
+    lang: 'English',
+    seed: 42,
+    nSteps: 32,
+    refWav: null,
+    refText: null,
     help: false,
   };
 
-  const argv = process.argv.slice(2);
+  if (argv[0] && !argv[0].startsWith('-')) {
+    args.mode = argv.shift().toLowerCase();
+  }
+
   for (let i = 0; i < argv.length; i++) {
     switch (argv[i]) {
-      case '-m':
-      case '--model':   args.model = argv[++i]; break;
-      case '-w':
-      case '--wav':     args.wav = argv[++i]; break;
-      case '-t':
-      case '--threads': args.threads = parseInt(argv[++i], 10); break;
-      case '-r':
-      case '--runs':    args.runs = parseInt(argv[++i], 10); break;
-      case '-h':
-      case '--help':    args.help = true; break;
+      case '-m': case '--model':    args.model = argv[++i]; break;
+      case '-w': case '--wav':      args.wav = argv[++i]; break;
+      case '-t': case '--text':     args.text = argv[++i]; break;
+      case '-o': case '--output':   args.output = argv[++i]; break;
+      case '--threads':             args.threads = parseInt(argv[++i], 10); break;
+      case '-r': case '--runs':     args.runs = parseInt(argv[++i], 10); break;
+      case '--two-pass':            args.twoPass = true; break;
+      case '--ctc-precheck':        args.ctcPrecheck = true; break;
+      case '--instruct':            args.instruct = argv[++i]; break;
+      case '--lang':                args.lang = argv[++i]; break;
+      case '--seed':                args.seed = parseInt(argv[++i], 10); break;
+      case '--n-steps':             args.nSteps = parseInt(argv[++i], 10); break;
+      case '--ref':                 args.refWav = argv[++i]; break;
+      case '--ref-text':            args.refText = argv[++i]; break;
+      case '-h': case '--help':     args.help = true; break;
+      default:
+        console.error(`Unknown argument: ${argv[i]}`); args.help = true; break;
     }
   }
   return args;
@@ -50,85 +75,108 @@ function parseArgs() {
 
 function showHelp() {
   console.log(`
-RapidSpeech Node.js API Example
+RapidSpeech Node.js API Example (WASM-based, ASR + TTS)
 
 Usage:
-  node index.js -m <model.gguf> -w <audio.wav> [options]
+  node index.js asr -m <model.gguf> -w <audio.wav> [options]
+  node index.js tts -m <model.gguf> -t "text"    [options]
 
-Required:
-  -m, --model <path>    Path to GGUF ASR model
-  -w, --wav <path>      Path to 16kHz mono WAV file
+ASR options:
+  -w, --wav <path>          Input WAV file (any sample rate; downstream model decides)
+  --two-pass                Run CTC greedy then LLM rescore (FunASRNano)
+  --ctc-precheck            Skip LLM on silence using a quick CTC precheck
+  -r, --runs <n>            Inference runs for benchmarking (default: 1)
 
-Options:
-  -t, --threads <n>     Number of CPU threads (default: 2)
-  -r, --runs <n>        Benchmark runs (default: 1)
-  -h, --help            Show this help
+TTS options:
+  -t, --text <text>         Text to synthesize
+  -o, --output <path>       Output WAV file (default: out.wav)
+  --instruct <text>         Voice description (default: "male")
+  --lang <lang>             Target language     (default: English)
+  --seed <n>                Random seed         (default: 42)
+  --n-steps <n>             Diffusion steps     (default: 32)
+  --ref <path>              Reference WAV for voice cloning
+  --ref-text <text>         Transcript of the reference audio
 
-Examples:
-  node index.js -m sense-voice-small.gguf -w test.wav
-  node index.js -m model.gguf -w audio.wav --threads 4 --runs 10
+Common:
+  -m, --model <path>        GGUF model path
+  --threads <n>             CPU threads (default: 2)
+  -h, --help                Show this help
 `);
 }
 
-// ── WAV Reader (PCM, 8/16/24/32-bit) ────────────────────────
+// ── WAV reader (8/16/24/32-bit PCM) ─────────────────────────
 function readWav(filePath) {
   const buf = fs.readFileSync(filePath);
   if (buf.length < 44) throw new Error('File too small to be WAV');
-
   if (buf.toString('ascii', 0, 4) !== 'RIFF') throw new Error('Not a valid RIFF file');
   if (buf.toString('ascii', 8, 12) !== 'WAVE') throw new Error('Not a valid WAV file');
+  if (buf.readUInt16LE(20) !== 1) throw new Error('Only PCM WAV is supported');
 
-  const audioFormat = buf.readUInt16LE(20);
-  if (audioFormat !== 1) throw new Error('Only PCM WAV files are supported');
-
-  const numChannels = buf.readUInt16LE(22);
-  const sampleRate = buf.readUInt32LE(24);
-  const bitsPerSample = buf.readUInt16LE(34);
+  const numChannels  = buf.readUInt16LE(22);
+  const sampleRate   = buf.readUInt32LE(24);
+  const bitsPerSample= buf.readUInt16LE(34);
 
   // Find data chunk
   let offset = 36;
   while (offset + 8 < buf.length) {
-    const chunkId = buf.toString('ascii', offset, offset + 4);
+    const chunkId   = buf.toString('ascii', offset, offset + 4);
     const chunkSize = buf.readUInt32LE(offset + 4);
     if (chunkId === 'data') {
-      const dataOffset = offset + 8;
-      const bytesPerSample = bitsPerSample / 8;
-      const totalSamples = Math.floor(chunkSize / bytesPerSample);
-      const samplesPerChannel = Math.floor(totalSamples / numChannels);
-
+      const dataOff = offset + 8;
+      const bps = bitsPerSample / 8;
+      const totalSamples       = Math.floor(chunkSize / bps);
+      const samplesPerChannel  = Math.floor(totalSamples / numChannels);
       const pcm = new Float32Array(samplesPerChannel);
 
       for (let i = 0; i < samplesPerChannel; i++) {
-        let sample = 0;
-        const byteOff = dataOffset + i * numChannels * bytesPerSample;
-
-        if (bitsPerSample === 8) {
-          sample = buf.readUInt8(byteOff) - 128;
-          pcm[i] = sample / 128.0;
-        } else if (bitsPerSample === 16) {
-          sample = buf.readInt16LE(byteOff);
-          pcm[i] = sample / 32768.0;
-        } else if (bitsPerSample === 24) {
-          // 24-bit signed in little-endian
-          const lo = buf.readUInt8(byteOff);
-          const mi = buf.readUInt8(byteOff + 1);
-          const hi = buf.readInt8(byteOff + 2);
-          sample = (hi << 16) | (mi << 8) | lo;
-          pcm[i] = sample / 8388608.0;
-        } else if (bitsPerSample === 32) {
-          sample = buf.readInt32LE(byteOff);
-          pcm[i] = sample / 2147483648.0;
-        } else {
-          throw new Error(`Unsupported bit depth: ${bitsPerSample}`);
+        let s = 0;
+        const byteOff = dataOff + i * numChannels * bps;
+        switch (bitsPerSample) {
+          case 8:  s = buf.readUInt8(byteOff) - 128;  pcm[i] = s / 128.0; break;
+          case 16: s = buf.readInt16LE(byteOff);      pcm[i] = s / 32768.0; break;
+          case 24: {
+            const lo = buf.readUInt8(byteOff);
+            const mi = buf.readUInt8(byteOff + 1);
+            const hi = buf.readInt8 (byteOff + 2);
+            s = (hi << 16) | (mi << 8) | lo;
+            pcm[i] = s / 8388608.0;
+            break;
+          }
+          case 32: s = buf.readInt32LE(byteOff);      pcm[i] = s / 2147483648.0; break;
+          default: throw new Error(`Unsupported bit depth: ${bitsPerSample}`);
         }
       }
-
       return { pcm, sampleRate, numChannels, bitsPerSample };
     }
     offset += 8 + chunkSize;
   }
-
   throw new Error('No data chunk found in WAV file');
+}
+
+// ── WAV writer (16-bit mono PCM) ────────────────────────────
+function writeWavMono16(filePath, pcm, sampleRate) {
+  const numSamples = pcm.length;
+  const byteRate   = sampleRate * 2;
+  const dataSize   = numSamples * 2;
+  const buf = Buffer.alloc(44 + dataSize);
+  buf.write('RIFF', 0);
+  buf.writeUInt32LE(36 + dataSize, 4);
+  buf.write('WAVE', 8);
+  buf.write('fmt ', 12);
+  buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1,  20);    // PCM
+  buf.writeUInt16LE(1,  22);    // mono
+  buf.writeUInt32LE(sampleRate, 24);
+  buf.writeUInt32LE(byteRate,   28);
+  buf.writeUInt16LE(2,  32);    // block align
+  buf.writeUInt16LE(16, 34);    // bits/sample
+  buf.write('data', 36);
+  buf.writeUInt32LE(dataSize, 40);
+  for (let i = 0; i < numSamples; i++) {
+    const v = Math.max(-1, Math.min(1, pcm[i]));
+    buf.writeInt16LE((v * 32767) | 0, 44 + i * 2);
+  }
+  fs.writeFileSync(filePath, buf);
 }
 
 // ── Load WASM module ────────────────────────────────────────
@@ -137,130 +185,140 @@ async function loadWasmModule() {
     path.join(__dirname, '..', 'wasm-examples', 'rapidspeech-wasm.js'),
     path.join(__dirname, '..', 'rapidspeech', 'wasm', 'build', 'rapidspeech-wasm.js'),
   ];
-
-  let wasmJsPath = null;
-  for (const p of searchPaths) {
-    if (fs.existsSync(p)) { wasmJsPath = p; break; }
-  }
-
+  const wasmJsPath = searchPaths.find((p) => fs.existsSync(p));
   if (!wasmJsPath) {
     console.error('WASM module not found. Build it first:');
     console.error('  cd rapidspeech/wasm && ./build-wasm.sh');
-    console.error('Searched:');
-    searchPaths.forEach(p => console.error(`  ${p}`));
+    console.error('Searched:'); searchPaths.forEach((p) => console.error('  ' + p));
     process.exit(1);
   }
-
-  console.log(`WASM:   ${wasmJsPath}`);
-  const RapidSpeechModule = require(wasmJsPath);
-  console.log('Initializing WASM runtime...');
-  const module = await RapidSpeechModule();
-  const version = module.ccall('rs_wasm_get_version', 'string', [], []);
-  console.log(`Version: ${version}`);
-  return module;
+  console.log(`WASM:    ${wasmJsPath}`);
+  const Module = require(wasmJsPath);
+  return await Module();
 }
 
-// ── Main ────────────────────────────────────────────────────
+// ── ASR runner ──────────────────────────────────────────────
+async function runAsr(args) {
+  const wav = readWav(args.wav);
+  const duration = wav.pcm.length / wav.sampleRate;
+  console.log(`WAV:     ${args.wav} (${wav.sampleRate} Hz, ${wav.numChannels} ch, ${wav.bitsPerSample}-bit, ${duration.toFixed(2)}s)`);
+
+  const mod = await loadWasmModule();
+  const rs  = new RapidSpeechWASM(mod);
+
+  const modelData = fs.readFileSync(args.model);
+  await rs.initAsr(modelData, args.threads);
+  console.log(`Arch:    ${rs.archName}  SR=${rs.sampleRate} Hz  version=${rs.version}`);
+
+  if (args.ctcPrecheck) rs.setCtcPrecheck(true);
+
+  const times1 = [];
+  const times2 = [];
+  for (let r = 0; r < args.runs; r++) {
+    rs.reset();
+    rs.pushAudio(wav.pcm);
+
+    if (args.twoPass) rs.setUseLlm(false);
+
+    const t0 = performance.now();
+    const first = rs.process();
+    const e1 = (performance.now() - t0) / 1000;
+    times1.push(e1);
+
+    let second = null;
+    if (args.twoPass) {
+      rs.setUseLlm(true);
+      const t = performance.now();
+      second = rs.redecode();
+      times2.push((performance.now() - t) / 1000);
+    }
+
+    if (args.runs === 1) {
+      if (args.twoPass) {
+        console.log(`\n  CTC :  ${first.text || '(no speech)'}`);
+        console.log(`  LLM :  ${(second && second.text) || '(no speech)'}\n`);
+      } else {
+        console.log(`\n  Result: ${first.text || '(no speech)'}\n`);
+      }
+    } else {
+      const rtf = e1 / duration;
+      const out = (second && second.text) || first.text || '(no speech)';
+      console.log(`  Run ${r+1}: ${e1.toFixed(3)}s RTF=${rtf.toFixed(3)} ${out}`);
+    }
+  }
+
+  if (args.runs > 1) {
+    const avg1 = times1.reduce((a,b)=>a+b,0) / times1.length;
+    console.log(`\n  CTC avg: ${avg1.toFixed(3)}s  RTF=${(avg1/duration).toFixed(3)}`);
+    if (times2.length) {
+      const avg2 = times2.reduce((a,b)=>a+b,0) / times2.length;
+      console.log(`  LLM avg: ${avg2.toFixed(3)}s  RTF=${(avg2/duration).toFixed(3)}`);
+    }
+  }
+
+  rs.free();
+}
+
+// ── TTS runner ──────────────────────────────────────────────
+async function runTts(args) {
+  const mod = await loadWasmModule();
+  const rs  = new RapidSpeechWASM(mod);
+
+  const modelData = fs.readFileSync(args.model);
+  await rs.initTts(modelData, args.threads);
+  console.log(`Arch:    ${rs.archName}  SR=${rs.sampleRate} Hz  version=${rs.version}`);
+
+  rs.setTtsParams({ instruct: args.instruct, language: args.lang, seed: args.seed });
+  rs.setDiffusionSteps(args.nSteps);
+  console.log(`Params:  instruct="${args.instruct}" lang=${args.lang} seed=${args.seed} steps=${args.nSteps}`);
+
+  if (args.refWav) {
+    if (!args.refText) { console.error('--ref requires --ref-text'); process.exit(1); }
+    const ref = readWav(args.refWav);
+    rs.pushReferenceAudio(ref.pcm, ref.sampleRate);
+    rs.pushReferenceText(args.refText);
+    console.log(`Cloning: ${args.refWav} (${ref.sampleRate} Hz, ${(ref.pcm.length/ref.sampleRate).toFixed(2)}s)`);
+  }
+
+  console.log(`Text:    ${JSON.stringify(args.text)}`);
+  const t0 = performance.now();
+  const pcm = rs.synthesize(args.text);
+  const elapsed = (performance.now() - t0) / 1000;
+  const duration = pcm.length / rs.sampleRate;
+  const rtf = elapsed / Math.max(duration, 1e-9);
+  console.log(`Output:  ${pcm.length} samples @ ${rs.sampleRate} Hz (${duration.toFixed(2)}s, elapsed=${elapsed.toFixed(2)}s, RTF=${rtf.toFixed(3)})`);
+
+  writeWavMono16(args.output, pcm, rs.sampleRate);
+  console.log(`Wrote    ${args.output}`);
+
+  rs.free();
+}
+
+// ── Main ───────────────────────────────────────────────────
 async function main() {
-  const args = parseArgs();
-  if (args.help || !args.model || !args.wav) {
-    if (!args.help) console.error('Error: --model and --wav are required.\n');
+  const args = parseArgs(process.argv.slice(2));
+
+  if (args.help || !args.mode || !args.model
+      || (args.mode === 'asr' && !args.wav)
+      || (args.mode === 'tts' && !args.text)) {
+    if (!args.help) console.error('Error: missing required arguments.\n');
     showHelp();
     process.exit(args.help ? 0 : 1);
   }
 
-  const modelPath = path.resolve(args.model);
-  const wavPath = path.resolve(args.wav);
-
-  if (!fs.existsSync(modelPath)) { console.error(`Model not found: ${modelPath}`); process.exit(1); }
-  if (!fs.existsSync(wavPath)) { console.error(`WAV not found: ${wavPath}`); process.exit(1); }
+  if (!fs.existsSync(args.model)) {
+    console.error(`Model not found: ${args.model}`); process.exit(1);
+  }
 
   console.log('=== RapidSpeech Node.js API Example ===\n');
+  if (args.mode === 'asr')      await runAsr(args);
+  else if (args.mode === 'tts') await runTts(args);
+  else { console.error(`Unknown mode: ${args.mode}`); showHelp(); process.exit(1); }
 
-  // ── 1. Read WAV ───────────────────────────────────────────
-  console.log(`WAV:    ${wavPath}`);
-  let wav;
-  try { wav = readWav(wavPath); }
-  catch (err) { console.error(`Failed to read WAV: ${err.message}`); process.exit(1); }
-
-  const audioDuration = wav.pcm.length / wav.sampleRate;
-  console.log(`        ${wav.sampleRate} Hz, ${wav.numChannels} ch, ${wav.bitsPerSample}-bit`);
-  console.log(`        ${wav.pcm.length} samples, ${audioDuration.toFixed(2)} s\n`);
-
-  // ── 2. Load WASM ──────────────────────────────────────────
-  const module = await loadWasmModule();
-
-  // ── 3. Load model ─────────────────────────────────────────
-  console.log(`\nModel:  ${modelPath}`);
-  console.log('Loading model into WASM...');
-
-  const modelData = fs.readFileSync(modelPath);
-  const modelName = '/model.gguf';
-  module.FS.writeFile(modelName, modelData);
-
-  const initRet = module.ccall('rs_wasm_init', 'number', ['string', 'number'],
-                                [modelName, args.threads]);
-  if (initRet !== 0) {
-    console.error('Failed to initialize model.');
-    module.ccall('rs_wasm_free', null, [], []);
-    process.exit(1);
-  }
-
-  const archName = module.ccall('rs_wasm_get_arch_name', 'string', [], []);
-  const sampleRate = module.ccall('rs_wasm_get_sample_rate', 'number', [], []);
-  console.log(`        Architecture: ${archName}, Sample rate: ${sampleRate} Hz\n`);
-
-  // ── 4. Run ASR ────────────────────────────────────────────
-  console.log(`Running ASR (${args.runs} run(s))...`);
-
-  // Prepare audio on WASM heap once (reused for benchmarks)
-  const nSamples = wav.pcm.length;
-  const ptr = module._malloc(nSamples * 4);
-  module.HEAPF32.set(wav.pcm, ptr / 4);
-
-  const times = [];
-
-  for (let r = 0; r < args.runs; r++) {
-    module.ccall('rs_wasm_reset', null, [], []);
-    module.ccall('rs_wasm_push_audio', 'number', ['number', 'number'], [ptr, nSamples]);
-
-    const t0 = performance.now();
-    const status = module.ccall('rs_wasm_process', 'number', [], []);
-    const elapsed = (performance.now() - t0) / 1000;
-    times.push(elapsed);
-
-    if (status > 0) {
-      const text = module.ccall('rs_wasm_get_text', 'string', [], []);
-      if (args.runs === 1) {
-        console.log(`\n──────────────────────────────────────────────────────────`);
-        console.log(` ${text || '(no speech recognized)'}`);
-        console.log(`──────────────────────────────────────────────────────────\n`);
-      } else {
-        const rtf = elapsed / audioDuration;
-        console.log(`  Run ${r+1}: ${elapsed.toFixed(3)}s  RTF=${rtf.toFixed(3)}  ${text || '(no speech)'}`);
-      }
-    } else {
-      console.log(`  Run ${r+1}: no output`);
-    }
-  }
-
-  module._free(ptr);
-
-  if (args.runs > 1) {
-    const avg = times.reduce((a, b) => a + b, 0) / times.length;
-    const min = Math.min(...times);
-    const max = Math.max(...times);
-    console.log(`\n  Avg: ${avg.toFixed(3)}s  Min: ${min.toFixed(3)}s  Max: ${max.toFixed(3)}s  RTF=${(avg/audioDuration).toFixed(3)}`);
-  }
-
-  console.log(`Elapsed: ${times.reduce((a,b)=>a+b,0).toFixed(2)}s | Audio: ${audioDuration.toFixed(2)}s`);
-
-  // ── 5. Cleanup ────────────────────────────────────────────
-  module.ccall('rs_wasm_free', null, [], []);
   console.log('Done.');
 }
 
-main().catch(err => {
+main().catch((err) => {
   console.error('Fatal error:', err);
   process.exit(1);
 });

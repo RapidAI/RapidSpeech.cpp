@@ -3,251 +3,269 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>RapidSpeech — WebAssembly ASR Demo</title>
-  <style>
-    :root {
-      --bg: #1a1a2e;
-      --card: #16213e;
-      --accent: #0f3460;
-      --highlight: #e94560;
-      --text: #eee;
-      --dim: #8892b0;
-      --green: #4ecca3;
-      --yellow: #f0a500;
-      --radius: 8px;
-    }
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      min-height: 100vh;
-      display: flex;
-      justify-content: center;
-      padding: 20px;
-    }
-    .container {
-      max-width: 700px;
-      width: 100%;
-    }
-
-    /* Header */
-    .header {
-      text-align: center;
-      margin-bottom: 24px;
-    }
-    .header h1 {
-      font-size: 28px;
-      font-weight: 700;
-      letter-spacing: -0.5px;
-    }
-    .header h1 span { color: var(--highlight); }
-    .header p {
-      color: var(--dim);
-      font-size: 14px;
-      margin-top: 4px;
-    }
-
-    /* Card */
-    .card {
-      background: var(--card);
-      border-radius: var(--radius);
-      padding: 20px;
-      margin-bottom: 16px;
-    }
-    .card-title {
-      font-size: 14px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-      color: var(--dim);
-      margin-bottom: 12px;
-    }
-
-    /* Model input row */
-    .input-row {
-      display: flex;
-      gap: 8px;
-    }
-    .input-row input {
-      flex: 1;
-      padding: 10px 14px;
-      border: 1px solid var(--accent);
-      border-radius: var(--radius);
-      background: var(--bg);
-      color: var(--text);
-      font-size: 14px;
-      outline: none;
-    }
-    .input-row input:focus { border-color: var(--highlight); }
-
-    /* Buttons */
-    .btn-row { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
-    .btn {
-      padding: 8px 18px;
-      border: none;
-      border-radius: var(--radius);
-      font-size: 14px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: opacity 0.2s;
-    }
-    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
-    .btn-load { background: var(--accent); color: var(--text); }
-    .btn-start { background: var(--green); color: var(--bg); }
-    .btn-stop { background: var(--highlight); color: var(--text); }
-    .btn-clear { background: transparent; border: 1px solid var(--dim); color: var(--dim); }
-
-    /* Progress bar */
-    .progress-container { display: none; margin-top: 10px; }
-    .progress-track {
-      width: 100%; height: 4px; background: var(--accent);
-      border-radius: 2px; overflow: hidden;
-    }
-    .progress-fill {
-      height: 100%; width: 0%; background: var(--green);
-      transition: width 0.2s;
-    }
-
-    /* Status */
-    .status {
-      margin-top: 10px;
-      font-size: 13px;
-      padding: 6px 12px;
-      border-radius: 4px;
-      display: inline-block;
-    }
-    .status.idle { color: var(--dim); background: transparent; }
-    .status.loading { color: var(--yellow); background: rgba(240,165,0,0.1); }
-    .status.ready { color: var(--green); background: rgba(78,204,163,0.1); }
-    .status.listening { color: var(--green); background: rgba(78,204,163,0.1); }
-    .status.error { color: var(--highlight); background: rgba(233,69,96,0.1); }
-
-    /* VAD meter */
-    .vad-container { margin-top: 12px; }
-    .vad-track {
-      width: 100%; height: 6px; background: var(--accent);
-      border-radius: 3px; overflow: hidden;
-    }
-    .vad-fill {
-      height: 100%; width: 0%; background: var(--dim);
-      transition: width 0.1s, background 0.2s;
-      border-radius: 3px;
-    }
-    .vad-fill.speech { background: var(--green); }
-    .vad-meta { display: flex; justify-content: space-between; margin-top: 4px; }
-    .vad-label { font-size: 12px; color: var(--dim); text-transform: uppercase; }
-    .vad-label.speech { color: var(--green); font-weight: 600; }
-    .vad-info { font-size: 12px; color: var(--dim); }
-
-    /* Transcript */
-    .transcript {
-      background: var(--bg);
-      border-radius: var(--radius);
-      padding: 16px;
-      min-height: 200px;
-      max-height: 400px;
-      overflow-y: auto;
-      font-size: 15px;
-      line-height: 1.7;
-      word-break: break-all;
-    }
-    .transcript-line {
-      margin-bottom: 6px;
-      padding-bottom: 6px;
-      border-bottom: 1px solid rgba(255,255,255,0.05);
-    }
-    .transcript-line .timestamp {
-      color: var(--dim);
-      font-size: 12px;
-      font-family: monospace;
-      margin-right: 8px;
-    }
-    .partial {
-      color: var(--dim);
-      font-style: italic;
-      padding: 8px 16px;
-      min-height: 24px;
-      font-size: 14px;
-    }
-
-    /* Footer */
-    .footer {
-      text-align: center;
-      margin-top: 20px;
-      font-size: 12px;
-      color: var(--dim);
-    }
-    .footer a { color: var(--highlight); text-decoration: none; }
-  </style>
+  <title>RapidSpeech — WebAssembly Demo</title>
+  <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <div class="container">
 
-    <!-- Header -->
     <div class="header">
       <h1>Rapid<span>Speech</span></h1>
-      <p>Speech Recognition in the Browser — Powered by WebAssembly</p>
+      <p>ASR &amp; TTS in the Browser — WebAssembly + WebGPU</p>
     </div>
 
-    <!-- Model Loading -->
-    <div class="card">
-      <div class="card-title">Model</div>
-      <div class="input-row">
-        <input id="model-url" type="text"
-               placeholder="https://huggingface.co/.../sense-voice-small-q8_0.gguf"
-               value="">
+    <nav class="tabs">
+      <button class="tab-btn active" data-tab="asr-offline">ASR Offline</button>
+      <button class="tab-btn"        data-tab="asr-online">ASR Online</button>
+      <button class="tab-btn"        data-tab="tts-offline">TTS Offline</button>
+    </nav>
+
+    <!-- ─── ASR Offline ─────────────────────────────────────── -->
+    <section data-page="asr-offline">
+      <div class="card">
+        <div class="card-title">Model</div>
+        <div class="form-row">
+          <label>Model URL</label>
+          <input type="text" data-id="model-url"
+                 placeholder="https://huggingface.co/.../funasr-nano-q4_k_m.gguf">
+        </div>
+        <div class="form-row">
+          <label>Threads</label>
+          <input type="number" data-id="n-threads" value="4" min="1" max="8">
+          <label style="min-width: 80px;">Use LLM</label>
+          <input type="checkbox" data-id="use-llm" checked>
+        </div>
+        <div class="progress-container" data-id="progress-container">
+          <div class="progress-track"><div class="progress-fill" data-id="progress-bar"></div></div>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-load" data-id="load-btn">Load Model</button>
+        </div>
+        <div class="status idle" data-id="status">Enter a model URL and click Load.</div>
       </div>
-      <div class="progress-container" id="progress-container">
-        <div class="progress-track">
-          <div class="progress-fill" id="progress-bar"></div>
+
+      <div class="card">
+        <div class="card-title">VAD (optional — silero-vad or firered-vad)</div>
+        <div class="form-row">
+          <label>VAD model URL</label>
+          <input type="text" data-id="vad-url"
+                 placeholder="https://huggingface.co/.../silero-vad.gguf (leave empty to skip)">
+        </div>
+        <div class="form-row">
+          <label>Threshold</label>
+          <input type="range" data-id="vad-threshold" min="0.1" max="0.9" step="0.05" value="0.5">
+          <span class="range-value" data-id="vad-threshold-val">0.50</span>
+          <label style="min-width: 100px;">Min seg (s)</label>
+          <input type="number" data-id="vad-min-seg" value="0.3" step="0.1" min="0" max="2">
+        </div>
+        <div class="progress-container" data-id="vad-progress-container">
+          <div class="progress-track"><div class="progress-fill" data-id="vad-progress-bar"></div></div>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-load" data-id="vad-load-btn">Load VAD</button>
+        </div>
+        <div class="status idle" data-id="vad-status">No VAD loaded — full clip will be transcribed.</div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Input</div>
+        <div class="form-row">
+          <label>Source</label>
+          <select data-id="source-mode">
+            <option value="upload">Upload WAV</option>
+            <option value="record">Record from mic</option>
+          </select>
+        </div>
+        <div class="form-row" data-id="upload-row">
+          <label>Audio file</label>
+          <input type="file" data-id="audio-file" accept="audio/*">
+        </div>
+        <div class="form-row" data-id="record-row" style="display:none;">
+          <label>Recording</label>
+          <button class="btn btn-primary" data-id="rec-btn" disabled>● Record</button>
+          <span data-id="rec-time" class="vad-info">00:00.0</span>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-primary" data-id="run-btn" disabled>Transcribe</button>
+          <button class="btn btn-ghost"   data-id="redecode-btn" disabled>Re-decode (LLM)</button>
         </div>
       </div>
-      <div class="btn-row">
-        <button class="btn btn-load" id="load-btn">Load Model</button>
-      </div>
-      <div id="status" class="status idle">Enter a model URL and click Load.</div>
-    </div>
 
-    <!-- Controls + VAD -->
-    <div class="card">
-      <div class="card-title">Microphone</div>
-      <div class="btn-row">
-        <button class="btn btn-start" id="start-btn" disabled>Start</button>
-        <button class="btn btn-stop" id="stop-btn" disabled>Stop</button>
-        <button class="btn btn-clear" id="clear-btn">Clear</button>
+      <div class="card">
+        <div class="card-title">Transcript</div>
+        <div class="transcript" data-id="transcript"></div>
       </div>
-      <div class="vad-container">
-        <div class="vad-track">
-          <div class="vad-fill" id="vad-bar"></div>
+    </section>
+
+    <!-- ─── ASR Online ──────────────────────────────────────── -->
+    <section data-page="asr-online" hidden>
+      <div class="card">
+        <div class="card-title">Model</div>
+        <div class="form-row">
+          <label>Model URL</label>
+          <input type="text" data-id="model-url"
+                 placeholder="https://huggingface.co/.../funasr-nano-q4_k_m.gguf">
         </div>
-        <div class="vad-meta">
-          <span class="vad-label" id="vad-label">silence</span>
-          <span class="vad-info" id="info"></span>
+        <div class="form-row">
+          <label>Threads</label>
+          <input type="number" data-id="n-threads" value="4" min="1" max="8">
+          <label style="min-width: 80px;">Use LLM</label>
+          <input type="checkbox" data-id="use-llm" checked>
+          <label style="min-width: 90px;">Two-pass</label>
+          <input type="checkbox" data-id="two-pass">
+        </div>
+        <div class="progress-container" data-id="progress-container">
+          <div class="progress-track"><div class="progress-fill" data-id="progress-bar"></div></div>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-load" data-id="load-btn">Load Model</button>
+        </div>
+        <div class="status idle" data-id="status">Enter a model URL and click Load.</div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">VAD (neural — silero-vad or firered-vad; falls back to energy gate)</div>
+        <div class="form-row">
+          <label>VAD model URL</label>
+          <input type="text" data-id="vad-url"
+                 placeholder="https://huggingface.co/.../silero-vad.gguf (leave empty for energy gate)">
+        </div>
+        <div class="progress-container" data-id="vad-progress-container">
+          <div class="progress-track"><div class="progress-fill" data-id="vad-progress-bar"></div></div>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-load" data-id="vad-load-btn">Load VAD</button>
+          <span class="status idle" data-id="vad-status" style="flex:1;">Energy gate (default).</span>
+        </div>
+        <div class="form-row">
+          <label>Speech threshold</label>
+          <input type="range" data-id="vad-threshold" min="0.001" max="0.9" step="0.005" value="0.5">
+          <span class="range-value" data-id="vad-threshold-val">0.500</span>
+        </div>
+        <div class="form-row">
+          <label>Silence frames (energy mode only)</label>
+          <input type="range" data-id="silence-frames" min="5" max="40" step="1" value="15">
+          <span class="range-value" data-id="silence-frames-val">15</span>
         </div>
       </div>
-    </div>
 
-    <!-- Transcript -->
-    <div class="card">
-      <div class="card-title">Transcript</div>
-      <div class="transcript" id="transcript"></div>
-      <div class="partial" id="partial"></div>
-    </div>
+      <div class="card">
+        <div class="card-title">Microphone</div>
+        <div class="btn-row">
+          <button class="btn btn-primary"   data-id="start-btn" disabled>Start</button>
+          <button class="btn btn-secondary" data-id="stop-btn"  disabled>Stop</button>
+          <button class="btn btn-ghost"     data-id="clear-btn">Clear</button>
+        </div>
+        <div class="vad-container">
+          <div class="vad-track"><div class="vad-fill" data-id="vad-bar"></div></div>
+          <div class="vad-meta">
+            <span class="vad-label" data-id="vad-label">silence</span>
+            <span class="vad-info"  data-id="info"></span>
+          </div>
+        </div>
+        <div class="status error" data-id="rtf-warn"
+             style="display:none; margin-top:8px;"></div>
+      </div>
 
-    <!-- Footer -->
+      <div class="card">
+        <div class="card-title">Transcript</div>
+        <div class="transcript" data-id="transcript"></div>
+        <div class="partial" data-id="partial"></div>
+      </div>
+    </section>
+
+    <!-- ─── TTS Offline ─────────────────────────────────────── -->
+    <section data-page="tts-offline" hidden>
+      <div class="card">
+        <div class="card-title">Model</div>
+        <div class="form-row">
+          <label>Model URL</label>
+          <input type="text" data-id="model-url"
+                 placeholder="https://huggingface.co/.../omnivoice-q4_k_m.gguf">
+        </div>
+        <div class="form-row">
+          <label>Threads</label>
+          <input type="number" data-id="n-threads" value="4" min="1" max="8">
+        </div>
+        <div class="progress-container" data-id="progress-container">
+          <div class="progress-track"><div class="progress-fill" data-id="progress-bar"></div></div>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-load" data-id="load-btn">Load Model</button>
+        </div>
+        <div class="status idle" data-id="status">Enter a model URL and click Load.</div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Generation params</div>
+        <div class="form-row">
+          <label>Instruct</label>
+          <select data-id="instruct">
+            <option value="male">male</option>
+            <option value="female">female</option>
+            <option value="child">child</option>
+          </select>
+          <label style="min-width: 80px;">Language</label>
+          <select data-id="language">
+            <option value="English">English</option>
+            <option value="Chinese">Chinese</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>Seed</label>
+          <input type="number" data-id="seed" value="42">
+          <label style="min-width: 120px;">Diffusion steps</label>
+          <input type="range" data-id="steps" min="8" max="50" step="1" value="32">
+          <span class="range-value" data-id="steps-val">32</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Voice cloning (optional)</div>
+        <div class="form-row">
+          <label>Reference WAV</label>
+          <input type="file" data-id="ref-audio" accept="audio/*">
+        </div>
+        <div class="form-row">
+          <label>Reference text</label>
+          <input type="text" data-id="ref-text" placeholder="Transcription of the reference clip">
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Synthesize</div>
+        <div class="form-row">
+          <label style="min-width: 110px;">Text</label>
+          <textarea data-id="text" placeholder="Type the text you want to synthesize..."></textarea>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-primary" data-id="gen-btn" disabled>Generate</button>
+          <button class="btn btn-ghost"   data-id="clear-btn">Clear</button>
+        </div>
+        <div class="audio-output" data-id="audio-output" hidden>
+          <audio data-id="audio" controls></audio>
+          <a class="download-link" data-id="download" download="rapidspeech-tts.wav">⬇ Download WAV</a>
+          <span class="vad-info" data-id="gen-info"></span>
+        </div>
+      </div>
+    </section>
+
     <div class="footer">
       <a href="https://github.com/lovemefan/RapidSpeech.cpp" target="_blank">RapidSpeech.cpp</a>
-      &mdash; GGUF ASR models run locally in your browser.
+      &mdash; GGUF speech models, in your browser.
     </div>
-
   </div>
 
-  <!-- Emscripten-generated WASM glue (build output) -->
+  <!-- Emscripten-generated WASM glue -->
   <script src="rapidspeech-wasm.js"></script>
-  <!-- JS bridge layer -->
+  <!-- Bridge + shared utils -->
   <script src="rapidspeech-bridge.js"></script>
-  <!-- App logic -->
+  <script src="utils.js"></script>
+  <!-- Per-tab modules -->
+  <script src="pages/asr-offline.js"></script>
+  <script src="pages/asr-online.js"></script>
+  <script src="pages/tts-offline.js"></script>
+  <!-- Tab router -->
   <script src="app.js"></script>
 </body>
 </html>

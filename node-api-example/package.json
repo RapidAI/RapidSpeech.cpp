@@ -1,13 +1,13 @@
 {
   "name": "rapidspeech-node-example",
   "version": "1.0.0",
-  "description": "RapidSpeech Node.js example — offline ASR via WebAssembly",
+  "description": "RapidSpeech Node.js example — offline ASR & TTS via WebAssembly",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "help": "node index.js --help"
   },
-  "keywords": ["asr", "speech-recognition", "wasm", "ggml", "rapidspeech"],
+  "keywords": ["asr", "tts", "speech-recognition", "speech-synthesis", "wasm", "ggml", "rapidspeech"],
   "engines": {
     "node": ">=18.0.0"
   },

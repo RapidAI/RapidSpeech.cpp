@@ -275,7 +275,7 @@ bool FunASRNanoModel::LoadLLM(
   // 5. Allocate backend buffers and copy tensor data
   // Create weight context for LLM
   struct ggml_init_params params = {/*.mem_size   =*/ggml_tensor_overhead() *
-                                            gguf_get_n_tensors(ctx_gguf) +
+                                            static_cast<size_t>(gguf_get_n_tensors(ctx_gguf)) +
                                         (1 << 20),
                                     /*.mem_buffer =*/nullptr,
                                     /*.no_alloc   =*/true};
@@ -874,13 +874,23 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
                     ("gpu_kv_v_" + std::to_string(il)).c_str());
     }
 
-    // Allocate KV cache on the fastest available backend
+    // Allocate KV cache on the fastest available backend.
+    // rs_context appends GPU backends first and CPU last (CPU must be last
+    // for ggml_backend_sched_new), so we scan for the first non-CPU backend
+    // and fall back to the last one (CPU-only build) if none is found.
     int n_backends = ggml_backend_sched_get_n_backends(sched);
-    // With a GPU-only scheduler the single backend IS the GPU.
-    // With a mixed scheduler the GPU is typically the last backend.
+    int gpu_idx = n_backends - 1;
+    for (int bi = 0; bi < n_backends; ++bi) {
+      ggml_backend_t b = ggml_backend_sched_get_backend(sched, bi);
+      ggml_backend_dev_t dev = ggml_backend_get_device(b);
+      if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        gpu_idx = bi;
+        break;
+      }
+    }
     ggml_backend_t gpu_backend =
-        ggml_backend_sched_get_backend(sched, n_backends - 1);
-    RS_LOG_INFO("KV cache allocated on backend %d/%d: %s", n_backends - 1,
+        ggml_backend_sched_get_backend(sched, gpu_idx);
+    RS_LOG_INFO("KV cache allocated on backend %d/%d: %s", gpu_idx,
                 n_backends, ggml_backend_name(gpu_backend));
 
     kv_gpu_buf = ggml_backend_alloc_ctx_tensors(ctx_kv, gpu_backend);

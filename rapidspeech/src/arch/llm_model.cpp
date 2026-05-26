@@ -559,7 +559,7 @@ bool llm_model::load_from_gguf(struct gguf_context *ctx_gguf,
     if (!ctx_weights_) {
       struct ggml_init_params params = {
           /*.mem_size   =*/ggml_tensor_overhead() *
-                  gguf_get_n_tensors(ctx_gguf) +
+                  static_cast<size_t>(gguf_get_n_tensors(ctx_gguf)) +
               (1 << 20),
           /*.mem_buffer =*/nullptr,
           /*.no_alloc   =*/true};

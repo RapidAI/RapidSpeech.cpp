@@ -231,6 +231,17 @@ void AudioProcessor::ComputeFbank(const std::vector<float> &samples,
   if (n_frames < num_threads * 2)
     num_threads = 1;
 
+  // Single-thread fast path: avoid std::thread entirely so this works on
+  // WASM builds without pthreads (Emscripten throws system_error otherwise).
+  if (num_threads == 1) {
+    std::vector<double> window_buf(config_.n_fft);
+    std::vector<double> power_spec_buf(config_.n_fft / 2 + 1);
+    for (int i = 0; i < n_frames; i++) {
+      ProcessFrame(i, samples, window_buf, power_spec_buf, output_mel);
+    }
+    return;
+  }
+
   std::vector<std::thread> threads;
   int chunk_size = n_frames / num_threads;
 

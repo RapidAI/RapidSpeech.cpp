@@ -247,6 +247,73 @@ RS_API rs_error_t rs_set_ctc_precheck(rs_context_t* ctx, bool enable);
 RS_API int32_t rs_redecode(rs_context_t* ctx);
 
 // ============================================
+// Voice Activity Detection (VAD)
+// Independent handle (separate from rs_context_t). Auto-dispatches on the
+// GGUF `general.architecture` field, currently {"silero-vad", "firered-vad"}.
+// ============================================
+
+typedef struct rs_vad_t rs_vad_t;
+
+// Collapsed speech segment in seconds (relative to first pushed sample).
+typedef struct {
+    float start_s;
+    float end_s;
+} rs_vad_segment_t;
+
+// Per-frame postprocessor output. Frame rate depends on the backend:
+//   silero-vad : ~31.25 fps (512-sample window @ 16 kHz)
+//   firered-vad: 100 fps (10 ms shift)
+typedef struct {
+    int32_t frame_idx;       // 1-based monotonic frame counter
+    float   raw_prob;        // model output, [0..1]
+    float   smoothed_prob;   // FireRed only; equals raw_prob on Silero
+    int32_t is_speech;       // postprocessor decision (1=speech)
+    int32_t is_speech_start; // 1 on the frame that begins a segment
+    int32_t is_speech_end;   // 1 on the frame that ends a segment
+} rs_vad_frame_t;
+
+// Open a VAD model from a GGUF file. `use_gpu` is honored when a GPU backend
+// is compiled in (e.g. WebGPU under WASM); CPU fallback is automatic.
+RS_API rs_vad_t* rs_vad_init_from_file(const char* model_path,
+                                       int32_t n_threads, bool use_gpu);
+
+// Release a VAD model (state, weights, backend).
+RS_API void rs_vad_free(rs_vad_t* vad);
+
+// Reset all streaming state (caches, postprocessor, audio remainder,
+// queued segments, queued frames). Sample counter is reset to 0.
+RS_API rs_error_t rs_vad_reset(rs_vad_t* vad);
+
+// Set the speech-probability threshold (0..1). Default per-model.
+RS_API rs_error_t rs_vad_set_threshold(rs_vad_t* vad, float threshold);
+
+// Push 16 kHz mono float PCM. Completed segments are appended to the
+// internal segment queue; per-frame events to the frame queue.
+RS_API rs_error_t rs_vad_push_audio(rs_vad_t* vad,
+                                    const float* pcm, int32_t n_samples);
+
+// Latest activity readouts (post-push).
+RS_API int32_t     rs_vad_is_speech(const rs_vad_t* vad);     // 1 or 0
+RS_API float       rs_vad_get_probability(const rs_vad_t* vad);
+RS_API const char* rs_vad_get_arch(const rs_vad_t* vad);
+
+// Drain queued speech segments. Returns number written to `out` (<= capacity).
+// Drained entries are removed from the internal queue.
+RS_API int32_t rs_vad_drain_segments(rs_vad_t* vad,
+                                     rs_vad_segment_t* out, int32_t capacity);
+
+// Drain queued per-frame events. Same semantics as drain_segments.
+RS_API int32_t rs_vad_drain_frames(rs_vad_t* vad,
+                                   rs_vad_frame_t* out, int32_t capacity);
+
+// One-shot offline detection. Resets state, pushes the whole utterance,
+// flushes any open segment, writes up to `capacity` segments into `out`.
+// Returns the total number of segments detected (may exceed capacity).
+RS_API int32_t rs_vad_detect_full(rs_vad_t* vad,
+                                  const float* pcm, int32_t n_samples,
+                                  rs_vad_segment_t* out, int32_t capacity);
+
+// ============================================
 // Utility Functions
 // ============================================
 

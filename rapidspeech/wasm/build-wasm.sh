@@ -38,6 +38,8 @@ cd "$BUILD_DIR"
 cmake .. \
     -DCMAKE_TOOLCHAIN_FILE="$EMSDK/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DRS_WASM_WEBGPU=ON \
+    -DRS_WASM_PTHREADS=ON \
     -G "Unix Makefiles"
 
 make -j$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
