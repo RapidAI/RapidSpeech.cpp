@@ -111,6 +111,8 @@ jobs:
                 install_name_tool -change "$lib.dylib" "@rpath/$lib.dylib" "$f" 2>/dev/null || true;
                 install_name_tool -change "ggml/src/$lib.dylib" "@rpath/$lib.dylib" "$f" 2>/dev/null || true;
               done;
+              install_name_tool -add_rpath "@loader_path" "$f" 2>/dev/null || true;
+              install_name_tool -add_rpath "@loader_path/.." "$f" 2>/dev/null || true;
               id=$(otool -D "$f" | tail -1) &&
               basename_id=$(basename "$id") &&
               if [ "$id" != "$basename_id" ] && [ -n "$basename_id" ]; then
