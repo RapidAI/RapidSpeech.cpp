@@ -3,7 +3,7 @@
  * Exposes window.RSPageTtsOffline.init({root, createInstance}).
  */
 (function () {
-  const { decodeFileToMonoAt, encodeWav, statusSetter } = window.RSUtils;
+  const { decodeFileToMonoAt, encodeWav, statusSetter, makeDownloadProgress } = window.RSUtils;
 
   function $(root, id) { return root.querySelector(`[data-id="${id}"]`); }
 
@@ -15,6 +15,7 @@
       status:   $(root, 'status'),
       progress: $(root, 'progress-container'),
       progressBar: $(root, 'progress-bar'),
+      progressInfo: $(root, 'progress-info'),
 
       instruct: $(root, 'instruct'),
       language: $(root, 'language'),
@@ -65,9 +66,8 @@
         const nThreads = parseInt(els.nThreads.value, 10) || 4;
         // Use generic init with TTS_OFFLINE task type so the engine batches the
         // whole utterance instead of streaming chunks.
-        await rs.init(url, RS_TASK.TTS_OFFLINE, nThreads, (p) => {
-          els.progressBar.style.width = (p * 100).toFixed(1) + '%';
-        });
+        const onProg = makeDownloadProgress(els.progressBar, els.progressInfo);
+        await rs.init(url, RS_TASK.TTS_OFFLINE, nThreads, onProg);
         refSr = rs.sampleRate || 24000;
         els.progress.style.display = 'none';
         els.genBtn.disabled = false;

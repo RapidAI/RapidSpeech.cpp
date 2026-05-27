@@ -42,6 +42,19 @@ python3 serve.py 8000
 > headers that pthreads + SharedArrayBuffer require — without them the WASM
 > module aborts at startup.
 
+### Deploying to a host you can't add headers to
+
+`coi-serviceworker.js` is loaded as the very first script in `index.html`. On
+hosts that won't let you set COOP/COEP server-side (ModelScope Static Spaces,
+GitHub Pages, some HuggingFace embeds), it registers a service worker that
+intercepts every response and rewrites the headers itself. First visit reloads
+the page once; subsequent visits start cross-origin-isolated. **HTTPS is
+required** — service workers don't register on plain HTTP.
+
+If your host *does* set COOP/COEP (the bundled `serve.py`, your own nginx,
+etc.), the shim is a no-op — it detects `crossOriginIsolated` is already
+`true` and skips registration.
+
 ## Tabs
 
 ### ASR Offline

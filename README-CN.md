@@ -142,7 +142,7 @@ cmake --build build --config Release
 | --- | --- | --- |
 | `-m, --model` | GGUF 模型文件路径（必填） | — |
 | `-w, --wav` | WAV 音频文件路径（16kHz，必填） | — |
-| `-v, --vad` | Silero VAD GGUF 模型路径（可选，启用 VAD 分段） | — |
+| `-v, --vad` | VAD GGUF 模型路径 —— Silero 或 FireRed，根据 `general.architecture` 自动识别（可选，启用 VAD 分段） | — |
 | `-t, --threads` | CPU 线程数 | 4 |
 | `--gpu` | 是否启用 GPU 加速（`true`/`false`） | true |
 | `--vad-threshold` | VAD 语音检测阈值（0~1，越低越灵敏） | 0.5 |
@@ -391,6 +391,8 @@ for chunk in chunks:
 | 🌐 **浏览器（WebAssembly）** | 三标签页演示：离线 ASR、麦克风在线 ASR、离线 TTS。本地运行，WebGPU + pthreads | [`wasm-examples/README.md`](wasm-examples/README.md) |
 | 🟩 **Node.js** | 复用 WASM 模块的 CLI：文件 → ASR（可选 VAD + 2-pass）、文本 → TTS（可选声音克隆） | [`node-api-example/README.md`](node-api-example/README.md) |
 | 💻 **C++ CLI** | `rs-asr-offline` / `rs-asr-online` / `rs-tts-offline` / `rs-quantize` | 本 README 上方章节 |
+| ☁️ **Colab Notebook** | 在免费 T4 上编译 CLI、跑 ASR/TTS、使用 Python API 全流程 | [`colab/README.md`](colab/README.md) |
+| 🤗 **HuggingFace Space** | 以 Docker SDK 部署浏览器 demo（自动配好 COOP/COEP） | [`huggingface-space/HOWTO.md`](huggingface-space/HOWTO.md) |
 
 快速预览：
 

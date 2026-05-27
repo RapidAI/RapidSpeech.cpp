@@ -22,6 +22,9 @@
 #include <cstdlib>
 #include <cstring>
 
+// Forward-declare explicit arch registrations so LTO cannot strip them.
+void rs_register_sensevoice();
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -65,6 +68,11 @@ static int audio_buf_set(const float *src, int n) {
 
 EMSCRIPTEN_KEEPALIVE
 int rs_wasm_init_ex(const char *model_path, int task_type, int n_threads) {
+  static bool archs_registered = false;
+  if (!archs_registered) {
+    rs_register_sensevoice();
+    archs_registered = true;
+  }
   if (g_ctx) {
     rs_free(g_ctx);
     g_ctx = nullptr;

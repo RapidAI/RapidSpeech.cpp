@@ -72,7 +72,7 @@ class RapidSpeechWASM {
    * @param {string}   modelUrl
    * @param {number}   taskType   one of RS_TASK.*
    * @param {number}   nThreads
-   * @param {function} onProgress(0..1)
+   * @param {function} onProgress(fraction, {loaded, total})
    */
   async init(modelUrl, taskType = RS_TASK.ASR_OFFLINE, nThreads = 2, onProgress = null) {
     const fileName = '/model.gguf';
@@ -89,16 +89,21 @@ class RapidSpeechWASM {
       const reader = response.body.getReader();
       const chunks = [];
       let loaded = 0;
+      if (onProgress) onProgress(0, { loaded: 0, total });
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         chunks.push(value);
         loaded += value.length;
-        if (onProgress && total > 0) onProgress(Math.min(loaded / total, 1.0));
+        if (onProgress) {
+          const frac = total > 0 ? Math.min(loaded / total, 1.0) : 0;
+          onProgress(frac, { loaded, total });
+        }
       }
       buffer = new Uint8Array(loaded);
       let off = 0;
       for (const c of chunks) { buffer.set(c, off); off += c.length; }
+      if (onProgress) onProgress(1, { loaded, total: total || loaded });
     }
 
     this._mod.FS.writeFile(fileName, buffer);
@@ -310,16 +315,21 @@ class RapidSpeechVAD {
       const reader = response.body.getReader();
       const chunks = [];
       let loaded = 0;
+      if (onProgress) onProgress(0, { loaded: 0, total });
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         chunks.push(value);
         loaded += value.length;
-        if (onProgress && total > 0) onProgress(Math.min(loaded / total, 1.0));
+        if (onProgress) {
+          const frac = total > 0 ? Math.min(loaded / total, 1.0) : 0;
+          onProgress(frac, { loaded, total });
+        }
       }
       buffer = new Uint8Array(loaded);
       let off = 0;
       for (const c of chunks) { buffer.set(c, off); off += c.length; }
+      if (onProgress) onProgress(1, { loaded, total: total || loaded });
     }
 
     this._mod.FS.writeFile(fileName, buffer);

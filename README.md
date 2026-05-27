@@ -143,7 +143,7 @@ Parameters:
 | --- | --- | --- |
 | `-m, --model` | Path to GGUF model file (required) | — |
 | `-w, --wav` | Path to WAV audio file (16 kHz, required) | — |
-| `-v, --vad` | Path to Silero VAD GGUF model (optional, enables VAD segmentation) | — |
+| `-v, --vad` | Path to VAD GGUF model — Silero or FireRed, auto-detected from `general.architecture` (optional, enables VAD segmentation) | — |
 | `-t, --threads` | Number of CPU threads | 4 |
 | `--gpu` | Enable GPU acceleration (`true`/`false`) | true |
 | `--vad-threshold` | VAD speech probability threshold (0–1, lower = more sensitive) | 0.5 |
@@ -394,6 +394,8 @@ underlying API surface.
 | 🌐 **Browser (WebAssembly)** | Three-tab demo: offline ASR, mic-driven online ASR, offline TTS. Runs locally with WebGPU + pthreads | [`wasm-examples/README.md`](wasm-examples/README.md) |
 | 🟩 **Node.js** | CLI built on the same WASM module: file → ASR (with optional VAD + 2-pass), text → TTS (with voice cloning) | [`node-api-example/README.md`](node-api-example/README.md) |
 | 💻 **C++ CLI** | `rs-asr-offline` / `rs-asr-online` / `rs-tts-offline` / `rs-quantize` | this README (sections above) |
+| ☁️ **Colab notebook** | Build the CLI on a free T4, run ASR/TTS, use the Python API end-to-end | [`colab/README.md`](colab/README.md) |
+| 🤗 **HuggingFace Space** | Deploy the browser demo as a Docker-SDK Space (COOP/COEP-ready) | [`huggingface-space/HOWTO.md`](huggingface-space/HOWTO.md) |
 
 Quick taste of each:
 

@@ -4,6 +4,11 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>RapidSpeech — WebAssembly Demo</title>
+  <!-- Service-worker shim that injects COOP/COEP headers on hosts that won't
+       set them server-side (ModelScope static spaces, GitHub Pages, etc.).
+       Must load BEFORE any WASM/pthreads code. First visit registers the SW
+       and self-reloads once; from then on the page is cross-origin-isolated. -->
+  <script src="coi-serviceworker.js"></script>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -12,6 +17,15 @@
     <div class="header">
       <h1>Rapid<span>Speech</span></h1>
       <p>ASR &amp; TTS in the Browser — WebAssembly + WebGPU</p>
+      <div class="webgpu-badge" id="webgpu-badge">Checking WebGPU support…</div>
+      <div class="gpu-pref-row">
+        <label for="gpu-pref">GPU preference</label>
+        <select id="gpu-pref">
+          <option value="">Auto</option>
+          <option value="high-performance">High-performance (discrete GPU)</option>
+          <option value="low-power">Low-power (integrated GPU)</option>
+        </select>
+      </div>
     </div>
 
     <nav class="tabs">
@@ -27,7 +41,9 @@
         <div class="form-row">
           <label>Model URL</label>
           <input type="text" data-id="model-url"
-                 placeholder="https://huggingface.co/.../funasr-nano-q4_k_m.gguf">
+                 placeholder="https://huggingface.co/RapidAI/RapidSpeech/resolve/main/ASR/FunasrNano/funasr-nano-q4_k_m.gguf"
+                 value="https://huggingface.co/RapidAI/RapidSpeech/resolve/main/ASR/FunasrNano/funasr-nano-q4_k_m.gguf"
+          >
         </div>
         <div class="form-row">
           <label>Threads</label>
@@ -37,6 +53,7 @@
         </div>
         <div class="progress-container" data-id="progress-container">
           <div class="progress-track"><div class="progress-fill" data-id="progress-bar"></div></div>
+          <div class="progress-info" data-id="progress-info"></div>
         </div>
         <div class="btn-row">
           <button class="btn btn-load" data-id="load-btn">Load Model</button>
@@ -49,7 +66,9 @@
         <div class="form-row">
           <label>VAD model URL</label>
           <input type="text" data-id="vad-url"
-                 placeholder="https://huggingface.co/.../silero-vad.gguf (leave empty to skip)">
+                 placeholder="https://huggingface.co/RapidAI/RapidSpeech/resolve/main/VAD/silero_vad_v6.gguf"
+                 value="https://huggingface.co/RapidAI/RapidSpeech/resolve/main/VAD/silero_vad_v6.gguf"
+          >
         </div>
         <div class="form-row">
           <label>Threshold</label>
@@ -60,6 +79,7 @@
         </div>
         <div class="progress-container" data-id="vad-progress-container">
           <div class="progress-track"><div class="progress-fill" data-id="vad-progress-bar"></div></div>
+          <div class="progress-info" data-id="vad-progress-info"></div>
         </div>
         <div class="btn-row">
           <button class="btn btn-load" data-id="vad-load-btn">Load VAD</button>
@@ -104,7 +124,9 @@
         <div class="form-row">
           <label>Model URL</label>
           <input type="text" data-id="model-url"
-                 placeholder="https://huggingface.co/.../funasr-nano-q4_k_m.gguf">
+                 placeholder="https://huggingface.co/RapidAI/RapidSpeech/resolve/main/ASR/FunasrNano/funasr-nano-q4_k_m.gguf"
+                 value="https://huggingface.co/RapidAI/RapidSpeech/resolve/main/ASR/FunasrNano/funasr-nano-q4_k_m.gguf"
+          >
         </div>
         <div class="form-row">
           <label>Threads</label>
@@ -116,6 +138,7 @@
         </div>
         <div class="progress-container" data-id="progress-container">
           <div class="progress-track"><div class="progress-fill" data-id="progress-bar"></div></div>
+          <div class="progress-info" data-id="progress-info"></div>
         </div>
         <div class="btn-row">
           <button class="btn btn-load" data-id="load-btn">Load Model</button>
@@ -128,10 +151,13 @@
         <div class="form-row">
           <label>VAD model URL</label>
           <input type="text" data-id="vad-url"
-                 placeholder="https://huggingface.co/.../silero-vad.gguf (leave empty for energy gate)">
+                 placeholder="https://huggingface.co/RapidAI/RapidSpeech/resolve/main/VAD/firered-stream-vad.gguf"
+                 value="https://huggingface.co/RapidAI/RapidSpeech/resolve/main/VAD/firered-stream-vad.gguf"
+          >
         </div>
         <div class="progress-container" data-id="vad-progress-container">
           <div class="progress-track"><div class="progress-fill" data-id="vad-progress-bar"></div></div>
+          <div class="progress-info" data-id="vad-progress-info"></div>
         </div>
         <div class="btn-row">
           <button class="btn btn-load" data-id="vad-load-btn">Load VAD</button>
@@ -181,7 +207,9 @@
         <div class="form-row">
           <label>Model URL</label>
           <input type="text" data-id="model-url"
-                 placeholder="https://huggingface.co/.../omnivoice-q4_k_m.gguf">
+                 placeholder="https://huggingface.co/RapidAI/RapidSpeech/resolve/main/TTS/omnivoice-q4_k_m.gguf"
+                 value="https://huggingface.co/RapidAI/RapidSpeech/resolve/main/TTS/omnivoice-q4_k_m.gguf"
+          >
         </div>
         <div class="form-row">
           <label>Threads</label>
@@ -189,6 +217,7 @@
         </div>
         <div class="progress-container" data-id="progress-container">
           <div class="progress-track"><div class="progress-fill" data-id="progress-bar"></div></div>
+          <div class="progress-info" data-id="progress-info"></div>
         </div>
         <div class="btn-row">
           <button class="btn btn-load" data-id="load-btn">Load Model</button>

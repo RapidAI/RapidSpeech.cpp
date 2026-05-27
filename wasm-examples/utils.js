@@ -98,6 +98,80 @@
     };
   }
 
+  // Human-readable byte count (KB / MB / GB, base-1024).
+  function formatBytes(n) {
+    if (!isFinite(n) || n <= 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let i = 0;
+    let v = n;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    const digits = v >= 100 ? 0 : v >= 10 ? 1 : 2;
+    return v.toFixed(digits) + ' ' + units[i];
+  }
+
+  // Human-readable duration "Ns" / "Mm Ss".
+  function formatDuration(seconds) {
+    if (!isFinite(seconds) || seconds < 0) return '--';
+    if (seconds < 60) return Math.ceil(seconds) + 's';
+    const m = Math.floor(seconds / 60);
+    const s = Math.ceil(seconds % 60);
+    return m + 'm ' + s + 's';
+  }
+
+  // Build a renderer that turns onProgress(frac, {loaded, total}) into
+  // a percentage bar + "45.2 / 120.8 MB · 8.3 MB/s · ETA 9s" caption.
+  // Uses a 2-second sliding window so the speed reading is responsive but
+  // not jittery.
+  function makeDownloadProgress(barEl, infoEl) {
+    const samples = [];                // [{t, loaded}]
+    const WINDOW_MS = 2000;
+    const startMs = performance.now();
+    let lastInfo = '';
+    return function onProgress(frac, meta) {
+      const loaded = meta && meta.loaded != null ? meta.loaded : 0;
+      const total  = meta && meta.total  != null ? meta.total  : 0;
+      const now = performance.now();
+
+      if (barEl) barEl.style.width = (frac * 100).toFixed(1) + '%';
+      if (!infoEl) return;
+
+      // Sample bookkeeping.
+      samples.push({ t: now, loaded });
+      while (samples.length > 1 && now - samples[0].t > WINDOW_MS) samples.shift();
+
+      let speed = 0;       // bytes / s
+      if (samples.length >= 2) {
+        const first = samples[0];
+        const dt = (now - first.t) / 1000;
+        if (dt > 0.05) speed = (loaded - first.loaded) / dt;
+      } else {
+        const dt = (now - startMs) / 1000;
+        if (dt > 0.05) speed = loaded / dt;
+      }
+
+      const parts = [];
+      if (total > 0) {
+        const pct = (frac * 100).toFixed(1);
+        parts.push(pct + '%');
+        parts.push(formatBytes(loaded) + ' / ' + formatBytes(total));
+      } else {
+        parts.push(formatBytes(loaded));
+      }
+      if (speed > 0) parts.push(formatBytes(speed) + '/s');
+      if (total > 0 && speed > 0 && loaded < total) {
+        const eta = (total - loaded) / speed;
+        parts.push('ETA ' + formatDuration(eta));
+      } else if (frac >= 1) {
+        parts.push('done');
+      }
+      const text = parts.join(' · ');
+      if (text !== lastInfo) {
+        infoEl.textContent = text;
+        lastInfo = text;
+      }
+    };
+  }
+
   window.RSUtils = {
     TARGET_SR,
     decodeFileToMono16k,
@@ -105,7 +179,10 @@
     resample,
     encodeWav,
     formatTime,
+    formatBytes,
+    formatDuration,
     escapeHtml,
     statusSetter,
+    makeDownloadProgress,
   };
 })();

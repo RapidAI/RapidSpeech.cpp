@@ -27,6 +27,54 @@ body {
 .header h1 span { color: var(--highlight); }
 .header p { color: var(--dim); font-size: 14px; margin-top: 4px; }
 
+/* WebGPU / runtime badge */
+.webgpu-badge {
+  display: inline-block;
+  margin-top: 10px;
+  max-width: 100%;
+  padding: 6px 14px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: monospace;
+  line-height: 1.6;
+  text-align: left;
+  background: rgba(136, 146, 176, 0.15);
+  color: var(--dim);
+  border: 1px solid transparent;
+  word-break: break-word;
+}
+.webgpu-badge code {
+  background: rgba(255,255,255,0.08);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+.webgpu-badge.ok    { color: var(--green);     border-color: rgba(78,204,163,0.4);  background: rgba(78,204,163,0.1); }
+.webgpu-badge.warn  { color: var(--yellow);    border-color: rgba(240,165,0,0.4);   background: rgba(240,165,0,0.1); }
+.webgpu-badge.error { color: var(--highlight); border-color: rgba(233,69,96,0.4);   background: rgba(233,69,96,0.1); }
+
+/* GPU preference row */
+.gpu-pref-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--dim);
+}
+.gpu-pref-row select {
+  padding: 3px 8px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+  cursor: pointer;
+}
+.gpu-pref-row select:focus { border-color: var(--highlight); }
+
 /* Tabs */
 .tabs {
   display: flex;
@@ -117,6 +165,13 @@ body {
 .progress-fill {
   height: 100%; width: 0%; background: var(--green);
   transition: width 0.2s;
+}
+.progress-info {
+  font-size: 12px;
+  color: var(--dim);
+  font-family: monospace;
+  margin-top: 6px;
+  min-height: 16px;
 }
 
 /* Status */

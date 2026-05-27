@@ -1373,5 +1373,5 @@ struct FunASRNanoRegistrar {
     rs_register_model_arch(
         "FunASRNano", []() { return std::make_shared<FunASRNanoModel>(); });
   }
-} global_FunASRNano_reg;
+} __attribute__((used)) global_FunASRNano_reg;
 } // namespace

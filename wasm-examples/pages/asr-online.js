@@ -9,7 +9,7 @@
  * Exposes window.RSPageAsrOnline.init({root, createInstance}).
  */
 (function () {
-  const { formatTime, escapeHtml, statusSetter } = window.RSUtils;
+  const { formatTime, escapeHtml, statusSetter, makeDownloadProgress } = window.RSUtils;
   const SAMPLE_RATE = 16000;
 
   function $(root, id) { return root.querySelector(`[data-id="${id}"]`); }
@@ -24,12 +24,14 @@
       status:   $(root, 'status'),
       progress: $(root, 'progress-container'),
       progressBar: $(root, 'progress-bar'),
+      progressInfo: $(root, 'progress-info'),
 
       vadUrl:        $(root, 'vad-url'),
       vadLoadBtn:    $(root, 'vad-load-btn'),
       vadStatus:     $(root, 'vad-status'),
       vadProgress:   $(root, 'vad-progress-container'),
       vadProgressBar:$(root, 'vad-progress-bar'),
+      vadProgressInfo:$(root, 'vad-progress-info'),
 
       threshold:    $(root, 'vad-threshold'),
       thresholdVal: $(root, 'vad-threshold-val'),
@@ -109,9 +111,8 @@
       try {
         rs = await createInstance();
         const nThreads = parseInt(els.nThreads.value, 10) || 4;
-        await rs.initAsr(url, nThreads, (p) => {
-          els.progressBar.style.width = (p * 100).toFixed(1) + '%';
-        });
+        const onProg = makeDownloadProgress(els.progressBar, els.progressInfo);
+        await rs.initAsr(url, nThreads, onProg);
         rs.setUseLlm(els.useLlm.checked);
         els.useLlm.addEventListener('change', () => rs.setUseLlm(els.useLlm.checked));
 
@@ -136,9 +137,8 @@
       try {
         if (!rs) { rs = await createInstance(); }
         vad = new window.RapidSpeechVAD(rs._mod);
-        await vad.load(url, 2, (p) => {
-          els.vadProgressBar.style.width = (p * 100).toFixed(1) + '%';
-        });
+        const onProg = makeDownloadProgress(els.vadProgressBar, els.vadProgressInfo);
+        await vad.load(url, 2, onProg);
         vad.setThreshold(parseFloat(els.threshold.value));
         els.vadProgress.style.display = 'none';
         setVadStatus(`Neural VAD — ${vad.arch}`, 'ready');

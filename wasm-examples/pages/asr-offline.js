@@ -6,7 +6,7 @@
  * Exposes window.RSPageAsrOffline.init({root, createInstance}).
  */
 (function () {
-  const { decodeFileToMono16k, escapeHtml, statusSetter, TARGET_SR } = window.RSUtils;
+  const { decodeFileToMono16k, escapeHtml, statusSetter, makeDownloadProgress, TARGET_SR } = window.RSUtils;
 
   function $(root, id) { return root.querySelector(`[data-id="${id}"]`); }
 
@@ -19,6 +19,7 @@
       status:   $(root, 'status'),
       progress: $(root, 'progress-container'),
       progressBar: $(root, 'progress-bar'),
+      progressInfo: $(root, 'progress-info'),
 
       vadUrl:        $(root, 'vad-url'),
       vadThreshold:  $(root, 'vad-threshold'),
@@ -28,6 +29,7 @@
       vadStatus:     $(root, 'vad-status'),
       vadProgress:   $(root, 'vad-progress-container'),
       vadProgressBar:$(root, 'vad-progress-bar'),
+      vadProgressInfo:$(root, 'vad-progress-info'),
 
       sourceMode: $(root, 'source-mode'),
       uploadRow:  $(root, 'upload-row'),
@@ -85,9 +87,8 @@
       try {
         rs = await createInstance();
         const nThreads = parseInt(els.nThreads.value, 10) || 4;
-        await rs.initAsr(url, nThreads, (p) => {
-          els.progressBar.style.width = (p * 100).toFixed(1) + '%';
-        });
+        const onProg = makeDownloadProgress(els.progressBar, els.progressInfo);
+        await rs.initAsr(url, nThreads, onProg);
         rs.setUseLlm(els.useLlm.checked);
         els.useLlm.addEventListener('change', () => rs.setUseLlm(els.useLlm.checked));
         els.progress.style.display = 'none';
@@ -118,9 +119,8 @@
           rs = await createInstance();
         }
         vad = new window.RapidSpeechVAD(rs._mod);
-        await vad.load(url, 2, (p) => {
-          els.vadProgressBar.style.width = (p * 100).toFixed(1) + '%';
-        });
+        const onProg = makeDownloadProgress(els.vadProgressBar, els.vadProgressInfo);
+        await vad.load(url, 2, onProg);
         vad.setThreshold(parseFloat(els.vadThreshold.value));
         els.vadProgress.style.display = 'none';
         setVadStatus(`Ready — ${vad.arch}`, 'ready');
