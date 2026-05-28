@@ -5,7 +5,10 @@
 简体中文 | [English](./README.md)
 
 <a href="https://huggingface.co/RapidAI/RapidSpeech" target="_blank"><img src="https://img.shields.io/badge/🤗-Hugging Face-blue"></a>
-<a href="https://www.modelscope.cn/models/RapidAI/RapidSpeech" target="_blank"><img src="https://img.shields.io/badge/ModelScope-blue"></a>
+<a href="https://www.modelscope.cn/models/RapidAI/RapidSpeech/files?version=main" target="_blank"><img src="https://img.shields.io/badge/ModelScope-blue"></a>
+<a href="https://colab.research.google.com/drive/16U6k9zhdtfrEwVLP9a6ks99J0bEHNQyS?usp=sharing" target="_blank"><img src="https://raw.githubusercontent.com/RapidAI/RapidOCR/main/assets/colab-badge.svg" alt="Open in Colab"></a>
+<a href="https://rapidai-rapidspeech-wasm.hf.space" target="_blank"><img src="https://img.shields.io/badge/%F0%9F%A4%97-Hugging Face wasm Demo-blue"></a>
+<a href="https://rapidai-rapidspeech-wasm.ms.show" target="_blank"><img src="https://img.shields.io/badge/魔搭-wasm Demo-blue"></a>
 <a href="https://github.com/RapidAI/RapidSpeech.cpp/stargazers"><img src="https://img.shields.io/github/stars/RapidAI/RapidSpeech.cpp?color=ccf"></a>
 
 # RapidSpeech.cpp 🎙️
@@ -308,22 +311,45 @@ OpenVoice2 把说话人音色和韵律解耦。通过 `--ref` 传入参考音频
 #### 安装
 
 ```bash
-# 从 PyPI 安装（CPU 版本）
+# CPU 版本（Linux / macOS / Windows）
 pip install rapidspeech
 
-# CUDA 版本
+# CUDA 版本（Linux + NVIDIA GPU）
 pip install rapidspeech-cuda
 
-# macOS Metal 版本
+# Metal 版本（macOS Apple Silicon）
 pip install rapidspeech-metal
 ```
+
+支持的后端：
+
+| 后端    | 发行包名             | 平台                          | 备注                                       |
+|---------|----------------------|-------------------------------|--------------------------------------------|
+| CPU     | `rapidspeech`        | Linux / macOS / Windows       | 默认后端，无 GPU 依赖                      |
+| CUDA    | `rapidspeech-cuda`   | Linux + NVIDIA GPU            | 基于 CUDA 11.8 构建（manylinux2014）       |
+| Metal   | `rapidspeech-metal`  | macOS（Apple Silicon）        | DAC 声码器使用 Metal 融合内核加速          |
+| Vulkan  | _仅源码构建_         | Linux / Windows + Vulkan SDK  | 跨厂商 GPU 加速                            |
+| CANN    | _仅源码构建_         | Linux + 华为昇腾 NPU          | 需安装 CANN 工具链                         |
+| OpenCL  | _仅源码构建_         | Linux / Android + OpenCL ICD  | 适用于移动端 / 嵌入式 GPU                  |
+| WebGPU  | _仅源码构建_         | 原生（Dawn）/ WASM            | 浏览器部署，WASM 下使用 emdawnwebgpu       |
+
+> 提示：不同后端的 pip 发行包名不同，但 Python 中的 import 名统一为 `rapidspeech`。标注为 _仅源码构建_ 的后端未发布到 PyPI，请按下方指引从源码编译。
 
 #### 从源码构建 Python 包
 
 ```bash
+# CPU 构建（默认）
 pip install .
-# 或指定后端
-RS_BACKEND=cuda pip install .
+
+# 内置识别的后端（setup.py 会自动设置 wheel 名）
+RS_BACKEND=cuda  pip install .              # 需 PATH 中可找到 nvcc
+RS_BACKEND=metal pip install .              # macOS，Apple Silicon 自动启用
+
+# 其他后端 —— 通过 RAPIDSPEECH_CMAKE_ARGS 直接传递 CMake 选项
+RAPIDSPEECH_CMAKE_ARGS="-DRS_VULKAN=ON" pip install .   # Vulkan
+RAPIDSPEECH_CMAKE_ARGS="-DRS_CANN=ON"   pip install .   # 华为昇腾
+RAPIDSPEECH_CMAKE_ARGS="-DRS_OPENCL=ON" pip install .   # OpenCL
+RAPIDSPEECH_CMAKE_ARGS="-DRS_WEBGPU=ON" pip install .   # WebGPU (Dawn)
 ```
 
 #### Python API

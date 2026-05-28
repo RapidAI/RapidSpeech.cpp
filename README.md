@@ -6,7 +6,11 @@ English | [简体中文](./README-CN.md)
 
 <a href="https://huggingface.co/RapidAI/RapidSpeech" target="_blank"><img src="https://img.shields.io/badge/🤗-Hugging Face-blue"></a>
 <a href="https://www.modelscope.cn/models/RapidAI/RapidSpeech/files?version=main" target="_blank"><img src="https://img.shields.io/badge/ModelScope-blue"></a>
+<a href="https://colab.research.google.com/drive/16U6k9zhdtfrEwVLP9a6ks99J0bEHNQyS?usp=sharing" target="_blank"><img src="https://raw.githubusercontent.com/RapidAI/RapidOCR/main/assets/colab-badge.svg" alt="Open in Colab"></a>
+<a href="https://rapidai-rapidspeech-wasm.hf.space" target="_blank"><img src="https://img.shields.io/badge/%F0%9F%A4%97-Hugging Face wasm Demo-blue"></a>
+<a href="https://rapidai-rapidspeech-wasm.ms.show" target="_blank"><img src="https://img.shields.io/badge/魔搭-wasm Demo-blue"></a>
 <a href="https://github.com/RapidAI/RapidSpeech.cpp/stargazers"><img src="https://img.shields.io/github/stars/RapidAI/RapidSpeech.cpp?color=ccf"></a>
+
 
 # RapidSpeech.cpp 🎙️
 
@@ -309,22 +313,45 @@ Supported quantization types: `q4_0`, `q4_k`, `q5_0`, `q5_k`, `q8_0`, `f16`, `f3
 #### Installation
 
 ```bash
-# Install from PyPI (CPU version)
+# CPU (Linux / macOS / Windows)
 pip install rapidspeech
 
-# CUDA version
+# CUDA (Linux, NVIDIA GPU)
 pip install rapidspeech-cuda
 
-# macOS Metal version
+# Metal (macOS, Apple Silicon)
 pip install rapidspeech-metal
 ```
+
+Supported backends:
+
+| Backend | Distribution        | Platform                   | Notes                                                |
+|---------|---------------------|----------------------------|------------------------------------------------------|
+| CPU     | `rapidspeech`       | Linux / macOS / Windows    | Default; no GPU dependency                           |
+| CUDA    | `rapidspeech-cuda`  | Linux + NVIDIA GPU         | Built against CUDA 11.8 (manylinux2014)              |
+| Metal   | `rapidspeech-metal` | macOS (Apple Silicon)      | Uses fused Metal kernels for DAC vocoder             |
+| Vulkan  | _source build only_ | Linux / Windows + Vulkan SDK | Cross-vendor GPU acceleration                      |
+| CANN    | _source build only_ | Linux + Huawei Ascend NPU  | Requires CANN toolkit                                |
+| OpenCL  | _source build only_ | Linux / Android + OpenCL ICD | Mobile / embedded GPUs                             |
+| WebGPU  | _source build only_ | Native (Dawn) / WASM       | Browser deployment via emdawnwebgpu                  |
+
+> Note: The pip distribution name varies by backend, but the Python import name is always `rapidspeech`. Backends marked _source build only_ are not published to PyPI — build them from source (see below).
 
 #### Build Python Package from Source
 
 ```bash
+# CPU build (default)
 pip install .
-# Or specify backend
-RS_BACKEND=cuda pip install .
+
+# Pre-wired backends (recognized by setup.py, sets the wheel name automatically)
+RS_BACKEND=cuda  pip install .              # requires nvcc in PATH
+RS_BACKEND=metal pip install .              # macOS, auto-enabled on Apple Silicon
+
+# Other backends — pass the CMake flag directly through RAPIDSPEECH_CMAKE_ARGS
+RAPIDSPEECH_CMAKE_ARGS="-DRS_VULKAN=ON" pip install .   # Vulkan
+RAPIDSPEECH_CMAKE_ARGS="-DRS_CANN=ON"   pip install .   # Huawei Ascend
+RAPIDSPEECH_CMAKE_ARGS="-DRS_OPENCL=ON" pip install .   # OpenCL
+RAPIDSPEECH_CMAKE_ARGS="-DRS_WEBGPU=ON" pip install .   # WebGPU (Dawn)
 ```
 
 #### Python API
