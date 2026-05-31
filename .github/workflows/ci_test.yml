@@ -17,10 +17,16 @@ jobs:
         include:
           - os: ubuntu-latest
             cmake_generator: "Unix Makefiles"
+            bin_dir: "build"
+            exe_suffix: ""
           - os: macos-latest
             cmake_generator: "Unix Makefiles"
+            bin_dir: "build"
+            exe_suffix: ""
           - os: windows-latest
             cmake_generator: "Visual Studio 17 2022"
+            bin_dir: "build/Release"
+            exe_suffix: ".exe"
 
     steps:
       - uses: actions/checkout@v4
@@ -38,27 +44,95 @@ jobs:
         run: |
           cmake -B build -G "${{ matrix.cmake_generator }}" -DRS_BUILD_TESTS=ON
 
-      - name: Build (Unix)
-        if: runner.os != 'Windows'
-        run: cmake --build build --config Release
-
-      - name: Build (Windows)
-        if: runner.os == 'Windows'
+      - name: Build
         run: cmake --build build --config Release
 
       - name: Run CTest
         working-directory: build
         run: ctest --output-on-failure -C Release
 
-      - name: Verify binary exists (Unix)
-        if: runner.os != 'Windows'
+      - name: Smoke-test example binaries
+        shell: bash
+        env:
+          BIN_DIR: ${{ matrix.bin_dir }}
+          EXE: ${{ matrix.exe_suffix }}
         run: |
-          ls -la build/rs-asr-offline || ls -la build/Release/rs-asr-offline
+          set -e
+          # Targets that accept --help and exit cleanly enough for a smoke test.
+          # We only check that the binary launches and exits with a non-signal
+          # status (< 128). Some examples return 1 from --help by design.
+          TARGETS=(
+            rs-asr-offline
+            rs-asr-online
+            rs-speaker-id
+            rs-tts-offline
+            rs-tts-split
+            rs-imatrix
+            rs-quantize
+          )
+          for t in "${TARGETS[@]}"; do
+            bin="${BIN_DIR}/${t}${EXE}"
+            if [ ! -x "$bin" ] && [ ! -f "$bin" ]; then
+              echo "MISSING: $bin"
+              exit 1
+            fi
+            echo "=== $t --help ==="
+            set +e
+            "$bin" --help
+            rc=$?
+            set -e
+            # rc >= 128 means killed by signal (segfault, abort, etc.)
+            if [ "$rc" -ge 128 ]; then
+              echo "FAIL: $t crashed with exit code $rc"
+              exit 1
+            fi
+            echo "ok ($t exit=$rc)"
+          done
 
-      - name: Verify binary exists (Windows)
-        if: runner.os == 'Windows'
+  configure-backends:
+    name: Configure ${{ matrix.backend }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            backend: vulkan
+            cmake_flags: "-DRS_VULKAN=ON"
+          - os: ubuntu-latest
+            backend: cuda
+            cmake_flags: "-DRS_CUDA=ON"
+          - os: macos-latest
+            backend: metal
+            cmake_flags: "-DRS_METAL=ON"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install Vulkan SDK (Linux)
+        if: matrix.backend == 'vulkan'
         run: |
-          dir build\Release\rs-asr-offline.exe
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev glslang-tools glslc \
+                                  vulkan-validationlayers-dev spirv-tools
+
+      - name: Install CUDA toolkit (Linux)
+        if: matrix.backend == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.20
+        with:
+          cuda: '12.4.0'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart-dev"]'
+
+      - name: Configure only (verify CMake options)
+        run: |
+          cmake -B build-${{ matrix.backend }} \
+                ${{ matrix.cmake_flags }} \
+                -DRS_BUILD_TESTS=OFF \
+                -DRS_BUILD_CLI=OFF
 
   python-bindings-test:
     name: Python Bindings (${{ matrix.os }}, Python ${{ matrix.python-version }})
@@ -90,5 +164,6 @@ jobs:
           pip install . -v
 
       - name: Verify Python import
+        working-directory: ${{ runner.temp }}
         run: |
           python -c "import rapidspeech; print('rapidspeech imported successfully')"
