@@ -228,7 +228,7 @@ def convert_from_safetensors(model_dir: Path, writer: GGUFWriter, dtype):
     main_state = safetensors.torch.load_file(str(main_path), device="cpu")
 
     for name, tensor in main_state.items():
-        t = tensor.cpu().numpy()
+        t = tensor.float().cpu().numpy()
         # Reorder weight matrices for ggml memory layout (ne0 varies fastest).
         # Numpy C-order has last dim fastest; ggml has first dim fastest.
         # The raw bytes of PT tensors are already correct for ggml:

@@ -121,6 +121,11 @@ struct llm_layer {
   ggml_tensor *wv = nullptr;
   ggml_tensor *wo = nullptr;
 
+  // Optional Q/K/V bias (Qwen2-style)
+  ggml_tensor *wq_b = nullptr;
+  ggml_tensor *wk_b = nullptr;
+  ggml_tensor *wv_b = nullptr;
+
   // QK normalization (optional, for Qwen)
   ggml_tensor *attn_q_norm = nullptr;
   ggml_tensor *attn_q_norm_b = nullptr;
@@ -204,7 +209,16 @@ public:
 
   // Architecture-specific tensor mapping (public for combined model loading)
   bool map_tensors_qwen3(std::map<std::string, ggml_tensor *> &tensors);
+  bool map_tensors_qwen2(std::map<std::string, ggml_tensor *> &tensors);
   bool map_tensors_llama(std::map<std::string, ggml_tensor *> &tensors);
+
+  // CosyVoice3-LLM speech-token heads (only set for arch="cosyvoice3-llm").
+  // speech_embd: [d_model, speech_vocab] — used to embed sampled speech tokens
+  //              for the next AR step.
+  // speech_lm_head: [speech_vocab, d_model] — projects hidden state to
+  //                 speech-token logits.
+  ggml_tensor *speech_embd() const { return speech_embd_; }
+  ggml_tensor *speech_lm_head() const { return speech_lm_head_; }
 
 private:
   std::string name_;
@@ -216,6 +230,10 @@ private:
   ggml_tensor *output_norm_ = nullptr;
   ggml_tensor *output_norm_b_ = nullptr;
   ggml_tensor *output_ = nullptr;
+
+  // CosyVoice3-LLM extras (nullptr for non-cosyvoice3 archs).
+  ggml_tensor *speech_embd_ = nullptr;
+  ggml_tensor *speech_lm_head_ = nullptr;
 
   std::vector<llm_layer> layers_;
 

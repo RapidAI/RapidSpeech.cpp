@@ -211,10 +211,9 @@ int RSProcessor::ProcessTTS() {
   }
 
   ggml_backend_sched_reset(sched_);
-  if (!model_->Decode(*state_, sched_)) {
-    tts_decoded_ = true;  // No more chunks to decode
-    return 0;
-  }
+  bool ok = model_->Decode(*state_, sched_);
+  tts_decoded_ = true;
+  if (!ok) return -1;
 
   float *chunk_data = nullptr;
   int chunk_n = model_->GetAudioOutput(*state_, &chunk_data);
@@ -223,7 +222,7 @@ int RSProcessor::ProcessTTS() {
     tts_audio_read_pos_ = 0;
   }
 
-  return 1;  // More chunks available
+  return 0;  // offline: single call, done
 }
 
 int RSProcessor::GetAudioOutput(float **out_data) {

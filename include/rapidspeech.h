@@ -314,6 +314,40 @@ RS_API int32_t rs_vad_detect_full(rs_vad_t* vad,
                                   rs_vad_segment_t* out, int32_t capacity);
 
 // ============================================
+// Speaker Embedding (CAMPPlus 192-d)
+// Independent handle (separate from rs_context_t / rs_vad_t). The GGUF must
+// declare `general.architecture = "campplus"`.
+// ============================================
+
+typedef struct rs_speaker_t rs_speaker_t;
+
+// Open a CAMPPlus model from a GGUF file. `use_gpu` is honored when a GPU
+// backend is compiled in; CPU fallback is automatic. Returns nullptr on
+// failure (see rs_get_last_error()).
+RS_API rs_speaker_t* rs_speaker_init_from_file(const char* model_path,
+                                               int32_t n_threads, bool use_gpu);
+
+// Release a speaker model (state, weights, backend).
+RS_API void rs_speaker_free(rs_speaker_t* sp);
+
+// Embedding dimensionality (always 192 for CAMPPlus).
+RS_API int32_t rs_speaker_dim(const rs_speaker_t* sp);
+
+// Required PCM sample rate (always 16000 for CAMPPlus).
+RS_API int32_t rs_speaker_sample_rate(const rs_speaker_t* sp);
+
+// Compute a 192-d L2-normalised speaker embedding from 16 kHz mono float PCM.
+// `out_emb` must hold at least `rs_speaker_dim()` floats; on success exactly
+// that many are written.
+RS_API rs_error_t rs_speaker_embed(rs_speaker_t* sp,
+                                   const float* pcm, int32_t n_samples,
+                                   float* out_emb, int32_t out_capacity);
+
+// Cosine similarity between two embeddings (utility, no handle needed).
+// Returns 0.0f if either pointer is null or dim <= 0.
+RS_API float rs_speaker_cosine(const float* a, const float* b, int32_t dim);
+
+// ============================================
 // Utility Functions
 // ============================================
 

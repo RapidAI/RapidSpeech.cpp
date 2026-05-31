@@ -608,6 +608,13 @@ bool llm_model::load_hparams(struct gguf_context *ctx_gguf) {
   } else if (arch_str == "OmniVoice") {
     hparams_.arch = LLM_ARCH_QWEN3;
     arch_key = "omnivoice-lm";
+  } else if (arch_str == "cosyvoice3-llm") {
+    // CosyVoice3-0.5B-2512 LLM = Qwen2-0.5B body (Q/K/V bias, no Q/K-norm)
+    // + speech_embd / speech_lm_head heads. Hparams under "cosyvoice3.llm.*".
+    hparams_.arch = LLM_ARCH_QWEN2;
+    hparams_.use_qkv_bias = true;
+    hparams_.use_kq_norm = false;
+    arch_key = "cosyvoice3.llm";
   } else if (arch_str == "llama") {
     hparams_.arch = LLM_ARCH_LLAMA;
     arch_key = "llama";
@@ -669,6 +676,26 @@ bool llm_model::load_hparams(struct gguf_context *ctx_gguf) {
 
   hparams_.rope_freq_base = (int32_t)get_f32("%s.rope.freq_base", 10000.0f);
   hparams_.rope_freq_scale = get_f32("%s.rope.freq_scale", 1.0f);
+
+  // cosyvoice3-llm uses a flat "cosyvoice3.llm.*" namespace instead of the
+  // standard llama-template keys. Override the values we just read with
+  // the explicit ones from the converter script.
+  if (arch_str == "cosyvoice3-llm") {
+    hparams_.n_vocab = get_i32("cosyvoice3.llm.vocab_size", 0);
+    hparams_.n_embd  = get_i32("cosyvoice3.llm.d_model", 0);
+    hparams_.n_layer = get_i32("cosyvoice3.llm.n_layers", 0);
+    hparams_.n_head  = get_i32("cosyvoice3.llm.n_heads", 0);
+    hparams_.n_head_kv = get_i32("cosyvoice3.llm.n_kv_heads", hparams_.n_head);
+    hparams_.head_dim  = get_i32("cosyvoice3.llm.head_dim",
+                                  (int32_t)(hparams_.n_embd /
+                                            (hparams_.n_head ? hparams_.n_head : 1)));
+    hparams_.n_rot     = hparams_.head_dim;
+    hparams_.n_ff      = get_i32("cosyvoice3.llm.ff_dim", 0);
+    hparams_.n_ctx_train = get_i32("cosyvoice3.llm.max_pos", 32768);
+    hparams_.f_norm_rms_eps = get_f32("cosyvoice3.llm.rms_norm_eps", 1e-6f);
+    hparams_.rope_freq_base = (uint32_t)get_f32("cosyvoice3.llm.rope_theta",
+                                                1000000.0f);
+  }
 
   LLM_LOG_INFO("DEBUG: n_vocab=%d n_embd=%d n_layer=%d arch=%s arch_key=%s",
                hparams_.n_vocab, hparams_.n_embd, hparams_.n_layer,
@@ -888,6 +915,58 @@ bool llm_model::map_tensors_qwen3(
   }
 
   LLM_LOG_INFO("Mapped %zu Qwen3 layers", layers_.size());
+  return true;
+}
+
+bool llm_model::map_tensors_qwen2(
+    std::map<std::string, ggml_tensor *> &tensors) {
+  // CosyVoice3-LLM converter writes llama-style names: blk.K.attn_*.{weight,bias}
+  // plus token_embd / output_norm / output, and adds two cosyvoice3.* heads.
+  auto find_tensor = [&](const std::string &name) -> ggml_tensor * {
+    auto it = tensors.find(name);
+    return (it != tensors.end()) ? it->second : nullptr;
+  };
+
+  tok_embd_ = find_tensor("token_embd.weight");
+  output_norm_ = find_tensor("output_norm.weight");
+  output_norm_b_ = find_tensor("output_norm.bias");
+  output_ = find_tensor("output.weight");
+
+  speech_embd_ = find_tensor("cosyvoice3.speech_embd.weight");
+  speech_lm_head_ = find_tensor("cosyvoice3.speech_lm_head.weight");
+
+  layers_.resize(hparams_.n_layer);
+  for (uint32_t il = 0; il < hparams_.n_layer; ++il) {
+    llm_layer &layer = layers_[il];
+    std::string p = "blk." + std::to_string(il) + ".";
+
+    layer.attn_norm = find_tensor(p + "attn_norm.weight");
+    layer.wq        = find_tensor(p + "attn_q.weight");
+    layer.wk        = find_tensor(p + "attn_k.weight");
+    layer.wv        = find_tensor(p + "attn_v.weight");
+    layer.wo        = find_tensor(p + "attn_output.weight");
+    layer.wq_b      = find_tensor(p + "attn_q.bias");
+    layer.wk_b      = find_tensor(p + "attn_k.bias");
+    layer.wv_b      = find_tensor(p + "attn_v.bias");
+    layer.ffn_norm  = find_tensor(p + "ffn_norm.weight");
+    layer.ffn_gate  = find_tensor(p + "ffn_gate.weight");
+    layer.ffn_up    = find_tensor(p + "ffn_up.weight");
+    layer.ffn_down  = find_tensor(p + "ffn_down.weight");
+  }
+
+  if (!tok_embd_) {
+    LLM_LOG_ERROR("map_tensors_qwen2: missing token_embd.weight");
+    return false;
+  }
+  if (!speech_embd_ || !speech_lm_head_) {
+    LLM_LOG_ERROR("map_tensors_qwen2: missing cosyvoice3 speech heads "
+                  "(speech_embd=%p speech_lm_head=%p)",
+                  (void *)speech_embd_, (void *)speech_lm_head_);
+    return false;
+  }
+
+  LLM_LOG_INFO("Mapped %zu Qwen2 layers (with Q/K/V bias) + speech heads",
+               layers_.size());
   return true;
 }
 

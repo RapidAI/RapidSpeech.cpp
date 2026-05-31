@@ -156,8 +156,16 @@ set(RS_SOURCES
         rapidspeech/src/arch/llm_kv_cache.cpp
         rapidspeech/src/arch/qwen3.h
         rapidspeech/src/arch/qwen3.cpp
+        rapidspeech/src/arch/qwen2.h
+        rapidspeech/src/arch/qwen2.cpp
+        rapidspeech/src/arch/cosyvoice3.h
+        rapidspeech/src/arch/cosyvoice3.cpp
+        rapidspeech/src/arch/cosyvoice3_decode.cpp
+        rapidspeech/src/arch/cosyvoice3_ras.h
+        rapidspeech/src/arch/cosyvoice3_ras.cpp
 	    rapidspeech/src/arch/openvoice2.cpp
         rapidspeech/src/arch/omnivoice.cpp
+        rapidspeech/src/arch/campplus.cpp
         rapidspeech/src/arch/bert.cpp
         rapidspeech/src/arch/bert.h
         rapidspeech/src/frontend/text_frontend.cpp
@@ -178,6 +186,7 @@ add_library(rapidspeech-core SHARED
         ${RS_SOURCES}
         rapidspeech/src/c_api/rapidspeech_c.cpp
         rapidspeech/src/c_api/rs_vad.cpp
+        rapidspeech/src/c_api/rs_speaker.cpp
 )
 
 target_include_directories(rapidspeech-core PUBLIC
@@ -391,12 +400,16 @@ if (RS_BUILD_CLI)
     add_executable(rs-tts-split
             examples/tts/rs-tts-split.cpp
     )
+    add_executable(rs-speaker-id
+            examples/asr/rs-speaker-id.cpp
+    )
     target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-asr-online  PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-tts-offline PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-tts-split   PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-quantize PRIVATE ggml)
     target_link_libraries(rs-imatrix PRIVATE rapidspeech-core ggml)
+    target_link_libraries(rs-speaker-id  PRIVATE rapidspeech-core ggml)
 
 
     if (NOT MSVC)
@@ -447,6 +460,13 @@ if (RS_BUILD_CLI)
         ${GGML_PATH}/include
         ${GGML_PATH}/src
     )
+    target_include_directories(rs-speaker-id PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
+        ${GGML_PATH}/include
+        ${GGML_PATH}/src
+    )
 
     # miniaudio uses dlopen on Linux for ALSA/PulseAudio/JACK backend discovery
     if(UNIX AND NOT APPLE)
@@ -460,6 +480,9 @@ if (RS_BUILD_CLI)
             RUNTIME DESTINATION bin
     )
     install(TARGETS rs-tts-offline
+            RUNTIME DESTINATION bin
+    )
+    install(TARGETS rs-speaker-id
             RUNTIME DESTINATION bin
     )
 endif()

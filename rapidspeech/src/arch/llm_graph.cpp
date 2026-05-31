@@ -850,10 +850,20 @@ llm_create_graph_builder(const llm_model &model, const llm_cparams &cparams,
                          ggml_backend_sched_t sched) {
   llm_arch arch = model.arch();
 
+  // Qwen2 vs Qwen3 share the LLM_ARCH_QWEN* enums but differ in attention:
+  // Qwen2 has Q/K/V bias and no Q/K-norm; Qwen3 is the opposite. Route by
+  // hparams flag rather than relying on registration order, so OmniVoice
+  // (Qwen3 weights tagged "qwen2"/"omnivoice-lm") and CosyVoice3-LLM (true
+  // Qwen2) end up on the right builder.
+  if (arch == LLM_ARCH_QWEN2 || arch == LLM_ARCH_QWEN3) {
+    llm_arch desired = model.hparams().use_qkv_bias ? LLM_ARCH_QWEN2
+                                                    : LLM_ARCH_QWEN3;
+    auto *factory = get_registry().get_builder(desired);
+    if (factory) return (*factory)(model, cparams, sched);
+  }
+
   auto *factory = get_registry().get_builder(arch);
   if (!factory) {
-    // Fallback: try to create a generic builder
-    // This should rarely happen if architectures are properly registered
     return nullptr;
   }
 

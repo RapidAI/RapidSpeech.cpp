@@ -1,5 +1,6 @@
 /**
- * rs-tts-offline.cpp — Offline Text-to-Speech (OmniVoice / OpenVoice2)
+ * rs-tts-offline.cpp — Offline Text-to-Speech (OmniVoice / OpenVoice2 /
+ *                       CosyVoice3-LLM Phase 2)
  *
  * Usage:
  *   rs-tts-offline -m <tts.gguf> -t "text" [options]
@@ -7,13 +8,19 @@
  * Options:
  *   -m, --model <path>       TTS model path (required)
  *   -t, --text <text>        Text to synthesize (required)
- *   -o, --output <path>      Output WAV file path (default: output.wav)
+ *   -o, --output <path>      Output WAV file path (default: output.wav). For
+ *                            models that emit speech tokens instead of audio
+ *                            (e.g. cosyvoice3-llm Phase 2), the int32 LE token
+ *                            sequence is written here.
  *       --instruct <text>    Voice description (default: male)
  *       --lang <lang>        Target language (default: English)
  *       --seed <n>           Random seed (default: 42)
  *       --n-steps <n>        Diffusion steps (1-128, default: 32)
  *       --threads <n>        CPU threads (default: 4)
  *       --gpu <true|false>   Enable GPU acceleration (default: true)
+ *       --dump-step0-logits <path>
+ *                            Debug: write the first speech-token logits
+ *                            (float32) to this path. CosyVoice3-LLM only.
  *   -h, --help               Show help
  */
 
@@ -45,6 +52,7 @@ struct TtsArgs {
   const char *ref_text = nullptr;       // transcript of reference audio
   const char *bert_path = nullptr;      // ZH BERT (1024-dim) GGUF, OpenVoice2 ZH
   const char *mbert_path = nullptr;     // multilingual BERT (768-dim) GGUF
+  const char *dump_step0 = nullptr;     // CosyVoice3-LLM step-0 logits dump
   int seed = 42;
   int n_steps = 32;
   int n_threads = 4;
@@ -73,6 +81,9 @@ static void print_usage(const char *prog) {
       << "      --n-steps <n>        Diffusion steps 1-128 (default: 32)\n"
       << "      --threads <n>        CPU threads (default: 4)\n"
       << "      --gpu <true|false>   Enable GPU acceleration (default: true)\n"
+      << "      --dump-step0-logits <path>\n"
+      << "                          Debug: dump first speech-token logits "
+         "(CosyVoice3-LLM only)\n"
       << "  -h, --help               Show this help\n"
       << std::endl;
 }
@@ -106,6 +117,8 @@ static bool parse_args(int argc, char **argv, TtsArgs &args) {
       args.n_threads = std::stoi(argv[++i]);
     } else if (a == "--gpu" && i + 1 < argc) {
       args.use_gpu = parse_bool(argv[++i]);
+    } else if (a == "--dump-step0-logits" && i + 1 < argc) {
+      args.dump_step0 = argv[++i];
     } else if (a == "-h" || a == "--help") {
       print_usage(argv[0]);
       return false;
@@ -194,6 +207,11 @@ int main(int argc, char **argv) {
   if (args.mbert_path && args.mbert_path[0]) {
     set_env_var("RS_MBERT_PATH", args.mbert_path);
     LOG_INFO("mBERT:   %s", args.mbert_path);
+  }
+  if (args.dump_step0 && args.dump_step0[0]) {
+    // CosyVoice3-LLM reads this env var inside Decode (Phase-2 debug hook).
+    set_env_var("RS_CV3_DUMP_STEP0_LOGITS", args.dump_step0);
+    LOG_INFO("Step-0 logits dump: %s", args.dump_step0);
   }
 
   rs_init_params_t tts_params = rs_default_params();
@@ -285,7 +303,44 @@ int main(int argc, char **argv) {
       std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() /
       1e3f;
 
+  // ----- Token-emitting models (e.g. CosyVoice3-LLM Phase 2) ----------------
+  // These don't return PCM; they expose a CSV of int32 speech-token ids via
+  // rs_get_text_output. Persist them as a packed little-endian int32 blob so
+  // downstream tooling (flow + HiFT integration, validation harnesses) can
+  // consume them.
   if (all_pcm.empty()) {
+    const std::string arch = meta.arch_name;
+    if (arch == "cosyvoice3-llm") {
+      const char *csv = rs_get_text_output(tts_ctx);
+      std::vector<int32_t> ids;
+      if (csv && *csv) {
+        std::string buf;
+        for (const char *p = csv; ; ++p) {
+          if (*p == ',' || *p == '\0') {
+            if (!buf.empty()) ids.push_back((int32_t)std::atoi(buf.c_str()));
+            buf.clear();
+            if (*p == '\0') break;
+          } else {
+            buf.push_back(*p);
+          }
+        }
+      }
+      std::ofstream out(args.output_path, std::ios::binary);
+      if (!out) {
+        LOG_ERROR("Cannot write tokens to %s", args.output_path);
+        rs_free(tts_ctx);
+        return 1;
+      }
+      if (!ids.empty()) {
+        out.write(reinterpret_cast<const char *>(ids.data()),
+                  (std::streamsize)(ids.size() * sizeof(int32_t)));
+      }
+      LOG_INFO("Generated %zu speech tokens in %.0f ms → %s", ids.size(),
+               elapsed_ms, args.output_path);
+      rs_free(tts_ctx);
+      rs_clear_error();
+      return 0;
+    }
     LOG_ERROR("No audio generated");
     rs_free(tts_ctx);
     return 1;

@@ -47,6 +47,7 @@ struct llm_hparams {
   float f_attn_logit_softcapping = 0.0f;
   bool causal_attn = true;
   bool use_kq_norm = true;
+  bool use_qkv_bias = false;  // Qwen2 / OPT-style: add bias on Q/K/V projections
 
   // Expert/MoE (optional)
   uint32_t n_expert = 0;
