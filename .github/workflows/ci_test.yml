@@ -63,7 +63,7 @@ jobs:
           # status (< 128). Some examples return 1 from --help by design.
           TARGETS=(
             rs-asr-offline
-            rs-asr-online
+            rs-asr-vad-online
             rs-speaker-id
             rs-tts-offline
             rs-tts-split
@@ -99,7 +99,7 @@ jobs:
           - os: ubuntu-latest
             backend: vulkan
             cmake_flags: "-DRS_VULKAN=ON"
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             backend: cuda
             cmake_flags: "-DRS_CUDA=ON"
           - os: macos-latest
@@ -117,7 +117,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libvulkan-dev glslang-tools glslc \
-                                  vulkan-validationlayers-dev spirv-tools
+                                  vulkan-utility-libraries-dev spirv-tools
 
       - name: Install CUDA toolkit (Linux)
         if: matrix.backend == 'cuda'
@@ -160,6 +160,13 @@ jobs:
           pip install pybind11 cmake setuptools setuptools_scm wheel numpy
 
       - name: Build and install Python package
+        env:
+          # setuptools_scm appends `.d<date>` to the version when the working
+          # tree is dirty. Building writes _version.py (a tracked file), which
+          # dirties the tree mid-build, so pip's recorded version diverges from
+          # the wheel filename and pip >=24 rejects the install. Pin a stable
+          # version to sidestep the whole interaction.
+          SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0.dev0"
         run: |
           pip install . -v
 
