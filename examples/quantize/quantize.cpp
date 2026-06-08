@@ -8,6 +8,11 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <string.h>
+#define strcasecmp _stricmp
+#endif
+
 #define RS_QUANTIZE_LOG_INFO(fmt, ...)                                         \
   std::printf("[RapidSpeech] " fmt "\n", ##__VA_ARGS__)
 #define RS_QUANTIZE_LOG_ERROR(fmt, ...)                                        \
