@@ -3,6 +3,7 @@
 #include "gguf.h"
 #include "utils/rs_log.h"
 #include <chrono>
+#include <climits>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -453,36 +454,101 @@ std::vector<int32_t> llm_vocab::tokenize(const std::string &text,
         tokens.push_back(token_unk_);
       }
     } else {
-      // Normal text - greedy longest-match tokenization on encoded text
-      // The text has already been converted to vocab format via encode_bytes()
+      // Normal text — proper GPT-2-style BPE.
+      //
+      // We pretok on the ORIGINAL (pre-byte-encoded) UTF-8 codepoints:
+      //  - contiguous ASCII letters → 1 pretok (with leading space if any)
+      //  - contiguous ASCII digits  → 1 pretok (with leading space if any)
+      //  - each non-ASCII codepoint (CJK, etc.) → own pretok (with leading
+      //    space if any)
+      //  - punct / control bytes   → own pretok (with leading space if any)
+      //  - whitespace-only runs    → own pretok
+      //
+      // For each pretok, byte-encode then split into per-codepoint pieces in
+      // the encoded space; apply BPE merges iteratively (lowest rank wins).
+      // `segment.first` was already byte-encoded by encode_bytes(), so we
+      // need to decode it back, pretok the original bytes, then re-encode
+      // each pretok individually.
+      const std::string orig = decode_bytes(segment.first);
+      auto utf8_len_at = [&](const std::string &s, size_t pos) -> size_t {
+        unsigned char c = (unsigned char)s[pos];
+        if ((c & 0x80) == 0)    return 1;
+        if ((c & 0xE0) == 0xC0) return 2;
+        if ((c & 0xF0) == 0xE0) return 3;
+        if ((c & 0xF8) == 0xF0) return 4;
+        return 1;
+      };
+      auto is_ascii_letter = [](unsigned char b) {
+        return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z');
+      };
+      auto is_ascii_digit = [](unsigned char b) {
+        return b >= '0' && b <= '9';
+      };
+      auto is_ascii_space = [](unsigned char b) {
+        return b == ' ' || b == '\t' || b == '\n' || b == '\r';
+      };
 
-      size_t seg_pos = 0;
-      while (seg_pos < segment.first.size()) {
-        int32_t best_id = -1;
-        size_t best_len = 0;
-
-        // Try to find the longest matching token (up to 12 bytes for
-        // efficiency)
-        size_t max_len = std::min(segment.first.size() - seg_pos, size_t(12));
-
-        for (size_t len = max_len; len > 0; --len) {
-          std::string candidate = segment.first.substr(seg_pos, len);
-          int32_t token_id = find_token_id(candidate);
-
-          if (token_id >= 0) {
-            best_id = token_id;
-            best_len = len;
-            break;
-          }
+      // Walk original codepoints, build pretoks (each pretok is a slice of
+      // orig, possibly with a leading space included).
+      std::vector<std::pair<size_t,size_t>> pretoks; // (begin, end) in orig
+      size_t pos = 0;
+      while (pos < orig.size()) {
+        size_t begin = pos;
+        // Optional single leading ASCII space (GPT-2 convention attaches a
+        // leading ' ' to the following letter / digit / punct run).
+        if (pos + 1 < orig.size() && (unsigned char)orig[pos] == ' ') {
+          ++pos;
         }
-
-        if (best_id >= 0) {
-          tokens.push_back(best_id);
-          seg_pos += best_len;
+        if (pos >= orig.size()) { pretoks.push_back({begin, pos}); break; }
+        const unsigned char b = (unsigned char)orig[pos];
+        const size_t cp_len = utf8_len_at(orig, pos);
+        if (cp_len == 1 && is_ascii_letter(b)) {
+          // Extend over contiguous letters.
+          ++pos;
+          while (pos < orig.size() && is_ascii_letter((unsigned char)orig[pos])) ++pos;
+        } else if (cp_len == 1 && is_ascii_digit(b)) {
+          ++pos;
+          while (pos < orig.size() && is_ascii_digit((unsigned char)orig[pos])) ++pos;
+        } else if (cp_len == 1 && is_ascii_space(b)) {
+          // Whitespace run that wasn't already swallowed as a leading space.
+          while (pos < orig.size() && is_ascii_space((unsigned char)orig[pos])) ++pos;
         } else {
-          // Unknown token - skip one character and continue
-          tokens.push_back(token_unk_);
-          seg_pos += 1;
+          // Single codepoint (CJK, punct, byte ≥ 0x80, etc.).
+          pos += cp_len;
+        }
+        pretoks.push_back({begin, pos});
+      }
+
+      // For each pretok: byte-encode → split into encoded codepoints → BPE.
+      for (const auto &pt : pretoks) {
+        const std::string sub = orig.substr(pt.first, pt.second - pt.first);
+        const std::string enc = encode_bytes(sub);
+        std::vector<std::string> pieces;
+        for (size_t j = 0; j < enc.size(); ) {
+          size_t n = utf8_len_at(enc, j);
+          pieces.emplace_back(enc.substr(j, n));
+          j += n;
+        }
+        // Apply BPE: repeatedly merge the adjacent pair with the lowest
+        // rank in bpe_ranks_.
+        while (pieces.size() > 1) {
+          int best_rank = INT_MAX;
+          int best_i = -1;
+          for (int k = 0; k + 1 < (int)pieces.size(); ++k) {
+            auto it = bpe_ranks_.find({pieces[k], pieces[k + 1]});
+            if (it != bpe_ranks_.end() && it->second < best_rank) {
+              best_rank = it->second;
+              best_i = k;
+            }
+          }
+          if (best_i < 0) break;
+          pieces[best_i] = pieces[best_i] + pieces[best_i + 1];
+          pieces.erase(pieces.begin() + best_i + 1);
+        }
+        for (const auto &p : pieces) {
+          int32_t id = find_token_id(p);
+          if (id >= 0) tokens.push_back(id);
+          else tokens.push_back(token_unk_);
         }
       }
     }
@@ -608,9 +674,11 @@ bool llm_model::load_hparams(struct gguf_context *ctx_gguf) {
   } else if (arch_str == "OmniVoice") {
     hparams_.arch = LLM_ARCH_QWEN3;
     arch_key = "omnivoice-lm";
-  } else if (arch_str == "cosyvoice3-llm") {
+  } else if (arch_str == "cosyvoice3-llm" || arch_str == "cosyvoice3") {
     // CosyVoice3-0.5B-2512 LLM = Qwen2-0.5B body (Q/K/V bias, no Q/K-norm)
     // + speech_embd / speech_lm_head heads. Hparams under "cosyvoice3.llm.*".
+    // The unified "cosyvoice3" arch (LLM + Flow + HiFT) shares this LLM
+    // namespace; Flow/HiFT live under `cosyvoice3.{flow,hift}.*`.
     hparams_.arch = LLM_ARCH_QWEN2;
     hparams_.use_qkv_bias = true;
     hparams_.use_kq_norm = false;
@@ -680,7 +748,7 @@ bool llm_model::load_hparams(struct gguf_context *ctx_gguf) {
   // cosyvoice3-llm uses a flat "cosyvoice3.llm.*" namespace instead of the
   // standard llama-template keys. Override the values we just read with
   // the explicit ones from the converter script.
-  if (arch_str == "cosyvoice3-llm") {
+  if (arch_str == "cosyvoice3-llm" || arch_str == "cosyvoice3") {
     hparams_.n_vocab = get_i32("cosyvoice3.llm.vocab_size", 0);
     hparams_.n_embd  = get_i32("cosyvoice3.llm.d_model", 0);
     hparams_.n_layer = get_i32("cosyvoice3.llm.n_layers", 0);

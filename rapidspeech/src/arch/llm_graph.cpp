@@ -135,7 +135,11 @@ void llm_graph_result::set_causal_mask(ggml_tensor *mask, uint32_t n_tokens,
     const uint32_t cur_pos = n_kv_cache + i;
     for (uint32_t j = 0; j < n_kv; ++j) {
       const size_t index = (size_t)i * n_kv + j;
-      mask_data[index] = (j > cur_pos) ? -7.2f : 0.0f;
+      // -1e4: exp(-1e4) underflows to 0 in f32 (true zero leakage) and stays
+      // well above F16 saturation (-65504), so the flash-attn F16 cast at
+      // build_flash_attn() is also safe. Avoids the CPU-softmax NaN edge case
+      // that motivated commit 0908d89's earlier -7.2f workaround.
+      mask_data[index] = (j > cur_pos) ? -1e4f : 0.0f;
     }
   }
 
@@ -520,6 +524,11 @@ ggml_tensor *llm_graph_builder::build_multi_head_attn(
   // A: k_perm [d_k, n_tokens_kv, n_head], B: q_perm [d_k, n_tokens, n_head]
   // ggml_mul_mat: result is [n_tokens_kv, n_tokens, n_head]
   ggml_tensor *kq = ggml_mul_mat(ctx, k_perm, q_perm);
+  // Force F32 accumulator: long-context prefill (reduction over d_k=128) on
+  // CUDA Ampere/Turing/Ada uses F16 accumulators by default, which collapses
+  // attention scores and produces degenerate softmax. See FunASR Nano F16
+  // regression where lm_head logits saturate to token 0.
+  ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
 
   kq = ggml_scale(ctx, kq, scale);
 
@@ -682,7 +691,11 @@ ggml_tensor *llm_graph_builder::build_residual(ggml_context *ctx,
 ggml_tensor *llm_graph_builder::build_lm_head(ggml_context *ctx,
                                               ggml_tensor *cur,
                                               ggml_tensor *output) {
-  return ggml_mul_mat(ctx, output, cur);
+  ggml_tensor *logits = ggml_mul_mat(ctx, output, cur);
+  // Force F32 accumulator: large-vocab GEMM (e.g. Qwen3 151936) overflows
+  // F16 accumulators on CUDA Ampere/Turing/Ada, collapsing logits to token 0.
+  ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
+  return logits;
 }
 
 ggml_tensor *llm_graph_builder::build_output_norm(ggml_context *ctx,

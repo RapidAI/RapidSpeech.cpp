@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -97,8 +98,10 @@ std::vector<float> project_speech_logits(ggml_backend_sched_t sched,
 // Decode: prefill text → first speech token, then AR loop.
 // =====================================================================
 
-bool CosyVoice3LMModel::Decode(RSState &state, ggml_backend_sched_t sched) {
-  auto &s = static_cast<CosyVoice3State &>(state);
+// Originally `Decode` — the LLM AR loop that emits speech tokens. After the
+// Flow+HiFT wiring landed, the public Decode lives in cosyvoice3.cpp and
+// chains RunLM → Flow → HiFT. This function is now the LM-only stage.
+bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
   if (!llm_model_) return false;
   if (s.text_token_ids.empty()) {
     RS_LOG_ERR("CosyVoice3-LLM: empty text — call PushText first");
@@ -117,22 +120,84 @@ bool CosyVoice3LMModel::Decode(RSState &state, ggml_backend_sched_t sched) {
   s.host_kv_v.assign(n_layer, std::vector<float>());
   s.n_cached = 0;
 
-  // CosyVoice3 LLM input format (from upstream CosyVoice3LM.forward):
-  //   speech_embd[sos=codebook+0] | token_embd[text_ids] | speech_embd[task_id=codebook+2]
-  // Both sos and task_id live in the SPEECH embedding table, not the text table.
-  const int32_t sos_id    = speech_codebook_;      // 6561
-  const int32_t task_id   = speech_codebook_ + 2;  // 6563
-  const int n_text = (int)s.text_token_ids.size();
-  const int total_T = 1 + n_text + 1;  // sos + text + task_id
+  // CosyVoice3 LLM input format (matches upstream `CosyVoice3LM.inference`):
+  //   [sos] [prompt_text_ids + tts_text_ids] [task_id] [prompt_speech_token_embds]
+  //
+  // Both sos and task_id live in the SPEECH embedding table. prompt_text and
+  // prompt_speech_token are present only when --ref was provided. The AR loop
+  // continues from the end and emits the actual gen speech tokens.
+  //
+  // `<|endofprompt|>` (id 151646) is a hard requirement: upstream
+  // CosyVoice3LM.inference asserts `151646 in text`. From example.py the
+  // upstream caller-side convention for CosyVoice3 zero_shot is:
+  //   prompt_text = "You are a helpful assistant.<|endofprompt|>" + ref_text
+  // i.e. the system prefix and 151646 sit BEFORE the ref transcript, and the
+  // whole bundle is concatenated with tts_text before the LM forward.
+  const int32_t sos_id      = speech_codebook_;      // 6561
+  const int32_t task_id     = speech_codebook_ + 2;  // 6563
+  const int32_t eop_id      = 151646;                // <|endofprompt|>
+
+  std::vector<int32_t> sys_prefix_ids = llm_model_->vocab().tokenize(
+      std::string("You are a helpful assistant."), false);
+
+  std::vector<int32_t> prompt_text_with_eop;
+  prompt_text_with_eop.reserve(sys_prefix_ids.size() + 1 +
+                               s.prompt_text_token_ids.size());
+  prompt_text_with_eop.insert(prompt_text_with_eop.end(),
+                              sys_prefix_ids.begin(), sys_prefix_ids.end());
+  prompt_text_with_eop.push_back(eop_id);
+  prompt_text_with_eop.insert(prompt_text_with_eop.end(),
+                              s.prompt_text_token_ids.begin(),
+                              s.prompt_text_token_ids.end());
+
+  std::vector<int32_t> combined_text;
+  combined_text.reserve(prompt_text_with_eop.size() +
+                        s.text_token_ids.size());
+  combined_text.insert(combined_text.end(),
+                       prompt_text_with_eop.begin(),
+                       prompt_text_with_eop.end());
+  combined_text.insert(combined_text.end(),
+                       s.text_token_ids.begin(),
+                       s.text_token_ids.end());
+  const int n_text  = (int)combined_text.size();
+  const int n_pt    = (int)s.prompt_token.size();
+  const int total_T = 1 + n_text + 1 + n_pt;  // sos + text + task + prompt_speech
+
+  // RS_CV3_DUMP_PROMPT_IDS=/tmp/ids -> dump bpe text ids, prompt speech tokens
+  // and segment lengths so the python harness can verify input construction.
+  // Header layout: [n_prompt_text_eop, n_tts, n_prompt_speech,
+  //                 sos_id, task_id, speech_codebook]
+  // Body: prompt_text_with_eop_ids, tts_text_ids, prompt_speech_ids.
+  if (const char *p = std::getenv("RS_CV3_DUMP_PROMPT_IDS")) {
+    if (FILE *fp = std::fopen(p, "wb")) {
+      const int32_t header[6] = {
+          (int32_t)prompt_text_with_eop.size(),
+          (int32_t)s.text_token_ids.size(),
+          (int32_t)s.prompt_token.size(),
+          sos_id, task_id, speech_codebook_};
+      std::fwrite(header, sizeof(int32_t), 6, fp);
+      if (!prompt_text_with_eop.empty())
+        std::fwrite(prompt_text_with_eop.data(), sizeof(int32_t),
+                    prompt_text_with_eop.size(), fp);
+      if (!s.text_token_ids.empty())
+        std::fwrite(s.text_token_ids.data(), sizeof(int32_t),
+                    s.text_token_ids.size(), fp);
+      if (!s.prompt_token.empty())
+        std::fwrite(s.prompt_token.data(), sizeof(int32_t),
+                    s.prompt_token.size(), fp);
+      std::fclose(fp);
+      RS_LOG_INFO("CosyVoice3-LLM: dumped prompt ids "
+                  "(prompt_text_eop=%zu tts=%zu prompt_speech=%zu sos=%d task=%d) -> %s",
+                  prompt_text_with_eop.size(),
+                  s.text_token_ids.size(), s.prompt_token.size(), sos_id,
+                  task_id, p);
+    }
+  }
 
   // Build prefill embed buffer: [total_T, d_model] F32.
   // Use ggml_get_rows to dequantize (tensors may be Q8_0/Q4_K).
   std::vector<float> prefill_emb((size_t)total_T * d_model);
   {
-    // ids: [sos_id, text_ids..., task_id]
-    std::vector<int32_t> speech_ids = {sos_id, task_id};
-    std::vector<int32_t> text_ids_copy = s.text_token_ids;
-
     auto get_rows_f32 = [&](ggml_tensor *embd_w,
                             const std::vector<int32_t> &ids) -> std::vector<float> {
       ggml_init_params ip = {ggml_graph_overhead() + 4 * ggml_tensor_overhead(),
@@ -161,17 +226,41 @@ bool CosyVoice3LMModel::Decode(RSState &state, ggml_backend_sched_t sched) {
     if (sos_emb.empty()) { RS_LOG_ERR("CosyVoice3-LLM: sos embed failed"); return false; }
     std::copy(sos_emb.begin(), sos_emb.end(), prefill_emb.begin());
 
-    // text rows
-    auto text_emb = get_rows_f32(llm_model_->tok_embd(), text_ids_copy);
-    if (text_emb.empty()) { RS_LOG_ERR("CosyVoice3-LLM: text embed failed"); return false; }
-    std::copy(text_emb.begin(), text_emb.end(),
-              prefill_emb.begin() + d_model);
+    // text rows (prompt_text + tts_text)
+    if (!combined_text.empty()) {
+      auto text_emb = get_rows_f32(llm_model_->tok_embd(), combined_text);
+      if (text_emb.empty()) { RS_LOG_ERR("CosyVoice3-LLM: text embed failed"); return false; }
+      std::copy(text_emb.begin(), text_emb.end(),
+                prefill_emb.begin() + d_model);
+    }
 
     // task_id row
     auto task_emb = get_rows_f32(llm_model_->speech_embd(), {task_id});
     if (task_emb.empty()) { RS_LOG_ERR("CosyVoice3-LLM: task embed failed"); return false; }
     std::copy(task_emb.begin(), task_emb.end(),
               prefill_emb.begin() + (size_t)(1 + n_text) * d_model);
+
+    // prompt_speech_token rows — only when a reference voice was supplied.
+    if (n_pt > 0) {
+      auto pt_emb = get_rows_f32(llm_model_->speech_embd(), s.prompt_token);
+      if (pt_emb.empty()) { RS_LOG_ERR("CosyVoice3-LLM: prompt_token embed failed"); return false; }
+      std::copy(pt_emb.begin(), pt_emb.end(),
+                prefill_emb.begin() + (size_t)(1 + n_text + 1) * d_model);
+    }
+  }
+
+  // RS_CV3_DUMP_PREFILL_EMB=/tmp/prefill_emb.bin -> dump the [total_T, d_model]
+  // prefill embedding buffer so PyTorch can inject the same input and skip its
+  // own embedding-table lookups when verifying transformer numerics.
+  if (const char *p = std::getenv("RS_CV3_DUMP_PREFILL_EMB")) {
+    if (FILE *fp = std::fopen(p, "wb")) {
+      int32_t header[2] = {total_T, d_model};
+      std::fwrite(header, sizeof(int32_t), 2, fp);
+      std::fwrite(prefill_emb.data(), sizeof(float), prefill_emb.size(), fp);
+      std::fclose(fp);
+      RS_LOG_INFO("CosyVoice3-LLM: dumped prefill embeds [%d, %d] -> %s",
+                  total_T, d_model, p);
+    }
   }
 
   // ----- Build the LLM graph builder for this segment.
@@ -202,6 +291,15 @@ bool CosyVoice3LMModel::Decode(RSState &state, ggml_backend_sched_t sched) {
   pf_opts.use_kv_cache = true;
   pf_opts.update_kv_cache = true;
   pf_opts.causal_mask = true;
+
+  // RS_CV3_DUMP_LAYER_HIDDEN=/tmp/layer -> dump per-layer last-row hidden
+  const char *layer_dump_dir = std::getenv("RS_CV3_DUMP_LAYER_HIDDEN");
+  if (layer_dump_dir && *layer_dump_dir) {
+    pf_opts.extract_intermediate = true;
+    pf_opts.extract_layers.clear();
+    for (int il = 0; il < n_layer; ++il)
+      pf_opts.extract_layers.push_back(il);
+  }
 
   auto pf = builder->build_graph_from_embeds(emb_in, (uint32_t)total_T, nullptr,
                                               positions.data(), &pf_opts);
@@ -245,6 +343,34 @@ bool CosyVoice3LMModel::Decode(RSState &state, ggml_backend_sched_t sched) {
     const size_t row_bytes = (size_t)d_model * sizeof(float);
     const size_t off = (size_t)(total_T - 1) * row_bytes;
     ggml_backend_tensor_get(embd, last_hidden.data(), off, row_bytes);
+  }
+  if (const char *p = std::getenv("RS_CV3_DUMP_HIDDEN")) {
+    if (FILE *fp = std::fopen(p, "wb")) {
+      std::fwrite(last_hidden.data(), sizeof(float), last_hidden.size(), fp);
+      std::fclose(fp);
+    }
+  }
+
+  // Dump per-layer last-row hidden states for debugging
+  if (const char *layer_dir = std::getenv("RS_CV3_DUMP_LAYER_HIDDEN")) {
+    if (layer_dir && *layer_dir) {
+      for (int il = 0; il < n_layer; ++il) {
+        ggml_tensor *layer_out = pf->get_intermediate_output((size_t)il);
+        if (!layer_out) continue;
+        std::vector<float> row((size_t)d_model);
+        const size_t row_bytes = (size_t)d_model * sizeof(float);
+        const size_t off = (size_t)(total_T - 1) * row_bytes;
+        ggml_backend_tensor_get(layer_out, row.data(), off, row_bytes);
+        char path[512];
+        snprintf(path, sizeof(path), "%s/layer_%02d.bin", layer_dir, il);
+        if (FILE *fp = std::fopen(path, "wb")) {
+          std::fwrite(row.data(), sizeof(float), row.size(), fp);
+          std::fclose(fp);
+        }
+      }
+      RS_LOG_INFO("CosyVoice3-LLM: dumped %d layer hiddens → %s", n_layer,
+                  layer_dir);
+    }
   }
 
   // Extract per-layer KV for the prefill into host buffers.
@@ -293,6 +419,21 @@ bool CosyVoice3LMModel::Decode(RSState &state, ggml_backend_sched_t sched) {
       }
     }
   }
+
+  // Upstream defaults: min_token_text_ratio=2, max_token_text_ratio=20.
+  // While step < min_len, PyTorch passes ignore_eos=True to its sampler, which
+  // suppresses any token id >= speech_token_size (i.e. the 200 stop ids). We
+  // mirror that by masking those ids to -inf before sampling.
+  const int n_tts_text = (int)s.text_token_ids.size();
+  const int min_len    = n_tts_text * 2;
+  const int max_len    = std::min(s.max_speech_tokens, n_tts_text * 20);
+
+  auto mask_stop_ids = [&](std::vector<float> &lg) {
+    for (int i = speech_codebook_; i < (int)lg.size(); ++i) {
+      lg[i] = -std::numeric_limits<float>::infinity();
+    }
+  };
+  if (0 < min_len) mask_stop_ids(logits);
 
   // First speech token.
   int32_t tok = cosyvoice3_sample_ras(logits.data(), speech_vocab_,
@@ -371,8 +512,67 @@ bool CosyVoice3LMModel::Decode(RSState &state, ggml_backend_sched_t sched) {
   std::vector<float> kv_stage_v((size_t)kv_dim);
   std::vector<float> step_hidden((size_t)d_model);
 
-  for (int step = 0; step < s.max_speech_tokens && tok != stop_token_id_;
-       ++step) {
+  // RS_CV3_DUMP_AR_DIR=/tmp/ar -> dump per-step AR hidden, logits, token,
+  // and per-layer KV new column for the first RS_CV3_DUMP_AR_STEPS steps.
+  // Also writes prefill summary so the PyTorch reference can prime its
+  // past_key_values and replay AR from the same starting point.
+  const char *ar_dir = std::getenv("RS_CV3_DUMP_AR_DIR");
+  int ar_max_steps = 0;
+  if (ar_dir && *ar_dir) {
+    const char *n_env = std::getenv("RS_CV3_DUMP_AR_STEPS");
+    ar_max_steps = n_env ? std::atoi(n_env) : 8;
+    if (ar_max_steps <= 0) ar_max_steps = 8;
+    // Write prefill KV: one file per layer, [kv_dim, n_cached] F32.
+    for (int il = 0; il < n_layer; ++il) {
+      char path[512];
+      snprintf(path, sizeof(path), "%s/prefill_kv_k_%02d.bin", ar_dir, il);
+      if (FILE *fp = std::fopen(path, "wb")) {
+        std::fwrite(s.host_kv_k[il].data(), sizeof(float),
+                    s.host_kv_k[il].size(), fp);
+        std::fclose(fp);
+      }
+      snprintf(path, sizeof(path), "%s/prefill_kv_v_%02d.bin", ar_dir, il);
+      if (FILE *fp = std::fopen(path, "wb")) {
+        std::fwrite(s.host_kv_v[il].data(), sizeof(float),
+                    s.host_kv_v[il].size(), fp);
+        std::fclose(fp);
+      }
+    }
+    // Write the first sampled token (step -1 / prefill output).
+    {
+      char path[512];
+      snprintf(path, sizeof(path), "%s/step_-1_token.bin", ar_dir);
+      if (FILE *fp = std::fopen(path, "wb")) {
+        std::fwrite(&tok, sizeof(int32_t), 1, fp);
+        std::fclose(fp);
+      }
+      snprintf(path, sizeof(path), "%s/step_-1_hidden.bin", ar_dir);
+      if (FILE *fp = std::fopen(path, "wb")) {
+        std::fwrite(last_hidden.data(), sizeof(float), last_hidden.size(), fp);
+        std::fclose(fp);
+      }
+      snprintf(path, sizeof(path), "%s/step_-1_logits.bin", ar_dir);
+      if (FILE *fp = std::fopen(path, "wb")) {
+        std::fwrite(logits.data(), sizeof(float), logits.size(), fp);
+        std::fclose(fp);
+      }
+    }
+    // Meta: n_cached (prefill length), n_layer, kv_dim, d_model, speech_vocab.
+    {
+      char path[512];
+      snprintf(path, sizeof(path), "%s/meta.bin", ar_dir);
+      if (FILE *fp = std::fopen(path, "wb")) {
+        int32_t meta[5] = {(int32_t)s.n_cached, n_layer, kv_dim, d_model,
+                           speech_vocab_};
+        std::fwrite(meta, sizeof(int32_t), 5, fp);
+        std::fclose(fp);
+      }
+    }
+    RS_LOG_INFO("CosyVoice3-LLM: AR dump dir=%s max_steps=%d", ar_dir,
+                ar_max_steps);
+  }
+
+  for (int step = 0; step < max_len && tok < speech_codebook_; ++step) {
     // Build a fresh per-step graph that:
     //   1. loads speech_embd[tok] into a [d_model, 1] tensor
     //   2. runs Qwen2 from_embeds with is_decode_step=true
@@ -469,8 +669,65 @@ bool CosyVoice3LMModel::Decode(RSState &state, ggml_backend_sched_t sched) {
       break;
     }
 
+    // step+1 is the index of the NEXT token about to be sampled (step 0 of
+    // the AR loop produces speech_token #1 since the prefill emitted #0).
+    if (step + 1 < min_len) mask_stop_ids(step_logits);
+
     int32_t next = cosyvoice3_sample_ras(step_logits.data(), speech_vocab_,
                                          s.speech_token_ids, s.sampler, s.rng);
+
+    // RS_CV3_DUMP_AR_DIR: dump THIS step's hidden, logits, KV new column,
+    // input token (tok = current step's input), and sampled token.
+    if (ar_dir && step < ar_max_steps) {
+      char path[512];
+      snprintf(path, sizeof(path), "%s/step_%02d_input_token.bin", ar_dir,
+               step);
+      if (FILE *fp = std::fopen(path, "wb")) {
+        std::fwrite(&tok, sizeof(int32_t), 1, fp);
+        std::fclose(fp);
+      }
+      snprintf(path, sizeof(path), "%s/step_%02d_hidden.bin", ar_dir, step);
+      if (FILE *fp = std::fopen(path, "wb")) {
+        std::fwrite(step_hidden.data(), sizeof(float), step_hidden.size(), fp);
+        std::fclose(fp);
+      }
+      snprintf(path, sizeof(path), "%s/step_%02d_logits.bin", ar_dir, step);
+      if (FILE *fp = std::fopen(path, "wb")) {
+        std::fwrite(step_logits.data(), sizeof(float), step_logits.size(), fp);
+        std::fclose(fp);
+      }
+      snprintf(path, sizeof(path), "%s/step_%02d_sampled.bin", ar_dir, step);
+      if (FILE *fp = std::fopen(path, "wb")) {
+        std::fwrite(&next, sizeof(int32_t), 1, fp);
+        std::fclose(fp);
+      }
+      // Dump the NEW K/V column we just appended at position s.n_cached-1
+      // (n_cached was incremented above).
+      for (int il = 0; il < n_layer; ++il) {
+        const size_t off = (size_t)(s.n_cached - 1) * kv_dim;
+        std::vector<float> k_col((size_t)kv_dim);
+        std::vector<float> v_col((size_t)kv_dim);
+        ggml_backend_tensor_get(gpu_kv_k[il], k_col.data(),
+                                off * sizeof(float),
+                                (size_t)kv_dim * sizeof(float));
+        ggml_backend_tensor_get(gpu_kv_v[il], v_col.data(),
+                                off * sizeof(float),
+                                (size_t)kv_dim * sizeof(float));
+        snprintf(path, sizeof(path), "%s/step_%02d_kv_k_%02d.bin", ar_dir,
+                 step, il);
+        if (FILE *fp = std::fopen(path, "wb")) {
+          std::fwrite(k_col.data(), sizeof(float), k_col.size(), fp);
+          std::fclose(fp);
+        }
+        snprintf(path, sizeof(path), "%s/step_%02d_kv_v_%02d.bin", ar_dir,
+                 step, il);
+        if (FILE *fp = std::fopen(path, "wb")) {
+          std::fwrite(v_col.data(), sizeof(float), v_col.size(), fp);
+          std::fclose(fp);
+        }
+      }
+    }
+
     if (next >= speech_codebook_) {
       RS_LOG_INFO("CosyVoice3-LLM: stop at step %d (id=%d)", step + 1, next);
       tok = next;
@@ -485,5 +742,14 @@ bool CosyVoice3LMModel::Decode(RSState &state, ggml_backend_sched_t sched) {
 
   RS_LOG_INFO("CosyVoice3-LLM: generated %zu speech tokens",
               s.speech_token_ids.size());
+  if (const char *p = std::getenv("RS_CV3_DUMP_SPEECH_TOKENS")) {
+    if (FILE *fp = std::fopen(p, "wb")) {
+      std::fwrite(s.speech_token_ids.data(), sizeof(int32_t),
+                  s.speech_token_ids.size(), fp);
+      std::fclose(fp);
+      RS_LOG_INFO("CosyVoice3-LLM: dumped %zu speech tokens -> %s",
+                  s.speech_token_ids.size(), p);
+    }
+  }
   return true;
 }

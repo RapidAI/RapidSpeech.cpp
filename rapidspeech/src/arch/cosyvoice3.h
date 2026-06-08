@@ -11,6 +11,12 @@
 #include <string>
 #include <vector>
 
+// Forward declarations to avoid a header explosion.
+class CosyVoice3FlowModel;
+class CosyVoice3HiFTModel;
+class CosyVoice3SpeechTokenizer;
+class CAMPPlusModel;
+
 /**
  * CosyVoice3-LLM (text → speech tokens, autoregressive).
  *
@@ -45,12 +51,27 @@ struct CosyVoice3State : public RSState {
   // Optional debug dump of step-0 logits (full 6761) before sampling. When
   // set the model writes the raw float32 logits buffer here exactly once.
   std::vector<float> *dump_step0_logits = nullptr;
+
+  // ----- Flow + HiFT pipeline state ----------------------------------------
+  // Voice conditioning — populated by PushReferenceAudio (or from the baked
+  // default voice when no --ref is supplied). prompt_feat is row-major
+  // [T_pt_mel, mel_dim=80].
+  std::vector<int32_t> prompt_token;
+  std::vector<int32_t> prompt_text_token_ids;  // BPE ids of the ref transcript
+  std::vector<float>   prompt_feat;
+  std::vector<float>   embedding;          // [192] CAMPPlus output
+
+  // Outputs.
+  std::vector<float>   mel_output;         // [T_mel, 80]   from Flow
+  std::vector<float>   audio_output;       // 24 kHz f32    from HiFT
+  bool flow_done = false;
+  bool hift_done = false;
 };
 
 class CosyVoice3LMModel : public ISpeechModel {
 public:
   CosyVoice3LMModel();
-  ~CosyVoice3LMModel() override = default;
+  ~CosyVoice3LMModel() override;
 
   // ISpeechModel
   bool Load(const std::unique_ptr<rs_context_t> &ctx,
@@ -61,21 +82,40 @@ public:
               ggml_backend_sched_t sched) override {
     (void)input_frames; (void)state; (void)sched; return true;
   }
+  // Full pipeline: RunLM (text → speech tokens) → Flow (→ mel) → HiFT (→ wav).
   bool Decode(RSState &state, ggml_backend_sched_t sched) override;
   std::string GetTranscription(RSState &state) override;
 
   bool PushText(RSState &state, const char *text,
                 const char *language = nullptr,
                 const char *instruct = nullptr) override;
+  bool PushReferenceAudio(RSState &state, const float *samples, int n_samples,
+                          int sample_rate,
+                          ggml_backend_sched_t sched) override;
+  bool PushReferenceText(RSState &state, const char *ref_text) override;
+  int  GetAudioOutput(RSState &state, float **out_data) override;
 
   const RSModelMeta &GetMeta() const override { return meta_; }
 
   // Tunables for the CLI / tests.
   void SetSampler(const ras_params &p) { default_sampler_ = p; }
   void SetMaxSpeechTokens(int n) { max_tokens_ = n; }
-  void SetSeed(uint64_t seed) { seed_ = seed; }
+  void SetSeed(uint64_t seed) override { seed_ = seed; }
   int32_t StopTokenId() const { return stop_token_id_; }
   int32_t SpeechVocabSize() const { return speech_vocab_; }
+
+private:
+  // Original LLM AR loop — implemented in cosyvoice3_decode.cpp.
+  bool RunLM(CosyVoice3State &state, ggml_backend_sched_t sched);
+
+  // Voice extraction helpers — fill state.{prompt_token, prompt_feat,
+  // embedding} either from a runtime reference wav (when --ref is provided
+  // and the encoders are available) or from the GGUF-baked default voice.
+  bool PrepareVoice(CosyVoice3State &state, ggml_backend_sched_t sched);
+  bool TryLoadDefaultVoiceFromGGUF(gguf_context *ctx_gguf,
+                                   ggml_context *gguf_data);
+  bool TryLoadExternalCampplus(const char *path);
+  bool TryLoadExternalTokenizer(const char *path);
 
 private:
   RSModelMeta meta_;
@@ -91,4 +131,42 @@ private:
   int32_t max_tokens_ = 1500;
   uint64_t seed_ = 0xC05A3ULL;
 
+  // ----- Pipeline sub-models -----------------------------------------------
+  // Flow + HiFT live in the same GGUF as the LLM (loaded in Load).
+  std::unique_ptr<CosyVoice3FlowModel> flow_;
+  std::unique_ptr<CosyVoice3HiFTModel> hift_;
+  bool flow_ready_ = false;
+  bool hift_ready_ = false;
+
+  // Tokenizer + CAMPPlus live in separate GGUFs, loaded lazily via env vars
+  // RS_CV3_SPEECH_TOKENIZER_PATH / RS_CV3_CAMPPLUS_PATH.
+  std::shared_ptr<CosyVoice3SpeechTokenizer> speech_tokenizer_;
+  std::shared_ptr<CAMPPlusModel> campplus_model_;
+  bool speech_tokenizer_ready_ = false;
+  bool campplus_ready_ = false;
+
+public:
+  // Helper used by load_external_gguf() in cosyvoice3.cpp. Exposed because
+  // the file-local loader takes a pointer to one of these.
+  struct ExternalGguf {
+    gguf_context *ctx_gguf  = nullptr;
+    ggml_context *ctx_data  = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+  };
+
+private:
+  ExternalGguf tokenizer_gguf_;
+  ExternalGguf campplus_gguf_;
+
+  // ----- Default voice tuple (baked into the unified GGUF when present) ----
+  std::vector<int32_t> default_prompt_text_ids_;
+  std::vector<int32_t> default_prompt_token_;
+  std::vector<float>   default_prompt_feat_;
+  std::vector<float>   default_embedding_;
+
+  // Reference-wav text (set by PushReferenceText, consumed by RunLM via
+  // text_token_ids prepending in PushText).
+  std::string pending_ref_text_;
+
+  std::string ref_text_;
 };
