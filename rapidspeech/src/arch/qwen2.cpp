@@ -96,7 +96,11 @@ llm_graph_result_ptr llm_build_qwen2::build_graph(const int32_t *tokens,
   for (int32_t il = n_layers_start; il < n_layers_end; ++il) {
     cur = build_transformer_layer(ctx_, cur, il, kv_cache, positions,
                                   causal_mask, n_tokens);
-    if (should_extract_layer(il)) result->add_intermediate_output(cur);
+    if (should_extract_layer(il)) {
+      ggml_set_name(cur, ("layer_" + std::to_string(il) + "_hidden").c_str());
+      ggml_set_output(cur);
+      result->add_intermediate_output(cur);
+    }
   }
 
   switch (current_opts_.output_mode) {
@@ -172,7 +176,11 @@ llm_graph_result_ptr llm_build_qwen2::build_graph_from_embeds(
   for (int32_t il = n_layers_start; il < n_layers_end; ++il) {
     cur = build_transformer_layer(ctx_, cur, il, kv_cache, positions,
                                   causal_mask, n_tokens);
-    if (should_extract_layer(il)) result->add_intermediate_output(cur);
+    if (should_extract_layer(il)) {
+      ggml_set_name(cur, ("layer_" + std::to_string(il) + "_hidden").c_str());
+      ggml_set_output(cur);
+      result->add_intermediate_output(cur);
+    }
   }
 
   switch (current_opts_.output_mode) {

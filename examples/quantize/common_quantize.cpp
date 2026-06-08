@@ -14,28 +14,31 @@
 // ============================================
 
 static const std::map<std::string, enum ggml_ftype> GGML_FTYPE_MAP = {
-    {"q4_0",    GGML_FTYPE_MOSTLY_Q4_0},
-    {"q4_1",    GGML_FTYPE_MOSTLY_Q4_1},
-    {"q5_0",    GGML_FTYPE_MOSTLY_Q5_0},
-    {"q5_1",    GGML_FTYPE_MOSTLY_Q5_1},
-    {"q8_0",    GGML_FTYPE_MOSTLY_Q8_0},
-    {"q2_k",    GGML_FTYPE_MOSTLY_Q2_K},
-    {"q3_k",    GGML_FTYPE_MOSTLY_Q3_K},
-    {"q3_k_m",  GGML_FTYPE_MOSTLY_Q3_K_M},
-    {"q4_k",    GGML_FTYPE_MOSTLY_Q4_K},
-    {"q4_k_m",  GGML_FTYPE_MOSTLY_Q4_K_M},
-    {"q5_k",    GGML_FTYPE_MOSTLY_Q5_K},
-    {"q5_k_m",  GGML_FTYPE_MOSTLY_Q5_K_M},
-    {"q6_k",    GGML_FTYPE_MOSTLY_Q6_K},
-    {"iq1_m",   GGML_FTYPE_MOSTLY_IQ1_M},
-    {"iq1_s",   GGML_FTYPE_MOSTLY_IQ1_S},
-    {"iq2_s",   GGML_FTYPE_MOSTLY_IQ2_S},
-    {"iq2_xs",  GGML_FTYPE_MOSTLY_IQ2_XS},
-    {"iq2_xxs", GGML_FTYPE_MOSTLY_IQ2_XXS},
-    {"iq3_xxs", GGML_FTYPE_MOSTLY_IQ3_XXS},
-    {"iq3_s",   GGML_FTYPE_MOSTLY_IQ3_S},
-    {"iq4_nl",  GGML_FTYPE_MOSTLY_IQ4_NL},
-    {"iq4_xs",  GGML_FTYPE_MOSTLY_IQ4_XS},
+    {"q4_0",       GGML_FTYPE_MOSTLY_Q4_0},
+    {"q4_1",       GGML_FTYPE_MOSTLY_Q4_1},
+    {"q5_0",       GGML_FTYPE_MOSTLY_Q5_0},
+    {"q5_1",       GGML_FTYPE_MOSTLY_Q5_1},
+    {"q8_0",       GGML_FTYPE_MOSTLY_Q8_0},
+    {"q2_k",       GGML_FTYPE_MOSTLY_Q2_K},
+    {"q2_k_m",     GGML_FTYPE_MOSTLY_Q2_K_M},
+    {"q3_k",       GGML_FTYPE_MOSTLY_Q3_K},
+    {"q3_k_m",     GGML_FTYPE_MOSTLY_Q3_K_M},
+    {"q4_k",       GGML_FTYPE_MOSTLY_Q4_K},
+    {"q4_k_m",     GGML_FTYPE_MOSTLY_Q4_K_M},
+    {"q5_k",       GGML_FTYPE_MOSTLY_Q5_K},
+    {"q5_k_m",     GGML_FTYPE_MOSTLY_Q5_K_M},
+    {"q6_k",       GGML_FTYPE_MOSTLY_Q6_K},
+    {"iq1_m",      GGML_FTYPE_MOSTLY_IQ1_M},
+    {"iq1_s",      GGML_FTYPE_MOSTLY_IQ1_S},
+    {"iq1_s_m",    GGML_FTYPE_MOSTLY_IQ1_S_M},
+    {"iq2_s",      GGML_FTYPE_MOSTLY_IQ2_S},
+    {"iq2_xs",     GGML_FTYPE_MOSTLY_IQ2_XS},
+    {"iq2_xxs",    GGML_FTYPE_MOSTLY_IQ2_XXS},
+    {"iq2_xxs_m",  GGML_FTYPE_MOSTLY_IQ2_XXS_M},
+    {"iq3_xxs",    GGML_FTYPE_MOSTLY_IQ3_XXS},
+    {"iq3_s",      GGML_FTYPE_MOSTLY_IQ3_S},
+    {"iq4_nl",     GGML_FTYPE_MOSTLY_IQ4_NL},
+    {"iq4_xs",     GGML_FTYPE_MOSTLY_IQ4_XS},
 };
 
 void ggml_print_ftypes(FILE *fp) {
@@ -186,33 +189,52 @@ enum class tensor_category {
   OTHER,
 };
 
-// Extract layer index from tensor names like:
-//   model.layers.{N}.*
-//   encoder.encoders.{N}.*
-// Returns -1 if no layer index found.
-static int extract_layer_index(const std::string &name) {
-  // TTS LLM backbone variants + ASR encoder
-  const char *prefixes[] = {
-      "model.layers.",
-      "llm.layers.",
-      "encoder.encoders.",
-      "semantic_model.encoder.layers.",
+// Extract (layer_index, n_total_layers_estimate) from tensor names like:
+//   model.layers.{N}.*                     (Qwen3-style LLM, ~28 layers)
+//   encoder.encoders.{N}.*                 (SenseVoice/FunASR main encoder)
+//   encoder.tp_encoders.{N}.*              (SenseVoice/FunASR TP encoder)
+//   ctc_decoder.blocks.{N}.*               (FunASR CTC decoder)
+//   audio_adaptor.blocks.{N}.*             (FunASR audio adaptor)
+//   semantic_model.encoder.layers.{N}.*    (HuBERT semantic encoder)
+//   encoder.encoders0.*                    (single first block — layer 0)
+// Returns {-1, 0} if no layer index is recognised.
+// The n_total estimate is used by is_critical_layer / is_first_last_8th to
+// derive proportional first/last-1/8 bounds. Estimates do not need to be
+// exact — the heuristic is robust to small mismatches.
+static std::pair<int, int> extract_layer_info(const std::string &name) {
+  struct PrefixInfo {
+    const char *prefix;
+    int         n_total_hint;
   };
-  for (const auto &pfx : prefixes) {
-    size_t pos = name.find(pfx);
+  static const PrefixInfo prefixes[] = {
+      {"model.layers.",                  28},  // Qwen3-style LLM
+      {"llm.layers.",                    28},  // Qwen3 (alt name)
+      {"llm.model.layers.",              28},  // FunASR LLM
+      {"encoder.encoders.",              50},  // SenseVoice/FunASR main
+      {"encoder.tp_encoders.",           20},  // SenseVoice/FunASR TP
+      {"semantic_model.encoder.layers.", 12},  // HuBERT
+      {"ctc_decoder.blocks.",             5},  // FunASR CTC decoder
+      {"audio_adaptor.blocks.",           2},  // FunASR audio adaptor
+  };
+  for (const auto &pi : prefixes) {
+    size_t pos = name.find(pi.prefix);
     if (pos != std::string::npos) {
-      pos += strlen(pfx);
+      pos += strlen(pi.prefix);
       size_t end = name.find('.', pos);
       if (end != std::string::npos) {
         try {
-          return std::stoi(name.substr(pos, end - pos));
+          return {std::stoi(name.substr(pos, end - pos)), pi.n_total_hint};
         } catch (...) {
-          return -1;
+          return {-1, 0};
         }
       }
     }
   }
-  return -1;
+  // encoders0 is a single first block — always layer 0 of a 1-layer module
+  if (name.find("encoder.encoders0.") != std::string::npos) {
+    return {0, 1};
+  }
+  return {-1, 0};
 }
 
 static bool name_ends_with(const std::string &name, const char *suffix) {
@@ -229,7 +251,8 @@ static tensor_category categorize_tensor(const std::string &name) {
   }
   // Output projection
   if (name_ends_with(name, "lm_head.weight") ||
-      name_ends_with(name, "ctc.ctc_lo.weight")) {
+      name_ends_with(name, "ctc.ctc_lo.weight") ||
+      name_ends_with(name, "ctc_out_linear.weight")) {
     return tensor_category::OUTPUT;
   }
   // Attention V (most sensitive to quantization)
@@ -280,9 +303,41 @@ static tensor_category categorize_tensor(const std::string &name) {
 // ============================================
 
 static ggml_type
-rs_get_qtype_for_tensor(ggml_ftype ftype, const std::string &name,
-                        const struct ggml_tensor *tensor,
-                        const std::vector<std::string> &to_skip) {
+rs_get_qtype_for_tensor(const rs_quantize_options &opts, const std::string &name,
+                        const struct ggml_tensor *tensor) {
+  const ggml_ftype ftype = opts.ftype;
+  const std::vector<std::string> &to_skip = opts.to_skip;
+
+  auto cat = categorize_tensor(name);
+
+  auto align_check = [tensor](ggml_type qt) -> bool {
+    return tensor->ne[0] % ggml_blck_size(qt) == 0;
+  };
+
+  // Demote to an alignment-safe type when the preferred k-quant block (256)
+  // does not divide ne[0]. Small leading dims (e.g. ctc_decoder w_2 with
+  // ne[0]=128) cannot use Q4_K/Q5_K/Q6_K/IQ*; fall back to Q8_0 (block=32)
+  // when possible, otherwise keep the original dtype.
+  auto pick = [tensor, &align_check](ggml_type preferred) -> ggml_type {
+    if (align_check(preferred)) return preferred;
+    if (align_check(GGML_TYPE_Q8_0)) return GGML_TYPE_Q8_0;
+    return tensor->type;
+  };
+
+  // --- Per-tensor type overrides (highest priority).
+  // These win over the skip list, --pure, and K_M / IQ_M bumps so that the
+  // caller can force a specific qtype on embed_tokens / lm_head / ctc_lo
+  // regardless of the default policy.  Skip the dimensionality/weight check
+  // for these — categorize_tensor already constrains to known weight names.
+  if (cat == tensor_category::TOKEN_EMBD &&
+      opts.token_embedding_type != GGML_TYPE_COUNT) {
+    return pick(opts.token_embedding_type);
+  }
+  if (cat == tensor_category::OUTPUT &&
+      opts.output_tensor_type != GGML_TYPE_COUNT) {
+    return pick(opts.output_tensor_type);
+  }
+
   // Check if this tensor should be quantized at all
   bool quantize = name.rfind("weight") == name.size() - 6;
   for (const auto &s : to_skip) {
@@ -299,34 +354,68 @@ rs_get_qtype_for_tensor(ggml_ftype ftype, const std::string &name,
     return tensor->type;
   }
 
-  auto cat = categorize_tensor(name);
-  int layer = extract_layer_index(name);
+  auto [layer, n_total] = extract_layer_info(name);
 
-  // Heuristic: use more bits for early/late layers
-  auto is_critical_layer = [](int layer) -> bool {
-    return layer >= 0 && (layer < 3 || layer >= 25);  // first 3, last layers
+  // --- --pure: bypass all mixed-precision bumps; use the ftype's underlying
+  // qtype uniformly. Routes through the `default` branch below.
+  ggml_ftype eff_ftype = ftype;
+  if (opts.pure) {
+    eff_ftype = (ggml_ftype)-128;  // unreachable, forces default branch
+  }
+
+  // Proportional first/last heuristics: bump precision on roughly the first
+  // and last 1/8 of layers. Scales correctly across 5-layer CTC decoder,
+  // 20-layer TP encoder, 28-layer Qwen3 LLM, and 50-layer SenseVoice main
+  // encoder. For very small modules (<8 layers) we treat the first and last
+  // layer as critical.
+  auto is_critical_layer = [](int layer, int n_total) -> bool {
+    if (layer < 0 || n_total <= 0) return false;
+    if (n_total < 8) {
+      return layer == 0 || layer == n_total - 1;
+    }
+    int eighth = n_total / 8;
+    return layer < eighth || layer >= n_total - eighth;
   };
 
-  auto is_first_last_8th = [](int layer) -> bool {
-    return layer >= 0 && (layer < 4 || layer >= 28);  // ~1/8 of typical 32 layers
-  };
-
-  auto align_check = [tensor](ggml_type qt) -> bool {
-    return tensor->ne[0] % ggml_blck_size(qt) == 0;
-  };
-
-  // Demote to an alignment-safe type when the preferred k-quant block (256)
-  // does not divide ne[0]. Small leading dims (e.g. ctc_decoder w_2 with
-  // ne[0]=128) cannot use Q4_K/Q5_K/Q6_K/IQ*; fall back to Q8_0 (block=32)
-  // when possible, otherwise keep the original dtype.
-  auto pick = [tensor, &align_check](ggml_type preferred) -> ggml_type {
-    if (align_check(preferred)) return preferred;
-    if (align_check(GGML_TYPE_Q8_0)) return GGML_TYPE_Q8_0;
-    return tensor->type;
-  };
+  auto is_first_last_8th = is_critical_layer;
 
   // Select per-tensor type based on the overall strategy
-  switch (ftype) {
+  switch (eff_ftype) {
+  // ================================================================
+  // Q2_K_M: ~3.0 bpw mixed. Baseline = Q2_K with aggressive bumps for
+  // tensors that determine CTC peak sharpness (the failure mode of pure
+  // Q2_K on small encoders like SenseVoice for KWS).
+  //   embed       → Q4_K   (token table)
+  //   output / lm_head / ctc_lo → Q4_K   (CTC head is the KWS-killer)
+  //   attn_v      → Q4_K critical layers, Q3_K elsewhere
+  //   attn_k      → Q3_K   (less critical than V per llama.cpp lore)
+  //   attn_output → Q3_K critical, Q2_K elsewhere
+  //   ffn_down    → Q3_K first/last 1/8 layers, Q2_K elsewhere
+  //   default     → Q2_K
+  // Sits between pure Q2_K (which fails on KWS) and Q3_K (which works).
+  // ================================================================
+  case GGML_FTYPE_MOSTLY_Q2_K_M: {
+    if (cat == tensor_category::TOKEN_EMBD) {
+      return align_check(GGML_TYPE_Q4_K) ? GGML_TYPE_Q4_K : pick(GGML_TYPE_Q3_K);
+    }
+    if (cat == tensor_category::OUTPUT) {
+      return align_check(GGML_TYPE_Q4_K) ? GGML_TYPE_Q4_K : pick(GGML_TYPE_Q3_K);
+    }
+    if (cat == tensor_category::ATTENTION_V) {
+      return pick(is_critical_layer(layer, n_total) ? GGML_TYPE_Q4_K : GGML_TYPE_Q3_K);
+    }
+    if (cat == tensor_category::ATTENTION_K) {
+      return pick(GGML_TYPE_Q3_K);
+    }
+    if (cat == tensor_category::ATTENTION_OUTPUT) {
+      return pick(is_critical_layer(layer, n_total) ? GGML_TYPE_Q3_K : GGML_TYPE_Q2_K);
+    }
+    if (cat == tensor_category::FFN_DOWN) {
+      return pick(is_first_last_8th(layer, n_total) ? GGML_TYPE_Q3_K : GGML_TYPE_Q2_K);
+    }
+    return pick(GGML_TYPE_Q2_K);
+  }
+
   // ================================================================
   // Q3_K_M: ~3.9 bpw mixed. Baseline = Q3_K with critical-tensor bumps.
   // embed → Q4_K, lm_head/ctc → Q5_K, attn_v → Q4_K (Q5_K critical),
@@ -343,16 +432,16 @@ rs_get_qtype_for_tensor(ggml_ftype ftype, const std::string &name,
       return align_check(GGML_TYPE_Q5_K) ? GGML_TYPE_Q5_K : pick(GGML_TYPE_Q4_K);
     }
     if (cat == tensor_category::ATTENTION_V) {
-      return pick(is_critical_layer(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K);
+      return pick(is_critical_layer(layer, n_total) ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K);
     }
     if (cat == tensor_category::ATTENTION_K) {
       return pick(GGML_TYPE_Q4_K);
     }
     if (cat == tensor_category::ATTENTION_OUTPUT) {
-      return pick(is_critical_layer(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_Q3_K);
+      return pick(is_critical_layer(layer, n_total) ? GGML_TYPE_Q4_K : GGML_TYPE_Q3_K);
     }
     if (cat == tensor_category::FFN_DOWN) {
-      return pick(is_first_last_8th(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_Q3_K);
+      return pick(is_first_last_8th(layer, n_total) ? GGML_TYPE_Q4_K : GGML_TYPE_Q3_K);
     }
     return pick(GGML_TYPE_Q3_K);
   }
@@ -366,13 +455,13 @@ rs_get_qtype_for_tensor(ggml_ftype ftype, const std::string &name,
       return align_check(GGML_TYPE_Q6_K) ? GGML_TYPE_Q6_K : pick(GGML_TYPE_Q4_K);
     }
     if (cat == tensor_category::ATTENTION_V) {
-      return pick(is_critical_layer(layer) ? GGML_TYPE_Q6_K : GGML_TYPE_Q5_K);
+      return pick(is_critical_layer(layer, n_total) ? GGML_TYPE_Q6_K : GGML_TYPE_Q5_K);
     }
     if (cat == tensor_category::ATTENTION_OUTPUT) {
-      return pick(is_critical_layer(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K);
+      return pick(is_critical_layer(layer, n_total) ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K);
     }
     if (cat == tensor_category::FFN_DOWN) {
-      return pick(is_first_last_8th(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K);
+      return pick(is_first_last_8th(layer, n_total) ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K);
     }
     return pick(GGML_TYPE_Q4_K);
   }
@@ -386,15 +475,15 @@ rs_get_qtype_for_tensor(ggml_ftype ftype, const std::string &name,
       return align_check(GGML_TYPE_Q6_K) ? GGML_TYPE_Q6_K : pick(GGML_TYPE_Q5_K);
     }
     if (cat == tensor_category::ATTENTION_V) {
-      return pick(is_critical_layer(layer) ? GGML_TYPE_Q6_K : GGML_TYPE_Q6_K);
+      return pick(is_critical_layer(layer, n_total) ? GGML_TYPE_Q6_K : GGML_TYPE_Q6_K);
     }
     if (cat == tensor_category::ATTENTION_OUTPUT ||
         cat == tensor_category::ATTENTION_Q ||
         cat == tensor_category::ATTENTION_K) {
-      return pick(is_critical_layer(layer) ? GGML_TYPE_Q6_K : GGML_TYPE_Q5_K);
+      return pick(is_critical_layer(layer, n_total) ? GGML_TYPE_Q6_K : GGML_TYPE_Q5_K);
     }
     if (cat == tensor_category::FFN_DOWN) {
-      return pick(is_first_last_8th(layer) ? GGML_TYPE_Q6_K : GGML_TYPE_Q5_K);
+      return pick(is_first_last_8th(layer, n_total) ? GGML_TYPE_Q6_K : GGML_TYPE_Q5_K);
     }
     return pick(GGML_TYPE_Q5_K);
   }
@@ -411,10 +500,10 @@ rs_get_qtype_for_tensor(ggml_ftype ftype, const std::string &name,
       return pick(GGML_TYPE_Q4_K);
     }
     if (cat == tensor_category::ATTENTION_OUTPUT) {
-      return pick(is_critical_layer(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ3_S);
+      return pick(is_critical_layer(layer, n_total) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ3_S);
     }
     if (cat == tensor_category::FFN_DOWN) {
-      return pick(is_first_last_8th(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ3_XXS);
+      return pick(is_first_last_8th(layer, n_total) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ3_XXS);
     }
     return pick(GGML_TYPE_IQ3_XXS);
   }
@@ -431,10 +520,10 @@ rs_get_qtype_for_tensor(ggml_ftype ftype, const std::string &name,
       return pick(GGML_TYPE_Q5_K);
     }
     if (cat == tensor_category::ATTENTION_OUTPUT) {
-      return pick(is_critical_layer(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K);
+      return pick(is_critical_layer(layer, n_total) ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K);
     }
     if (cat == tensor_category::FFN_DOWN) {
-      return pick(is_first_last_8th(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ3_S);
+      return pick(is_first_last_8th(layer, n_total) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ3_S);
     }
     return pick(GGML_TYPE_IQ3_S);
   }
@@ -451,10 +540,10 @@ rs_get_qtype_for_tensor(ggml_ftype ftype, const std::string &name,
       return pick(GGML_TYPE_Q5_K);
     }
     if (cat == tensor_category::FFN_DOWN) {
-      return pick(is_first_last_8th(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_IQ4_NL);
+      return pick(is_first_last_8th(layer, n_total) ? GGML_TYPE_Q5_K : GGML_TYPE_IQ4_NL);
     }
     if (cat == tensor_category::ATTENTION_OUTPUT) {
-      return pick(is_critical_layer(layer) ? GGML_TYPE_Q5_K : GGML_TYPE_IQ4_NL);
+      return pick(is_critical_layer(layer, n_total) ? GGML_TYPE_Q5_K : GGML_TYPE_IQ4_NL);
     }
     return pick(GGML_TYPE_IQ4_NL);
   }
@@ -471,22 +560,98 @@ rs_get_qtype_for_tensor(ggml_ftype ftype, const std::string &name,
       return pick(GGML_TYPE_Q5_K);
     }
     if (cat == tensor_category::FFN_DOWN) {
-      return pick(is_first_last_8th(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ4_XS);
+      return pick(is_first_last_8th(layer, n_total) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ4_XS);
     }
     if (cat == tensor_category::ATTENTION_OUTPUT) {
-      return pick(is_critical_layer(layer) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ4_XS);
+      return pick(is_critical_layer(layer, n_total) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ4_XS);
     }
     return pick(GGML_TYPE_IQ4_XS);
   }
 
-  default: {
-    // Uniform quantization — resolve ftype → qtype
-    ggml_type qtype = ggml_ftype_to_ggml_type(ftype);
-    if (qtype == GGML_TYPE_COUNT) return tensor->type;
-    if (tensor->ne[0] % ggml_blck_size(qtype) != 0) {
-      return tensor->type;
+  // ================================================================
+  // IQ2_XXS_M: ~2.4 bpw mixed. Baseline = IQ2_XXS with critical bumps so
+  // embed/lm_head don't tank a sub-1B LLM. Needs imatrix; tensors without
+  // an imatrix entry fall back to Q4_K (see ggml_quantize_requires_imatrix
+  // handling in rapid_speech_ggml_quantize).
+  //   embed       → Q4_K
+  //   lm_head     → Q4_K
+  //   attn_v      → Q4_K critical, IQ3_XXS else
+  //   attn_k      → IQ3_XXS
+  //   attn_output → IQ3_XXS critical, IQ2_XXS else
+  //   ffn_down    → IQ3_XXS first/last 1/8, IQ2_XXS else
+  //   default     → IQ2_XXS
+  // ================================================================
+  case GGML_FTYPE_MOSTLY_IQ2_XXS_M: {
+    if (cat == tensor_category::TOKEN_EMBD ||
+        cat == tensor_category::OUTPUT) {
+      return align_check(GGML_TYPE_Q4_K) ? GGML_TYPE_Q4_K : pick(GGML_TYPE_Q5_K);
     }
-    return qtype;
+    if (cat == tensor_category::ATTENTION_V) {
+      return pick(is_critical_layer(layer, n_total) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ3_XXS);
+    }
+    if (cat == tensor_category::ATTENTION_K) {
+      return pick(GGML_TYPE_IQ3_XXS);
+    }
+    if (cat == tensor_category::ATTENTION_OUTPUT) {
+      return pick(is_critical_layer(layer, n_total) ? GGML_TYPE_IQ3_XXS : GGML_TYPE_IQ2_XXS);
+    }
+    if (cat == tensor_category::FFN_DOWN) {
+      return pick(is_first_last_8th(layer, n_total) ? GGML_TYPE_IQ3_XXS : GGML_TYPE_IQ2_XXS);
+    }
+    return pick(GGML_TYPE_IQ2_XXS);
+  }
+
+  // ================================================================
+  // IQ1_S_M: ~1.9 bpw mixed.  Extreme low bit; only useful with imatrix
+  // and an LLM tolerant of heavy degradation.  Bumps the same critical
+  // tensors as IQ2_XXS_M but with even smaller body fallback.
+  //   embed       → Q4_K
+  //   lm_head     → Q4_K
+  //   attn_v      → Q4_K critical, IQ2_XXS else
+  //   attn_k      → IQ2_XXS
+  //   attn_output → IQ2_XXS critical, IQ1_S else
+  //   ffn_down    → IQ2_XXS first/last 1/8, IQ1_S else
+  //   default     → IQ1_S
+  // ================================================================
+  case GGML_FTYPE_MOSTLY_IQ1_S_M: {
+    if (cat == tensor_category::TOKEN_EMBD ||
+        cat == tensor_category::OUTPUT) {
+      return align_check(GGML_TYPE_Q4_K) ? GGML_TYPE_Q4_K : pick(GGML_TYPE_Q5_K);
+    }
+    if (cat == tensor_category::ATTENTION_V) {
+      return pick(is_critical_layer(layer, n_total) ? GGML_TYPE_Q4_K : GGML_TYPE_IQ2_XXS);
+    }
+    if (cat == tensor_category::ATTENTION_K) {
+      return pick(GGML_TYPE_IQ2_XXS);
+    }
+    if (cat == tensor_category::ATTENTION_OUTPUT) {
+      return pick(is_critical_layer(layer, n_total) ? GGML_TYPE_IQ2_XXS : GGML_TYPE_IQ1_S);
+    }
+    if (cat == tensor_category::FFN_DOWN) {
+      return pick(is_first_last_8th(layer, n_total) ? GGML_TYPE_IQ2_XXS : GGML_TYPE_IQ1_S);
+    }
+    return pick(GGML_TYPE_IQ1_S);
+  }
+
+  default: {
+    // Uniform quantization — resolve ftype → qtype.  Handle RS-custom M
+    // variants here too: --pure routes through this branch with the user's
+    // chosen ftype intact, so we need a mapping that knows about Q*_K_M /
+    // IQ*_M (ggml_ftype_to_ggml_type does not).
+    auto resolve_base_qtype = [](ggml_ftype f) -> ggml_type {
+      switch (f) {
+      case GGML_FTYPE_MOSTLY_Q2_K_M:    return GGML_TYPE_Q2_K;
+      case GGML_FTYPE_MOSTLY_Q3_K_M:    return GGML_TYPE_Q3_K;
+      case GGML_FTYPE_MOSTLY_Q4_K_M:    return GGML_TYPE_Q4_K;
+      case GGML_FTYPE_MOSTLY_Q5_K_M:    return GGML_TYPE_Q5_K;
+      case GGML_FTYPE_MOSTLY_IQ1_S_M:   return GGML_TYPE_IQ1_S;
+      case GGML_FTYPE_MOSTLY_IQ2_XXS_M: return GGML_TYPE_IQ2_XXS;
+      default:                          return ggml_ftype_to_ggml_type(f);
+      }
+    };
+    ggml_type qtype = resolve_base_qtype(ftype);
+    if (qtype == GGML_TYPE_COUNT) return tensor->type;
+    return pick(qtype);
   }
   }
 }
@@ -498,10 +663,12 @@ rs_get_qtype_for_tensor(ggml_ftype ftype, const std::string &name,
 bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
                                 const std::string &fname_inp,
                                 const std::string &fname_out,
-                                const ggml_ftype ftype, const int nthread,
-                                const std::vector<std::string> &to_quant,
-                                const std::vector<std::string> &to_skip,
-                                const std::string &imatrix_file) {
+                                const rs_quantize_options &opts) {
+
+  const ggml_ftype ftype = opts.ftype;
+  const int nthread = opts.nthread;
+  const std::vector<std::string> &to_skip = opts.to_skip;
+  const std::string &imatrix_file = opts.imatrix_file;
 
   // Validate that the ftype is supported
   {
@@ -517,14 +684,17 @@ bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
     case GGML_FTYPE_MOSTLY_Q4_K:
     case GGML_FTYPE_MOSTLY_Q5_K:
     case GGML_FTYPE_MOSTLY_Q6_K:
+    case GGML_FTYPE_MOSTLY_Q2_K_M:
     case GGML_FTYPE_MOSTLY_Q3_K_M:
     case GGML_FTYPE_MOSTLY_Q4_K_M:
     case GGML_FTYPE_MOSTLY_Q5_K_M:
     case GGML_FTYPE_MOSTLY_IQ1_M:
     case GGML_FTYPE_MOSTLY_IQ1_S:
+    case GGML_FTYPE_MOSTLY_IQ1_S_M:
     case GGML_FTYPE_MOSTLY_IQ2_S:
     case GGML_FTYPE_MOSTLY_IQ2_XS:
     case GGML_FTYPE_MOSTLY_IQ2_XXS:
+    case GGML_FTYPE_MOSTLY_IQ2_XXS_M:
     case GGML_FTYPE_MOSTLY_IQ3_XXS:
     case GGML_FTYPE_MOSTLY_IQ3_S:
     case GGML_FTYPE_MOSTLY_IQ4_NL:
@@ -540,7 +710,16 @@ bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
     }
   }
 
-  printf("%s: quantizing with strategy ftype=%d ..\n", __func__, ftype);
+  printf("%s: quantizing with strategy ftype=%d%s ..\n", __func__, ftype,
+         opts.pure ? " (--pure)" : "");
+  if (opts.token_embedding_type != GGML_TYPE_COUNT) {
+    printf("%s: token-embedding-type override: %s\n", __func__,
+           ggml_type_name(opts.token_embedding_type));
+  }
+  if (opts.output_tensor_type != GGML_TYPE_COUNT) {
+    printf("%s: output-tensor-type override:   %s\n", __func__,
+           ggml_type_name(opts.output_tensor_type));
+  }
 
   // Load importance matrix (activation-aware quantization)
   IMatrixCollector imatrix_collector;
@@ -644,7 +823,7 @@ bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
 
     // Determine per-tensor target type (handles mixed-precision strategies)
     enum ggml_type new_type =
-        rs_get_qtype_for_tensor(ftype, name, tensor, to_skip);
+        rs_get_qtype_for_tensor(opts, name, tensor);
     bool quantize = (new_type != tensor->type) && ggml_is_quantized(new_type);
 
     if (!quantize && new_type == tensor->type) {
@@ -769,14 +948,38 @@ bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
   close_ofstream();
   gguf_free(ctx_out);
 
+  auto ftype_label = [](ggml_ftype f) -> const char * {
+    switch (f) {
+    case GGML_FTYPE_MOSTLY_Q2_K_M:    return "Q2_K_M";
+    case GGML_FTYPE_MOSTLY_Q3_K_M:    return "Q3_K_M";
+    case GGML_FTYPE_MOSTLY_Q4_K_M:    return "Q4_K_M";
+    case GGML_FTYPE_MOSTLY_Q5_K_M:    return "Q5_K_M";
+    case GGML_FTYPE_MOSTLY_IQ1_S_M:   return "IQ1_S_M";
+    case GGML_FTYPE_MOSTLY_IQ2_XXS_M: return "IQ2_XXS_M";
+    default:                          return ggml_type_name(ggml_ftype_to_ggml_type(f));
+    }
+  };
+
   printf("%s: model size  = %8.2f MB\n", __func__,
          total_size_org / 1024.0 / 1024.0);
   printf("%s: quant size  = %8.2f MB | ftype = %d (%s)\n", __func__,
-         total_size_new / 1024.0 / 1024.0, ftype,
-         ftype == GGML_FTYPE_MOSTLY_Q3_K_M   ? "Q3_K_M"
-         : ftype == GGML_FTYPE_MOSTLY_Q4_K_M ? "Q4_K_M"
-         : ftype == GGML_FTYPE_MOSTLY_Q5_K_M ? "Q5_K_M"
-         : ggml_type_name(ggml_ftype_to_ggml_type(ftype)));
+         total_size_new / 1024.0 / 1024.0, ftype, ftype_label(ftype));
 
   return true;
+}
+
+bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
+                                const std::string &fname_inp,
+                                const std::string &fname_out,
+                                const ggml_ftype ftype, const int nthread,
+                                const std::vector<std::string> &to_quant,
+                                const std::vector<std::string> &to_skip,
+                                const std::string &imatrix_file) {
+  rs_quantize_options opts;
+  opts.ftype = ftype;
+  opts.nthread = nthread;
+  opts.to_quant = to_quant;
+  opts.to_skip = to_skip;
+  opts.imatrix_file = imatrix_file;
+  return rapid_speech_ggml_quantize(ctx, gguf_input, fname_inp, fname_out, opts);
 }

@@ -3050,15 +3050,27 @@ std::vector<float> OmniVoiceModel::RunDiffusionGraph(DiffusionGraphState &gs,
     ggml_backend_tensor_set(gs.t_mask, mask_data.data(), 0, mask_data.size() * sizeof(float));
     ggml_backend_tensor_set(gs.t_inv_mask, inv_mask_data.data(), 0, inv_mask_data.size() * sizeof(float));
 
-    // Compute
-    if (ggml_backend_sched_graph_compute(sched, gs.cgraph) != GGML_STATUS_SUCCESS) {
+    // Compute (with per-node imatrix observer if attached, so each MUL_MAT's
+    // src1 is read while still live — post-compute reads are unsafe because
+    // sched buffer reuse may have overwritten src1 with a downstream output).
+    bool armed = (bool)imatrix_cb_;
+    if (armed) {
+        auto trampoline = [](struct ggml_tensor *t, bool ask, void *ud) -> bool {
+            if (ask) return true;
+            auto *cb = static_cast<std::function<void(struct ggml_tensor *)> *>(ud);
+            (*cb)(t);
+            return true;
+        };
+        ggml_backend_sched_set_eval_callback(sched, trampoline, &imatrix_cb_);
+    }
+    enum ggml_status compute_status =
+        ggml_backend_sched_graph_compute(sched, gs.cgraph);
+    if (armed) {
+        ggml_backend_sched_set_eval_callback(sched, nullptr, nullptr);
+    }
+    if (compute_status != GGML_STATUS_SUCCESS) {
         RS_LOG_ERR("OmniVoice: LLM forward compute failed");
         return {};
-    }
-
-    // Notify imatrix collector (if attached)
-    if (imatrix_cb_) {
-        imatrix_cb_(gs.cgraph);
     }
 
     // Read output

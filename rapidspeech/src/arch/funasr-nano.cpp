@@ -382,12 +382,47 @@ bool FunASRNanoModel::Encode(const std::vector<float> &input_frames,
 }
 
 void FunASRNanoModel::set_imatrix_callback(
-    std::function<void(struct ggml_cgraph *)> cb) {
+    std::function<void(struct ggml_tensor *)> cb) {
   imatrix_cb_ = cb;
   if (encoder_) {
     encoder_->set_imatrix_callback(cb);
   }
 }
+
+namespace {
+// Trampoline shared by every FunASR compute call: installed as the sched's
+// per-node eval callback so that the imatrix collector sees each MUL_MAT's
+// src1 while it is still live (before any downstream op that shares its
+// buffer slot has executed).
+bool imatrix_eval_trampoline(struct ggml_tensor *t, bool ask, void *ud) {
+  if (ask) return true;
+  auto *cb = static_cast<std::function<void(struct ggml_tensor *)> *>(ud);
+  (*cb)(t);
+  return true;
+}
+
+// RAII install/teardown for the per-node observer around a single compute
+// call.  Keeping the eval callback armed past compute would let it fire on
+// unrelated downstream graphs (e.g. LLM forward after CTC) and double-count
+// or even crash if those graphs use a different sched.
+struct ImatrixHookGuard {
+  ggml_backend_sched_t sched;
+  bool armed = false;
+  ImatrixHookGuard(ggml_backend_sched_t s,
+                   std::function<void(struct ggml_tensor *)> *cb)
+      : sched(s) {
+    if (cb && *cb) {
+      ggml_backend_sched_set_eval_callback(sched, imatrix_eval_trampoline, cb);
+      armed = true;
+    }
+  }
+  ~ImatrixHookGuard() {
+    if (armed) {
+      ggml_backend_sched_set_eval_callback(sched, nullptr, nullptr);
+    }
+  }
+};
+}  // namespace
 
 static struct ggml_tensor *
 decoder_forward(const FunASRNanoHParams &hparams, struct ggml_context *ctx,
@@ -453,6 +488,9 @@ decoder_forward(const FunASRNanoHParams &hparams, struct ggml_context *ctx,
     // Multi-head Attention Score: (Q * K^T) * scale
     // ggml_mul_mat(k, q) computes dot product over the first dimension (d_k)
     struct ggml_tensor *scores = ggml_mul_mat(ctx, k_vec, q);
+    // F32 accumulator on CUDA: F16 default overflows for reduction-heavy
+    // attention scores, collapsing softmax into degenerate output.
+    ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
     scores = ggml_scale_inplace(ctx, scores, scale);
 
     // Softmax
@@ -603,14 +641,13 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   ggml_backend_tensor_set(inp_suffix_tokens, suffix_tokens.data(), 0,
                           suffix_tokens.size() * sizeof(int32_t));
 
-  if (ggml_backend_sched_graph_compute(sched, gf_proj) != GGML_STATUS_SUCCESS) {
-    RS_LOG_ERR("DecodeWithLLM: projection graph compute failed");
-    ggml_free(ctx_proj);
-    return false;
-  }
-
-  if (imatrix_cb_) {
-    imatrix_cb_(gf_proj);
+  {
+    ImatrixHookGuard hook(sched, &imatrix_cb_);
+    if (ggml_backend_sched_graph_compute(sched, gf_proj) != GGML_STATUS_SUCCESS) {
+      RS_LOG_ERR("DecodeWithLLM: projection graph compute failed");
+      ggml_free(ctx_proj);
+      return false;
+    }
   }
 
   // Get combined embeddings
@@ -695,15 +732,14 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
     RS_LOG_ERR("Prefill: causal_mask tensor not found!");
   }
 
-  if (ggml_backend_sched_graph_compute(sched, result->get_graph()) !=
-      GGML_STATUS_SUCCESS) {
-    RS_LOG_ERR("DecodeWithLLM: LLM prefill compute failed");
-    ggml_free(ctx_llm);
-    return false;
-  }
-
-  if (imatrix_cb_) {
-    imatrix_cb_(result->get_graph());
+  {
+    ImatrixHookGuard hook(sched, &imatrix_cb_);
+    if (ggml_backend_sched_graph_compute(sched, result->get_graph()) !=
+        GGML_STATUS_SUCCESS) {
+      RS_LOG_ERR("DecodeWithLLM: LLM prefill compute failed");
+      ggml_free(ctx_llm);
+      return false;
+    }
   }
 
   // 10. Get logits - now only the LAST token position is output (optimised)
@@ -1020,14 +1056,13 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
     // cached portion — no need to upload full KV cache each step!
 
     // Execute decode step
-    if (ggml_backend_sched_graph_compute(sched, dec_result->get_graph()) !=
-        GGML_STATUS_SUCCESS) {
-      RS_LOG_ERR("Decode graph compute failed at step %d", step);
-      break;
-    }
-
-    if (imatrix_cb_) {
-      imatrix_cb_(dec_result->get_graph());
+    {
+      ImatrixHookGuard hook(sched, &imatrix_cb_);
+      if (ggml_backend_sched_graph_compute(sched, dec_result->get_graph()) !=
+          GGML_STATUS_SUCCESS) {
+        RS_LOG_ERR("Decode graph compute failed at step %d", step);
+        break;
+      }
     }
 
     // Extract logits and sample next token
@@ -1215,14 +1250,14 @@ bool FunASRNanoModel::DecodeWithoutLLM(RSState &state,
     return false;
   }
   ggml_backend_tensor_copy(sv_state.encoder_out, encoder_in);
-  if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
-    ggml_free(ctx0);
-    return false;
+  {
+    ImatrixHookGuard hook(sched, &imatrix_cb_);
+    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+      ggml_free(ctx0);
+      return false;
+    }
   }
 
-  if (imatrix_cb_) {
-    imatrix_cb_(gf);
-  }
   // print_tensor(output_node);
   if (beam_size <= 1) {
     raw_ids.resize(T);
@@ -1295,11 +1330,12 @@ bool FunASRNanoModel::Decode(RSState &state, ggml_backend_sched_t sched) {
 
     if (ggml_backend_sched_alloc_graph(sched, gf_ctc)) {
       ggml_backend_tensor_copy(sv_state.encoder_out, enc_in);
-      if (ggml_backend_sched_graph_compute(sched, gf_ctc) ==
-          GGML_STATUS_SUCCESS) {
-        if (imatrix_cb_) {
-          imatrix_cb_(gf_ctc);
-        }
+      ggml_status ctc_status;
+      {
+        ImatrixHookGuard hook(sched, &imatrix_cb_);
+        ctc_status = ggml_backend_sched_graph_compute(sched, gf_ctc);
+      }
+      if (ctc_status == GGML_STATUS_SUCCESS) {
         int T = sv_state.encoder_out->ne[1];
         raw_ids.resize(T);
         ggml_backend_tensor_get(cur, raw_ids.data(), 0,

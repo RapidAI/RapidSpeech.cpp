@@ -355,8 +355,9 @@ public:
     void SetDiffusionSteps(int n_steps) override { n_diff_steps_ = n_steps; }
 
     // Activation statistics callback for imatrix collection.
-    // Called after each ggml_backend_sched_graph_compute during diffusion.
-    void set_imatrix_callback(std::function<void(struct ggml_cgraph *)> cb) {
+    // Per-MUL_MAT node, installed as sched eval callback during diffusion
+    // graph compute so src1 is read while still live.
+    void set_imatrix_callback(std::function<void(struct ggml_tensor *)> cb) {
         imatrix_cb_ = std::move(cb);
     }
 
@@ -416,7 +417,7 @@ private:
     int audio_mask_id_ = 1024;
 
     // Imatrix collection callback (called after each graph compute during diffusion)
-    std::function<void(struct ggml_cgraph *)> imatrix_cb_;
+    std::function<void(struct ggml_tensor *)> imatrix_cb_;
 
     // Quantization level (detected from tensor types at load time)
     int quant_level_ = 0;  // 0=F16, 1=Q8_0/Q8_1, 2=Q4_0/Q4_1, 3=Q2_K/Q3_K/other

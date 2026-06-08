@@ -29,89 +29,101 @@ struct IMatrixCollector {
     };
     std::unordered_map<std::string, Entry> stats;
 
-    // Collect activation statistics from a computed ggml graph.
-    // Walk all GGML_OP_MUL_MAT nodes and accumulate src1² per column.
-    void collect_from_graph(struct ggml_cgraph *gf) {
-        int n_nodes = ggml_graph_n_nodes(gf);
-        for (int i = 0; i < n_nodes; i++) {
-            struct ggml_tensor *node = ggml_graph_node(gf, i);
-            if (node->op != GGML_OP_MUL_MAT) continue;
+    // Collect activation statistics for a single MUL_MAT node.
+    //
+    // MUST be called from a per-node sched eval callback (see
+    // ggml_backend_sched_set_eval_callback), not after the whole graph
+    // finishes computing.  After compute, ggml_backend_sched_alloc_graph's
+    // buffer reuse may have overwritten src1's data with the output of a
+    // later, lifetime-disjoint op — so a post-compute walk reads garbage
+    // (often NaN) and silently corrupts the imatrix.  Per-node firing
+    // happens right after the node's matmul, while src1 is still the data
+    // the matmul actually consumed.
+    void collect_node(struct ggml_tensor *node) {
+        if (!node || node->op != GGML_OP_MUL_MAT) return;
 
-            struct ggml_tensor *weight = node->src[0];
-            struct ggml_tensor *act = node->src[1];
+        struct ggml_tensor *weight = node->src[0];
+        struct ggml_tensor *act = node->src[1];
 
-            // Only collect for named weight tensors (loaded from GGUF)
-            if (!weight->name[0]) continue;
-            // Only F32 activations (full precision)
-            if (act->type != GGML_TYPE_F32) continue;
-            // Skip trivially small batches
-            if (act->ne[1] < 4) continue;
-            // Skip non-contiguous activations (permuted/reshaped views).
-            // Their nb[1] stride and ggml_nbytes do not describe a flat row-major
-            // layout, so both host indexing and ggml_backend_tensor_get would
-            // over-read; on GPU backends the underlying device memory is also
-            // owned by view_src, not act->buffer.
-            if (!ggml_is_contiguous(act)) continue;
-            // Skip view tensors entirely. View tensors have act->buffer == NULL
-            // (the real buffer lives on view_src), so ggml_backend_tensor_get
-            // would null-deref the backend's get_tensor vtable on GPU. The
-            // underlying activation is almost always also fed as src1 of some
-            // other named MUL_MAT, so dropping the view does not lose stats.
-            if (act->view_src) continue;
-            // Skip ops that produce a fresh tensor but whose op is not a real
-            // GGUF-loaded weight (e.g. CONT of a weight inherits the name's
-            // first byte from uninitialised memory in some ggml versions).
-            // Genuine GGUF weights have op == GGML_OP_NONE.
-            if (weight->op != GGML_OP_NONE) continue;
+        // Only collect for named weight tensors (loaded from GGUF)
+        if (!weight->name[0]) return;
+        // Only F32 activations (full precision)
+        if (act->type != GGML_TYPE_F32) return;
+        // Skip trivially small batches
+        if (act->ne[1] < 4) return;
+        // Skip non-contiguous activations (permuted/reshaped views).
+        // Their nb[1] stride and ggml_nbytes do not describe a flat row-major
+        // layout, so both host indexing and ggml_backend_tensor_get would
+        // over-read; on GPU backends the underlying device memory is also
+        // owned by view_src, not act->buffer.
+        if (!ggml_is_contiguous(act)) return;
+        // Skip view tensors entirely. View tensors have act->buffer == NULL
+        // (the real buffer lives on view_src), so ggml_backend_tensor_get
+        // would null-deref the backend's get_tensor vtable on GPU. The
+        // underlying activation is almost always also fed as src1 of some
+        // other named MUL_MAT, so dropping the view does not lose stats.
+        if (act->view_src) return;
+        // Genuine GGUF weights have op == GGML_OP_NONE; CONT-of-weight and
+        // similar would carry uninitialised name bytes in some ggml versions.
+        if (weight->op != GGML_OP_NONE) return;
 
-            // Skip uninitialized activations (e.g. not yet after compute)
-            if (!act->buffer && !act->data) continue;
+        // Skip uninitialized activations (e.g. not yet after compute)
+        if (!act->buffer && !act->data) return;
 
-            int64_t ncol = act->ne[0];
-            int64_t nrows = act->ne[1] * act->ne[2] * act->ne[3];
-            if (ncol <= 0 || nrows <= 0) continue;
+        int64_t ncol = act->ne[0];
+        int64_t nrows = act->ne[1] * act->ne[2] * act->ne[3];
+        if (ncol <= 0 || nrows <= 0) return;
 
-            std::string name(weight->name);
-            auto &e = stats[name];
-            if (e.values.empty()) {
-                e.values.resize(ncol, 0.0);
-            } else if ((int64_t)e.values.size() != ncol) {
-                // Same weight name has been seen with a different column count.
-                // Writing into e.values[j] for j >= e.values.size() would walk
-                // off the heap and corrupt the unordered_map's bucket array,
-                // surfacing later as a segfault inside stats[name] on the next
-                // graph. Skip rather than corrupt.
-                fprintf(stderr,
-                        "[imatrix] WARN: ncol mismatch for '%s' (have %zu, got "
-                        "%lld) — skipping\n",
-                        name.c_str(), e.values.size(), (long long)ncol);
-                continue;
-            }
-
-            // Read activation data (may need GPU→CPU copy)
-            std::vector<float> act_data;
-            const float *data;
-            bool is_host = !act->buffer || ggml_backend_buffer_is_host(act->buffer);
-            if (!is_host) {
-                size_t nbytes = ggml_nbytes(act);
-                act_data.resize(nbytes / sizeof(float));
-                ggml_backend_tensor_get(act, act_data.data(), 0, nbytes);
-                data = act_data.data();
-            } else {
-                data = (const float *)act->data;
-                if (!data) continue;
-            }
-
-            // Accumulate squared activations per column (contiguous: nb[1] == ncol*4)
-            for (int64_t r = 0; r < nrows; r++) {
-                const float *row = data + r * (act->nb[1] / sizeof(float));
-                for (int64_t j = 0; j < ncol; j++) {
-                    double v = (double)row[j];
-                    e.values[j] += v * v;
-                }
-            }
-            e.count += nrows;
+        std::string name(weight->name);
+        auto &e = stats[name];
+        if (e.values.empty()) {
+            e.values.resize(ncol, 0.0);
+        } else if ((int64_t)e.values.size() != ncol) {
+            fprintf(stderr,
+                    "[imatrix] WARN: ncol mismatch for '%s' (have %zu, got "
+                    "%lld) — skipping\n",
+                    name.c_str(), e.values.size(), (long long)ncol);
+            return;
         }
+
+        // Read activation data (may need GPU→CPU copy)
+        std::vector<float> act_data;
+        const float *data;
+        bool is_host = !act->buffer || ggml_backend_buffer_is_host(act->buffer);
+        if (!is_host) {
+            size_t nbytes = ggml_nbytes(act);
+            act_data.resize(nbytes / sizeof(float));
+            ggml_backend_tensor_get(act, act_data.data(), 0, nbytes);
+            data = act_data.data();
+        } else {
+            data = (const float *)act->data;
+            if (!data) return;
+        }
+
+        // Skip if activation contains NaN/Inf (would poison the imatrix
+        // and crash downstream IQ grid lookups).  This shouldn't happen
+        // at per-node timing on a healthy model, but defend anyway.
+        bool any_bad = false;
+        size_t span = (size_t)nrows * (size_t)(act->nb[1] / sizeof(float));
+        for (size_t k = 0; k < span && !any_bad; k += std::max<size_t>(1, span / 16)) {
+            if (!std::isfinite(data[k])) any_bad = true;
+        }
+        if (any_bad) {
+            fprintf(stderr,
+                    "[imatrix] WARN: non-finite activations in '%s' — skipping node\n",
+                    name.c_str());
+            return;
+        }
+
+        // Accumulate squared activations per column (contiguous: nb[1] == ncol*4)
+        for (int64_t r = 0; r < nrows; r++) {
+            const float *row = data + r * (act->nb[1] / sizeof(float));
+            for (int64_t j = 0; j < ncol; j++) {
+                double v = (double)row[j];
+                e.values[j] += v * v;
+            }
+        }
+        e.count += nrows;
     }
 
     // Save as legacy .dat format (compatible with llama.cpp tools).
