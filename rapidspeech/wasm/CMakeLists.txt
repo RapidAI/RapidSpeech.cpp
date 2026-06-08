@@ -65,6 +65,7 @@ add_subdirectory(${GGML_PATH} ggml)
 set(RS_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/core/rs_context.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/core/rs_processor.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/core/rs_kws.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/frontend/audio_processor.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/frontend/fftsg.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/frontend/text_frontend.cpp
@@ -73,6 +74,9 @@ set(RS_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/utils/rs_wav.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/sensevoice.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/sensevoice_encoder.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/context_graph.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/keyword_loader.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/kws_decoder.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/funasr-nano.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/silero_vad.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/fireredvad.cpp
@@ -140,8 +144,8 @@ target_link_options(rapidspeech-wasm PRIVATE
     -sFORCE_FILESYSTEM=1
 
     # Export the WASM entry-point functions to JS
-    -sEXPORTED_FUNCTIONS=[_rs_wasm_init,_rs_wasm_init_ex,_rs_wasm_free,_rs_wasm_push_audio,_rs_wasm_push_text,_rs_wasm_push_reference_audio,_rs_wasm_push_reference_text,_rs_wasm_process,_rs_wasm_redecode,_rs_wasm_get_text,_rs_wasm_get_audio_ptr,_rs_wasm_get_audio_len,_rs_wasm_reset,_rs_wasm_get_sample_rate,_rs_wasm_get_arch_name,_rs_wasm_is_ready,_rs_wasm_get_version,_rs_wasm_set_user_input_prompt,_rs_wasm_set_use_llm,_rs_wasm_set_ctc_precheck,_rs_wasm_set_tts_params,_rs_wasm_set_tts_diffusion_steps,_rs_wasm_vad_init,_rs_wasm_vad_free,_rs_wasm_vad_reset,_rs_wasm_vad_set_threshold,_rs_wasm_vad_push_audio,_rs_wasm_vad_is_speech,_rs_wasm_vad_get_probability,_rs_wasm_vad_get_arch,_rs_wasm_vad_drain_segments,_rs_wasm_vad_drain_frames,_malloc,_free]
-    -sEXPORTED_RUNTIME_METHODS=[ccall,cwrap,UTF8ToString,stringToUTF8,lengthBytesUTF8,getValue,setValue,FS,HEAPF32,HEAP32]
+    -sEXPORTED_FUNCTIONS=[_rs_wasm_init,_rs_wasm_init_ex,_rs_wasm_free,_rs_wasm_push_audio,_rs_wasm_push_text,_rs_wasm_push_reference_audio,_rs_wasm_push_reference_text,_rs_wasm_process,_rs_wasm_redecode,_rs_wasm_get_text,_rs_wasm_get_audio_ptr,_rs_wasm_get_audio_len,_rs_wasm_reset,_rs_wasm_get_sample_rate,_rs_wasm_get_arch_name,_rs_wasm_is_ready,_rs_wasm_get_version,_rs_wasm_set_user_input_prompt,_rs_wasm_set_use_llm,_rs_wasm_set_ctc_precheck,_rs_wasm_set_tts_params,_rs_wasm_set_tts_diffusion_steps,_rs_wasm_vad_init,_rs_wasm_vad_free,_rs_wasm_vad_reset,_rs_wasm_vad_set_threshold,_rs_wasm_vad_push_audio,_rs_wasm_vad_is_speech,_rs_wasm_vad_get_probability,_rs_wasm_vad_get_arch,_rs_wasm_vad_drain_segments,_rs_wasm_vad_drain_frames,_rs_wasm_kws_init,_rs_wasm_kws_free,_rs_wasm_kws_reset,_rs_wasm_kws_push_audio,_rs_wasm_kws_poll,_rs_wasm_kws_get_hits_ptr,_rs_wasm_kws_get_hits_count,_rs_wasm_kws_get_phrase_pool_ptr,_rs_wasm_kws_get_phrase_pool_len,_rs_wasm_kws_get_sample_rate,_rs_wasm_kws_get_arch_name,_malloc,_free]
+    -sEXPORTED_RUNTIME_METHODS=[ccall,cwrap,UTF8ToString,stringToUTF8,lengthBytesUTF8,getValue,setValue,FS,HEAPF32,HEAP32,HEAPU8,HEAPU32]
 
     # No closure compiler (easier debugging)
     --closure 0

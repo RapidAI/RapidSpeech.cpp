@@ -140,11 +140,15 @@ include_directories(
 set(RS_SOURCES
         rapidspeech/src/core/rs_context.cpp
         rapidspeech/src/core/rs_processor.cpp
+        rapidspeech/src/core/rs_kws.cpp
         rapidspeech/src/frontend/audio_processor.cpp
         rapidspeech/src/frontend/fftsg.c
         rapidspeech/src/utils/rs_log.cpp
         rapidspeech/src/arch/sensevoice.cpp
         rapidspeech/src/arch/sensevoice_encoder.cpp
+        rapidspeech/src/arch/context_graph.cpp
+        rapidspeech/src/arch/keyword_loader.cpp
+        rapidspeech/src/arch/kws_decoder.cpp
         rapidspeech/src/arch/funasr-nano.cpp
         rapidspeech/src/arch/silero_vad.cpp
         rapidspeech/src/arch/fireredvad.cpp
@@ -163,6 +167,14 @@ set(RS_SOURCES
         rapidspeech/src/arch/cosyvoice3_decode.cpp
         rapidspeech/src/arch/cosyvoice3_ras.h
         rapidspeech/src/arch/cosyvoice3_ras.cpp
+        rapidspeech/src/arch/cosyvoice3_flow.h
+        rapidspeech/src/arch/cosyvoice3_flow.cpp
+        rapidspeech/src/arch/cosyvoice3_hift.h
+        rapidspeech/src/arch/cosyvoice3_hift.cpp
+        rapidspeech/src/arch/cosyvoice3_speech_tokenizer.h
+        rapidspeech/src/arch/cosyvoice3_speech_tokenizer.cpp
+        rapidspeech/src/frontend/cosyvoice3_mel.h
+        rapidspeech/src/frontend/cosyvoice3_mel.cpp
 	    rapidspeech/src/arch/openvoice2.cpp
         rapidspeech/src/arch/omnivoice.cpp
         rapidspeech/src/arch/campplus.cpp
@@ -382,8 +394,8 @@ if (RS_BUILD_CLI)
             examples/asr/rs-asr-offline.cpp
     )
 
-    add_executable(rs-asr-online
-            examples/asr/rs-asr-online.cpp
+    add_executable(rs-asr-vad-online
+            examples/asr/rs-asr-vad-online.cpp
     )
 
     add_executable(rs-tts-offline
@@ -403,13 +415,17 @@ if (RS_BUILD_CLI)
     add_executable(rs-speaker-id
             examples/asr/rs-speaker-id.cpp
     )
+    add_executable(rs-kws
+            examples/kws/rs-kws.cpp
+    )
     target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
-    target_link_libraries(rs-asr-online  PRIVATE rapidspeech-core ggml)
+    target_link_libraries(rs-asr-vad-online  PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-tts-offline PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-tts-split   PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-quantize PRIVATE ggml)
     target_link_libraries(rs-imatrix PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-speaker-id  PRIVATE rapidspeech-core ggml)
+    target_link_libraries(rs-kws PRIVATE rapidspeech-core ggml)
 
 
     if (NOT MSVC)
@@ -438,7 +454,7 @@ if (RS_BUILD_CLI)
         ${GGML_PATH}/src
     )
 
-    target_include_directories(rs-asr-online PRIVATE
+    target_include_directories(rs-asr-vad-online PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
         ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
@@ -467,22 +483,32 @@ if (RS_BUILD_CLI)
         ${GGML_PATH}/include
         ${GGML_PATH}/src
     )
+    target_include_directories(rs-kws PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
+        ${GGML_PATH}/include
+        ${GGML_PATH}/src
+    )
 
     # miniaudio uses dlopen on Linux for ALSA/PulseAudio/JACK backend discovery
     if(UNIX AND NOT APPLE)
-        target_link_libraries(rs-asr-online PRIVATE dl)
+        target_link_libraries(rs-asr-vad-online PRIVATE dl)
     endif()
 
     install(TARGETS rs-asr-offline
             RUNTIME DESTINATION bin
     )
-    install(TARGETS rs-asr-online
+    install(TARGETS rs-asr-vad-online
             RUNTIME DESTINATION bin
     )
     install(TARGETS rs-tts-offline
             RUNTIME DESTINATION bin
     )
     install(TARGETS rs-speaker-id
+            RUNTIME DESTINATION bin
+    )
+    install(TARGETS rs-kws
             RUNTIME DESTINATION bin
     )
 endif()
@@ -493,6 +519,7 @@ if (RS_BUILD_TESTS)
 
     set(TEST_MODULES
             audio_frontend
+            cosyvoice3_e2e
     )
 
     foreach(module ${TEST_MODULES})
