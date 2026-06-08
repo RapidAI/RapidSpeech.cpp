@@ -95,6 +95,11 @@ public:
   // Set number of MaskGIT diffusion steps (OmniVoice TTS only). Default 32.
   virtual void SetDiffusionSteps(int n_steps) { (void)n_steps; }
 
+  // Set RNG seed for sampling-based TTS models. Default no-op; CosyVoice3LM
+  // overrides this to seed its RAS sampler. Called by RSProcessor before
+  // CreateState() so the new seed propagates into the per-request state.
+  virtual void SetSeed(uint64_t seed) { (void)seed; }
+
   // Get metadata
   virtual const RSModelMeta &GetMeta() const = 0;
 };

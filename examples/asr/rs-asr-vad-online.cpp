@@ -1,5 +1,10 @@
 /**
- * rs-asr-online.cpp — Online (streaming) ASR with VAD endpoint detection
+ * rs-asr-vad-online.cpp — VAD-segmented quasi-streaming ASR
+ *
+ * Note: this is NOT true chunk-by-chunk streaming. Each VAD-detected speech
+ * segment is decoded as a whole by an offline-style ASR model. For
+ * frame-incremental decoding, see rs-asr-online (true streaming) once
+ * chunk-streaming models are integrated.
  *
  * Architecture (producer-consumer):
  *   Thread 1 — Audio + VAD (producer)
@@ -15,8 +20,8 @@
  *   the oldest segments are dropped (with a warning).
  *
  * Usage:
- *   rs-asr-online -m <asr.gguf> -v <vad.gguf> -w <audio.wav> [options]
- *   rs-asr-online -m <asr.gguf> -v <vad.gguf> --mic [options]
+ *   rs-asr-vad-online -m <asr.gguf> -v <vad.gguf> -w <audio.wav> [options]
+ *   rs-asr-vad-online -m <asr.gguf> -v <vad.gguf> --mic [options]
  *
  * Options:
  *   -m, --model <path>       ASR model path  (required)
@@ -516,7 +521,7 @@ static bool parse_args(int argc, char **argv, OnlineArgs &args) {
       g_verbose = true;
     } else if (a == "-h" || a == "--help") {
       std::cout
-          << "Usage: rs-asr-online -m <asr.gguf> -v <vad.gguf> [options]\n"
+          << "Usage: rs-asr-vad-online -m <asr.gguf> -v <vad.gguf> [options]\n"
              "\n"
              "Input source (choose one):\n"
              "  -w, --wav <path>         WAV file (simulate streaming)\n"

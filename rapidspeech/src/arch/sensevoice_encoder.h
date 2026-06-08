@@ -31,6 +31,14 @@ struct SenseVoiceState : public RSState {
   int language_id = 0;
   bool use_itn = true;
 
+  // KWS path: when set true via SenseVoiceModel::SetKWSMode(), Decode() skips
+  // greedy/beam token construction and instead copies full log-prob matrix
+  // (row-major [T, V]) into kws_log_probs. kws_T / kws_V record the shape.
+  bool kws_mode = false;
+  std::vector<float> kws_log_probs;
+  int kws_T = 0;
+  int kws_V = 0;
+
   SenseVoiceState() {
     // Increase persistent context to ensure enough room for tensor metadata
     struct ggml_init_params params = {512 * ggml_tensor_overhead(), nullptr,
@@ -87,8 +95,10 @@ public:
               ggml_backend_sched_t sched);
   virtual bool MapTensors(std::map<std::string, struct ggml_tensor *> &tensors);
 
-  // Imatrix activation collection: invoked after each graph compute when set.
-  void set_imatrix_callback(std::function<void(struct ggml_cgraph *)> cb) {
+  // Imatrix activation collection: fires per MUL_MAT node during graph
+  // compute (installed as ggml_backend_sched_set_eval_callback) so src1
+  // is still live when read.
+  void set_imatrix_callback(std::function<void(struct ggml_tensor *)> cb) {
     imatrix_cb_ = std::move(cb);
   }
 
@@ -104,8 +114,8 @@ private:
   struct ggml_context *cached_ctx_ = nullptr;
   struct ggml_cgraph *cached_gf_ = nullptr;
 
-  // Imatrix collection callback (post-compute)
-  std::function<void(struct ggml_cgraph *)> imatrix_cb_;
+  // Imatrix collection callback (per-node, via sched eval callback)
+  std::function<void(struct ggml_tensor *)> imatrix_cb_;
 
   // Helper to resize and pre-compute the table
   void ensure_pos_encoding_size(int required_len, int dim);

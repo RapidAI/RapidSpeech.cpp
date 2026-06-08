@@ -95,6 +95,9 @@ model_layer_sanm_forward(const SenseVoiceHParams &hparams,
   // Scaled Dot-Product Attention
   float scale = 1.0f / sqrtf(float(n_state) / n_head);
   struct ggml_tensor *KQ = ggml_mul_mat(ctx, K_h, Q_h);
+  // F32 accumulator on CUDA: F16 default overflows for long encoder
+  // sequences (50-layer SenseVoice), collapsing softmax distributions.
+  ggml_mul_mat_set_prec(KQ, GGML_PREC_F32);
   struct ggml_tensor *KQ_soft_max =
       ggml_soft_max_ext(ctx, KQ, nullptr, scale, 0.0f);
   struct ggml_tensor *KQV =
@@ -419,13 +422,29 @@ bool SenseVoiceEncoderModel::Encode(const std::vector<float> &input_frames,
   }
 
   // --- Compute ---
-  if (ggml_backend_sched_graph_compute(sched, cached_gf_) !=
-      GGML_STATUS_SUCCESS) {
-    return false;
+  // Install per-node imatrix observer (if any) before compute, so we can
+  // snapshot each MUL_MAT's src1 while it is still the data the matmul
+  // actually consumed.  Reading src1 post-compute is unsafe: sched buffer
+  // reuse may have overwritten it with a downstream op's output.
+  if (imatrix_cb_) {
+    auto trampoline = [](struct ggml_tensor *t, bool ask, void *ud) -> bool {
+      if (ask) return true; // observe every node
+      auto *cb = static_cast<std::function<void(struct ggml_tensor *)> *>(ud);
+      (*cb)(t);
+      return true;
+    };
+    ggml_backend_sched_set_eval_callback(sched, trampoline, &imatrix_cb_);
   }
 
+  enum ggml_status compute_status =
+      ggml_backend_sched_graph_compute(sched, cached_gf_);
+
   if (imatrix_cb_) {
-    imatrix_cb_(cached_gf_);
+    ggml_backend_sched_set_eval_callback(sched, nullptr, nullptr);
+  }
+
+  if (compute_status != GGML_STATUS_SUCCESS) {
+    return false;
   }
 
   // --- State Persistence Logic ---

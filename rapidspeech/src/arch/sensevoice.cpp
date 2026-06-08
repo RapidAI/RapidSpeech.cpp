@@ -179,12 +179,12 @@ bool SenseVoiceModel::Decode(RSState &state, ggml_backend_sched_t sched) {
 
   struct ggml_tensor *output_node = nullptr;
 
-  if (beam_size <= 1) {
-    // Greedy serach: Calculate argmax on backend
-    output_node = ggml_argmax(ctx0, log_probs);
-  } else {
-    // Beam Search Mode: We need the full log-probs on host
+  // KWS mode always needs the full log-prob matrix on host.
+  if (sv_state.kws_mode || beam_size > 1) {
     output_node = log_probs;
+  } else {
+    // Greedy search: Calculate argmax on backend
+    output_node = ggml_argmax(ctx0, log_probs);
   }
   ggml_set_name(output_node, "output");
 
@@ -204,7 +204,14 @@ bool SenseVoiceModel::Decode(RSState &state, ggml_backend_sched_t sched) {
   }
 
   // 3. Post-Processing on Host
-  if (beam_size <= 1) {
+  if (sv_state.kws_mode) {
+    // --- KWS path: hand full [T, V] log-prob matrix to caller ---
+    sv_state.kws_log_probs.resize(static_cast<size_t>(T) * V);
+    ggml_backend_tensor_get(output_node, sv_state.kws_log_probs.data(), 0,
+                            sizeof(float) * T * V);
+    sv_state.kws_T = T;
+    sv_state.kws_V = V;
+  } else if (beam_size <= 1) {
     // --- Greedy Decoding ---
     std::vector<int32_t> raw_ids(T);
     ggml_backend_tensor_get(output_node, raw_ids.data(), 0,
@@ -221,8 +228,10 @@ bool SenseVoiceModel::Decode(RSState &state, ggml_backend_sched_t sched) {
     sv_state.ids =
         CTCDecoder::BeamSearchDecode(host_log_probs.data(), T, V, beam_size);
   }
-  for (auto id : sv_state.ids) {
-    sv_state.tokens.push_back(this->vocab_.id_to_token[id]);
+  if (!sv_state.kws_mode) {
+    for (auto id : sv_state.ids) {
+      sv_state.tokens.push_back(this->vocab_.id_to_token[id]);
+    }
   }
 
   ggml_free(ctx0);
@@ -240,6 +249,20 @@ std::string SenseVoiceModel::GetTranscription(RSState &state) {
   sv_state.tokens.clear();
   return result;
 }
+
+void SenseVoiceModel::SetKWSMode(RSState &state, bool enable) const {
+  auto &sv_state = static_cast<SenseVoiceState &>(state);
+  sv_state.kws_mode = enable;
+}
+
+const float *SenseVoiceModel::GetCTCLogits(const RSState &state, int *T,
+                                           int *V) const {
+  const auto &sv_state = static_cast<const SenseVoiceState &>(state);
+  if (T) *T = sv_state.kws_T;
+  if (V) *V = sv_state.kws_V;
+  return sv_state.kws_log_probs.empty() ? nullptr
+                                        : sv_state.kws_log_probs.data();
+}
 // Registration logic
 extern void
 rs_register_model_arch(const std::string &arch,
@@ -250,3 +273,7 @@ void rs_register_sensevoice() {
     return std::make_shared<SenseVoiceModel>();
   });
 }
+
+static struct SenseVoiceRegistrar {
+  SenseVoiceRegistrar() { rs_register_sensevoice(); }
+} _sensevoice_registrar;

@@ -18,9 +18,20 @@
 
 #include "rapidspeech.h"
 
+#include "arch/keyword_loader.h"
+#include "arch/sensevoice.h"
+#include "core/rs_context.h"
+#include "core/rs_kws.h"
+
 #include <emscripten.h>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 // Forward-declare explicit arch registrations so LTO cannot strip them.
 void rs_register_sensevoice();
@@ -353,6 +364,240 @@ int rs_wasm_vad_drain_frames(rs_vad_frame_t *out, int capacity) {
 EMSCRIPTEN_KEEPALIVE
 const char *rs_wasm_get_version(void) {
   return rs_get_version();
+}
+
+// ── KWS (open-vocabulary wake-word, independent of g_ctx) ──
+//
+// Mirrors the VAD pattern: KWS owns its own rs_context_t so it can hold a
+// SenseVoiceModel and reuse the loaded sched, independently of the main
+// ASR/TTS context. JS reads hits via two host buffers:
+//
+//   - g_kws_records: contiguous array of HitRecord (24B each, 8B aligned),
+//                    holds {time_s, avg_prob, phrase_off, phrase_len}.
+//   - g_kws_phrases: single UTF-8 byte buffer; phrase_off/len index into it.
+//
+// Both are rebuilt on every rs_wasm_kws_poll() call.
+
+namespace {
+
+struct HitRecord {
+  double   time_s;     // offset 0
+  float    avg_prob;   // offset 8
+  uint32_t phrase_off; // offset 12
+  uint32_t phrase_len; // offset 16
+  uint32_t _pad;       // offset 20 — pad to 24 so the next record is 8B-aligned
+};
+static_assert(sizeof(HitRecord) == 24, "HitRecord layout");
+
+static rs_context_t                 *g_kws_ctx = nullptr;
+static std::unique_ptr<rs::RSKws>    g_kws;
+static std::vector<HitRecord>        g_kws_records;
+static std::string                   g_kws_phrases;
+static char                          g_kws_arch[64] = {0};
+
+// SenseVoice prefix-token ids that the CTC stream wraps every utterance with
+// (language, SER, AED, ITN). They are inside <…|…> bracket pairs in
+// id_to_token. Treat them as no-ops during CTC collapse.
+std::unordered_set<int32_t>
+build_ignore_ids(const std::unordered_map<int, std::string> &id_to_token) {
+  std::unordered_set<int32_t> out;
+  for (const auto &kv : id_to_token) {
+    const std::string &s = kv.second;
+    if (s.size() >= 4 && s.front() == '<' && s.back() == '>') {
+      out.insert(kv.first);
+    }
+  }
+  return out;
+}
+
+// Punctuation token detection — see examples/kws/rs-kws.cpp:171-201 for the
+// rationale. We accept ASCII punctuation and single-codepoint UTF-8 entries
+// in the CJK / general punctuation blocks.
+bool is_punct_token(const std::string &s) {
+  if (s.empty()) return false;
+  if (s.size() == 1) {
+    char c = s[0];
+    return std::strchr(",.!?;:()[]{}<>'\"`-_/\\|@#$%^&*+=~", c) != nullptr;
+  }
+  unsigned char b0 = static_cast<unsigned char>(s[0]);
+  int cp_len = 0;
+  uint32_t cp = 0;
+  if      ((b0 & 0x80) == 0x00) { cp_len = 1; cp = b0; }
+  else if ((b0 & 0xE0) == 0xC0) { cp_len = 2; cp = b0 & 0x1F; }
+  else if ((b0 & 0xF0) == 0xE0) { cp_len = 3; cp = b0 & 0x0F; }
+  else if ((b0 & 0xF8) == 0xF0) { cp_len = 4; cp = b0 & 0x07; }
+  else return false;
+  if (static_cast<int>(s.size()) != cp_len) return false;
+  for (int i = 1; i < cp_len; ++i) {
+    unsigned char b = static_cast<unsigned char>(s[i]);
+    if ((b & 0xC0) != 0x80) return false;
+    cp = (cp << 6) | (b & 0x3F);
+  }
+  if (cp >= 0x3000 && cp <= 0x303F) return true;
+  if (cp >= 0xFF00 && cp <= 0xFF65) return true;
+  if (cp >= 0x2000 && cp <= 0x206F) return true;
+  return false;
+}
+
+std::unordered_set<int32_t>
+build_punct_ids(const std::unordered_map<int, std::string> &id_to_token) {
+  std::unordered_set<int32_t> out;
+  for (const auto &kv : id_to_token) {
+    if (is_punct_token(kv.second)) out.insert(kv.first);
+  }
+  return out;
+}
+
+void kws_free_internal(void) {
+  g_kws.reset();
+  if (g_kws_ctx) { rs_free(g_kws_ctx); g_kws_ctx = nullptr; }
+  g_kws_records.clear();
+  g_kws_records.shrink_to_fit();
+  g_kws_phrases.clear();
+  g_kws_phrases.shrink_to_fit();
+  g_kws_arch[0] = '\0';
+}
+
+} // namespace
+
+EMSCRIPTEN_KEEPALIVE
+int rs_wasm_kws_init(const char *model_path, const char *keywords_path,
+                     int n_threads, int window_ms, int hop_ms,
+                     int debounce_ms, float default_threshold) {
+  static bool archs_registered = false;
+  if (!archs_registered) {
+    rs_register_sensevoice();
+    archs_registered = true;
+  }
+  if (!model_path || !keywords_path) return -1;
+
+  kws_free_internal();
+
+  rs_init_params_t params = rs_default_params();
+  params.model_path = model_path;
+  params.n_threads  = n_threads > 0 ? n_threads : 2;
+  // Pin to CPU — KWS runs SenseVoice every hop (~200ms). WebGPU's per-submit
+  // overhead dominates for short streaming windows; CPU + SIMD is faster and
+  // async-safe (no ASYNCIFY suspension inside Poll()).
+  params.use_gpu    = false;
+  params.task_type  = RS_TASK_ASR_OFFLINE;
+
+  g_kws_ctx = rs_init_from_file(params);
+  if (!g_kws_ctx) {
+    rs_error_info_t err = rs_get_last_error();
+    EM_ASM({ console.error("rs_wasm_kws_init: " + UTF8ToString($0)); }, err.message);
+    return -1;
+  }
+
+  auto sv = std::dynamic_pointer_cast<SenseVoiceModel>(g_kws_ctx->model);
+  if (!sv) {
+    EM_ASM({ console.error("rs_wasm_kws_init: model is not SenseVoice"); });
+    kws_free_internal();
+    return -2;
+  }
+
+  rs::KWSLoaderConfig lcfg;
+  lcfg.default_threshold = default_threshold;
+  auto graph = rs::LoadKeywordsFromFile(keywords_path, sv->GetIdToToken(), lcfg);
+  if (!graph) {
+    EM_ASM({ console.error("rs_wasm_kws_init: no valid keywords loaded"); });
+    kws_free_internal();
+    return -3;
+  }
+
+  rs::RSKwsConfig kcfg;
+  kcfg.sample_rate              = sv->GetMeta().audio_sample_rate;
+  kcfg.window_ms                = window_ms   > 0 ? window_ms   : 1600;
+  kcfg.hop_ms                   = hop_ms      > 0 ? hop_ms      : 200;
+  kcfg.debounce_ms              = debounce_ms > 0 ? debounce_ms : 1500;
+  kcfg.decoder.blank_id            = sv->GetBlankId();
+  kcfg.decoder.skip_prefix_frames  = 4;
+  kcfg.decoder.beam_size           = 1;
+  kcfg.decoder.top_k_per_frame     = 8;
+
+  auto ignore_ids = build_ignore_ids(sv->GetIdToToken());
+  auto punct_ids  = build_punct_ids(sv->GetIdToToken());
+
+  g_kws.reset(new rs::RSKws(sv, g_kws_ctx->sched, std::move(graph),
+                            std::move(ignore_ids), std::move(punct_ids),
+                            kcfg));
+
+  const auto &name = sv->GetMeta().arch_name;
+  size_t n = std::min(name.size(), sizeof(g_kws_arch) - 1);
+  std::memcpy(g_kws_arch, name.data(), n);
+  g_kws_arch[n] = '\0';
+  return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void rs_wasm_kws_free(void) {
+  kws_free_internal();
+}
+
+EMSCRIPTEN_KEEPALIVE
+int rs_wasm_kws_reset(void) {
+  if (!g_kws) return -1;
+  g_kws->Reset();
+  g_kws_records.clear();
+  g_kws_phrases.clear();
+  return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int rs_wasm_kws_push_audio(const float *pcm, int n_samples) {
+  if (!g_kws || !pcm || n_samples <= 0) return -1;
+  g_kws->PushAudio(pcm, static_cast<size_t>(n_samples));
+  return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int rs_wasm_kws_poll(void) {
+  if (!g_kws) return -1;
+  g_kws_records.clear();
+  g_kws_phrases.clear();
+  g_kws->Poll([](const rs::KWSHit &h) {
+    HitRecord rec;
+    rec.time_s     = h.time_s;
+    rec.avg_prob   = h.avg_prob;
+    rec.phrase_off = static_cast<uint32_t>(g_kws_phrases.size());
+    rec.phrase_len = static_cast<uint32_t>(h.phrase.size());
+    rec._pad       = 0;
+    g_kws_phrases.append(h.phrase);
+    g_kws_records.push_back(rec);
+  });
+  return static_cast<int>(g_kws_records.size());
+}
+
+EMSCRIPTEN_KEEPALIVE
+const void *rs_wasm_kws_get_hits_ptr(void) {
+  return g_kws_records.empty() ? nullptr : g_kws_records.data();
+}
+
+EMSCRIPTEN_KEEPALIVE
+int rs_wasm_kws_get_hits_count(void) {
+  return static_cast<int>(g_kws_records.size());
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char *rs_wasm_kws_get_phrase_pool_ptr(void) {
+  return g_kws_phrases.empty() ? "" : g_kws_phrases.data();
+}
+
+EMSCRIPTEN_KEEPALIVE
+int rs_wasm_kws_get_phrase_pool_len(void) {
+  return static_cast<int>(g_kws_phrases.size());
+}
+
+EMSCRIPTEN_KEEPALIVE
+int rs_wasm_kws_get_sample_rate(void) {
+  if (!g_kws_ctx) return 16000;
+  rs_model_meta_t meta = rs_get_model_meta(g_kws_ctx);
+  return meta.audio_sample_rate;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char *rs_wasm_kws_get_arch_name(void) {
+  return g_kws_arch;
 }
 
 #ifdef __cplusplus

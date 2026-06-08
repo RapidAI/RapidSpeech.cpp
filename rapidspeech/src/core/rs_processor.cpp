@@ -173,6 +173,13 @@ void RSProcessor::SetTTSParams(const char *instruct, const char *language,
   if (instruct) tts_instruct_ = instruct;
   if (language) tts_language_ = language;
   tts_seed_ = seed;
+  // Propagate the seed to the underlying TTS model and rebuild state so the
+  // per-request RNG is seeded *before* sampling begins. Without this, the
+  // sampler runs with the model's default seed regardless of --seed.
+  if (model_) {
+    model_->SetSeed((uint64_t)(uint32_t)seed);
+    state_ = model_->CreateState();
+  }
 }
 
 void RSProcessor::SetDiffusionSteps(int n_steps) {

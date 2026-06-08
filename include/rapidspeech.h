@@ -54,7 +54,7 @@ RS_API void rs_clear_error(void);
 // ============================================
 
 // Forward declaration for ggml types used by optional callbacks
-struct ggml_cgraph;
+struct ggml_tensor;
 
 // Context Handle (Opaque Pointer)
 typedef struct rs_context_t rs_context_t;
@@ -359,13 +359,14 @@ RS_API const char* rs_get_backend_name(const rs_context_t* ctx);
 
 //── Importance Matrix Collection (activation-aware quantization) ──
 
-// Set a callback that is invoked after every ggml graph compute during TTS
-// diffusion.  The callback receives userdata and the computed ggml_cgraph,
-// which can be inspected to collect activation statistics for imatrix.
-// Pass NULL for callback to unregister.
+// Set a per-node imatrix observer.  The callback fires once per MUL_MAT
+// node DURING graph compute (via ggml_backend_sched_set_eval_callback), so
+// the node's src1 (activation input) is still live and not yet overwritten
+// by downstream ops sharing the same sched buffer slot.  Pass NULL for
+// callback to unregister.
 RS_API void rs_set_imatrix_callback(rs_context_t* ctx,
                                      void (*callback)(void* userdata,
-                                                      struct ggml_cgraph* gf),
+                                                      struct ggml_tensor* node),
                                      void* userdata);
 
 #ifdef __cplusplus

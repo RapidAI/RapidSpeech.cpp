@@ -406,11 +406,165 @@ class RapidSpeechVAD {
   }
 }
 
+// ─────────────────────────────────────────────────────────────
+// RapidSpeechKWS — open-vocabulary streaming wake-word spotter
+// ─────────────────────────────────────────────────────────────
+//
+// Backed by SenseVoice + ContextGraph + CTC Aho-Corasick decoder. Independent
+// of the main RapidSpeechWASM context — KWS holds its own model so the
+// asr/tts tabs can coexist on the same MODULARIZE'd module.
+//
+// keywords.txt format (one per line, sherpa-onnx compatible):
+//   <tok-id> <tok-id> ...  [:boost] [#threshold] [@human-phrase]
+// Tokens are SenseVoice token ids; use scripts/sensevoice_tokenize.py to
+// produce them from natural-language phrases.
+
+const KWS_RECORD_BYTES = 24; // {double time_s; float avg_prob; u32 off; u32 len; u32 pad}
+
+class RapidSpeechKWS {
+  constructor(module) {
+    this._mod = module;
+    this._ready = false;
+
+    this._init       = module.cwrap('rs_wasm_kws_init',         'number',
+        ['string', 'string', 'number', 'number', 'number', 'number', 'number'],
+        { async: true });
+    this._free       = module.cwrap('rs_wasm_kws_free',         null,     []);
+    this._reset      = module.cwrap('rs_wasm_kws_reset',        'number', []);
+    this._push       = module.cwrap('rs_wasm_kws_push_audio',   'number', ['number', 'number']);
+    this._poll       = module.cwrap('rs_wasm_kws_poll',         'number', []);
+    this._hitsPtr    = module.cwrap('rs_wasm_kws_get_hits_ptr', 'number', []);
+    this._hitsCount  = module.cwrap('rs_wasm_kws_get_hits_count','number', []);
+    this._poolPtr    = module.cwrap('rs_wasm_kws_get_phrase_pool_ptr','number', []);
+    this._poolLen    = module.cwrap('rs_wasm_kws_get_phrase_pool_len','number', []);
+    this._sampleRate = module.cwrap('rs_wasm_kws_get_sample_rate','number', []);
+    this._archName   = module.cwrap('rs_wasm_kws_get_arch_name','string', []);
+
+    this._decoder = (typeof TextDecoder !== 'undefined') ? new TextDecoder('utf-8') : null;
+  }
+
+  /**
+   * Load model + register keywords.
+   * @param {string} modelUrl   GGUF URL (SenseVoice)
+   * @param {string} keywordsText  newline-separated keywords.txt content
+   * @param {object} opts  { nThreads, windowMs, hopMs, debounceMs, defaultThreshold }
+   * @param {function} onProgress(frac, {loaded,total})
+   */
+  async load(modelUrl, keywordsText, opts = {}, onProgress = null) {
+    const {
+      nThreads = 2, windowMs = 1600, hopMs = 200,
+      debounceMs = 1500, defaultThreshold = 0.0,
+    } = opts;
+
+    const modelPath = '/kws_model.gguf';
+    const kwPath    = '/keywords.txt';
+
+    let buffer;
+    if (modelUrl instanceof Uint8Array || modelUrl instanceof ArrayBuffer) {
+      buffer = modelUrl instanceof ArrayBuffer ? new Uint8Array(modelUrl) : modelUrl;
+    } else {
+      const response = await fetch(modelUrl);
+      if (!response.ok) {
+        throw new Error(`Failed to fetch KWS model: ${response.status} ${response.statusText}`);
+      }
+      const total = parseInt(response.headers.get('Content-Length') || '0', 10);
+      const reader = response.body.getReader();
+      const chunks = [];
+      let loaded = 0;
+      if (onProgress) onProgress(0, { loaded: 0, total });
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        loaded += value.length;
+        if (onProgress) {
+          const frac = total > 0 ? Math.min(loaded / total, 1.0) : 0;
+          onProgress(frac, { loaded, total });
+        }
+      }
+      buffer = new Uint8Array(loaded);
+      let off = 0;
+      for (const c of chunks) { buffer.set(c, off); off += c.length; }
+      if (onProgress) onProgress(1, { loaded, total: total || loaded });
+    }
+
+    this._mod.FS.writeFile(modelPath, buffer);
+    const enc = new TextEncoder();
+    this._mod.FS.writeFile(kwPath, enc.encode(String(keywordsText || '')));
+
+    const ret = await this._init(
+      modelPath, kwPath, nThreads | 0,
+      windowMs | 0, hopMs | 0, debounceMs | 0,
+      Number(defaultThreshold) || 0.0,
+    );
+    if (ret !== 0) throw new Error('rs_wasm_kws_init failed with code ' + ret);
+    this._ready = true;
+  }
+
+  free() {
+    if (this._ready) { this._free(); this._ready = false; }
+  }
+
+  reset() { if (this._ready) this._reset(); }
+
+  /** Push 16 kHz mono Float32Array PCM. */
+  pushAudio(pcm) {
+    if (!this._ready) return;
+    const n = pcm.length;
+    const ptr = this._mod._malloc(n * 4);
+    this._mod.HEAPF32.set(pcm, ptr / 4);
+    this._push(ptr, n);
+    this._mod._free(ptr);
+  }
+
+  /**
+   * Run as many KWS analysis windows as the buffered audio supports.
+   * Returns an array of hits: [{ phrase, avg_prob, time_s }, ...]
+   */
+  poll() {
+    if (!this._ready) return [];
+    const n = this._poll();
+    if (n <= 0) return [];
+
+    const recPtr  = this._hitsPtr();
+    const poolPtr = this._poolPtr();
+    const poolLen = this._poolLen();
+    if (!recPtr || !poolLen) return [];
+
+    const pool = this._mod.HEAPU8.subarray(poolPtr, poolPtr + poolLen);
+    const decode = (off, len) => {
+      const slice = pool.subarray(off, off + len);
+      if (this._decoder) return this._decoder.decode(slice);
+      // Fallback for very old environments.
+      let s = '';
+      for (let i = 0; i < slice.length; ++i) s += String.fromCharCode(slice[i]);
+      return decodeURIComponent(escape(s));
+    };
+
+    const out = new Array(n);
+    const getValue = this._mod.getValue;
+    for (let i = 0; i < n; ++i) {
+      const base = recPtr + i * KWS_RECORD_BYTES;
+      const time_s   = getValue(base + 0,  'double');
+      const avg_prob = getValue(base + 8,  'float');
+      const off      = this._mod.HEAPU32[(base + 12) >> 2];
+      const len      = this._mod.HEAPU32[(base + 16) >> 2];
+      out[i] = { time_s, avg_prob, phrase: decode(off, len) };
+    }
+    return out;
+  }
+
+  get sampleRate() { return this._ready ? this._sampleRate() : 16000; }
+  get archName()   { return this._ready ? this._archName()   : 'unknown'; }
+  get isReady()    { return this._ready; }
+}
+
 // Export for both browser and Node.js
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { RapidSpeechWASM, RapidSpeechVAD, RS_TASK };
+  module.exports = { RapidSpeechWASM, RapidSpeechVAD, RapidSpeechKWS, RS_TASK };
 } else if (typeof globalThis !== 'undefined') {
   globalThis.RapidSpeechWASM = RapidSpeechWASM;
   globalThis.RapidSpeechVAD  = RapidSpeechVAD;
+  globalThis.RapidSpeechKWS  = RapidSpeechKWS;
   globalThis.RS_TASK = RS_TASK;
 }

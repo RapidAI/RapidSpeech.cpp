@@ -94,102 +94,65 @@ bool load_wav_file(const char *filename, std::vector<float> &data,
 }
 
 // ─────────────────────────────────────────────────────
-// Polyphase Kaiser-windowed sinc resampler (mono float PCM).
+// Sinc-interp Hann resampler (mono float PCM).
 //
-// Designed around a rational ratio L/M = dst_sr / src_sr (gcd-reduced).
-// For each input sample we contribute it to a span of output positions
-// through an FIR low-pass whose cutoff is min(L, M) (in the L*src_sr
-// shared upsampled grid). Output sample y[n] is the inner product of the
-// FIR phase taps for (n*M) mod L with M input samples around n*M/L.
+// This is a direct port of torchaudio.functional.resample with the library's
+// defaults (lowpass_filter_width=6, rolloff=0.99, sinc_interp_hann window).
+// Bit-exact with `torchaudio.transforms.Resample(orig, new)` to within float
+// precision, which matches CosyVoice / FunAudioLLM's wav loader.
 // ─────────────────────────────────────────────────────
 namespace {
 
-double bessel_i0(double x) {
-  // Series approximation; sufficient accuracy for Kaiser window design.
-  double t = x / 3.75;
-  if (std::fabs(x) < 3.75) {
-    double t2 = t * t;
-    return 1.0 + t2 * (3.5156229 +
-                       t2 * (3.0899424 +
-                             t2 * (1.2067492 +
-                                   t2 * (0.2659732 +
-                                         t2 * (0.0360768 + t2 * 0.0045813)))));
-  } else {
-    double ax = std::fabs(x);
-    double y = 3.75 / ax;
-    return (std::exp(ax) / std::sqrt(ax)) *
-           (0.39894228 +
-            y * (0.01328592 +
-                 y * (0.00225319 +
-                      y * (-0.00157565 +
-                           y * (0.00916281 +
-                                y * (-0.02057706 +
-                                     y * (0.02635537 +
-                                          y * (-0.01647633 +
-                                               y * 0.00392377))))))));
-  }
-}
-
 struct ResamplerKernel {
-  int L = 1;            // up factor
-  int M = 1;            // down factor
-  int taps_per_phase;   // M taps per output
-  int half_zc;          // sinc half-width in zero-crossings (relative to low-rate)
-  std::vector<float> taps; // size L * taps_per_phase, indexed [phase * taps_per_phase + t]
+  int orig_g;           // src_sr / gcd
+  int new_g;            // dst_sr / gcd
+  int width;            // = ceil(lowpass_filter_width * orig_g / base_freq)
+  int taps_per_phase;   // = 2*width + orig_g
+  // Phase-major taps: kernel[j, p] = taps[j * taps_per_phase + p],
+  // j ∈ [0, new_g), p ∈ [0, taps_per_phase).
+  std::vector<float> taps;
 };
 
 ResamplerKernel build_kernel(int src_sr, int dst_sr) {
   ResamplerKernel k;
-  int g = std::gcd(src_sr, dst_sr);
-  k.L = dst_sr / g;
-  k.M = src_sr / g;
+  const int g = std::gcd(src_sr, dst_sr);
+  k.orig_g = src_sr / g;
+  k.new_g  = dst_sr / g;
 
-  // ~16 zero-crossings on the slower side gives ~80 dB stop-band with β=8.6
-  k.half_zc = 16;
-  k.taps_per_phase = 2 * k.half_zc;
+  // torchaudio defaults
+  const int    lowpass_filter_width = 6;
+  const double rolloff              = 0.99;
+  const double base_freq =
+      (double)std::min(k.orig_g, k.new_g) * rolloff;
 
-  const double cutoff = (double)std::min(k.L, k.M) / (double)std::max(k.L, k.M);
-  const double beta = 8.6; // Kaiser β; ~80 dB stop-band
-  const double i0_beta = bessel_i0(beta);
+  k.width = (int)std::ceil((double)lowpass_filter_width *
+                           (double)k.orig_g / base_freq);
+  k.taps_per_phase = 2 * k.width + k.orig_g;
 
-  const int N = k.L * k.taps_per_phase;
-  k.taps.resize(N);
+  const double scale = base_freq / (double)k.orig_g;
 
-  // Build a continuous prototype low-pass at L*fs_in and split into L phases.
-  // Tap m (m=0..N-1) corresponds to time offset
-  //   x_m = (m - (N-1)/2) / L   (in units of input samples)
-  // multiplied by the sinc cutoff.
-  const double center = 0.5 * (double)(N - 1);
-  double sum = 0.0;
-  for (int m = 0; m < N; ++m) {
-    double x = ((double)m - center) / (double)k.L;
-    double sinc_arg = M_PI * cutoff * x;
-    double sinc_val =
-        (std::fabs(sinc_arg) < 1e-12) ? 1.0 : std::sin(sinc_arg) / sinc_arg;
-    double w_arg = ((double)m - center) / center;
-    double w = bessel_i0(beta * std::sqrt(std::max(0.0, 1.0 - w_arg * w_arg))) /
-               i0_beta;
-    double tap = cutoff * sinc_val * w;
-    k.taps[m] = (float)tap;
-    sum += tap;
-  }
-
-  // Per-phase normalization so DC gain == 1 on every output phase.
-  for (int phase = 0; phase < k.L; ++phase) {
-    double psum = 0.0;
-    for (int t = 0; t < k.taps_per_phase; ++t) {
-      int m = t * k.L + phase;
-      psum += k.taps[m];
-    }
-    if (psum > 0.0) {
-      double scale = 1.0 / psum;
-      for (int t = 0; t < k.taps_per_phase; ++t) {
-        int m = t * k.L + phase;
-        k.taps[m] = (float)(k.taps[m] * scale);
-      }
+  k.taps.assign((size_t)k.new_g * (size_t)k.taps_per_phase, 0.f);
+  for (int j = 0; j < k.new_g; ++j) {
+    for (int p = 0; p < k.taps_per_phase; ++p) {
+      // idx_p (in input-sample units, relative to current frame start):
+      //   idx_p = (-width + p) / orig_g
+      // Output-phase time offset (in output-sample units): -j / new_g.
+      // t = (-j/new_g + idx_p) * base_freq, clamped to ±lowpass_filter_width.
+      double t = (-(double)j / (double)k.new_g +
+                  (double)(-k.width + p) / (double)k.orig_g) *
+                 base_freq;
+      const double cw = (double)lowpass_filter_width;
+      if (t < -cw) t = -cw;
+      if (t >  cw) t =  cw;
+      const double w_cos = std::cos(t * M_PI / cw / 2.0);
+      const double w     = w_cos * w_cos;
+      const double t_pi  = t * M_PI;
+      const double sval  = (std::fabs(t_pi) < 1e-30) ? 1.0
+                                                     : std::sin(t_pi) / t_pi;
+      k.taps[(size_t)j * (size_t)k.taps_per_phase + (size_t)p] =
+          (float)(sval * w * scale);
     }
   }
-  (void)sum;
   return k;
 }
 
@@ -213,37 +176,42 @@ bool resample_pcm(const std::vector<float> &in, int src_sr,
 
   ResamplerKernel k = build_kernel(src_sr, dst_sr);
 
-  const int N = (int)in.size();
-  // Output length: ceil(N * dst_sr / src_sr) == ceil(N * L / M)
-  const int64_t out_len =
-      ((int64_t)N * (int64_t)k.L + (int64_t)k.M - 1) / (int64_t)k.M;
+  const int64_t N        = (int64_t)in.size();
+  const int     orig_g   = k.orig_g;
+  const int     new_g    = k.new_g;
+  const int     width    = k.width;
+  const int     taps     = k.taps_per_phase;
+
+  // torchaudio pads the input with (width) zeros on the left and (width +
+  // orig_g) zeros on the right, runs conv1d with stride=orig_g and kernel
+  // shape [new_g, 1, taps], transposes [B, new_g, n_conv] → [B, n_conv,
+  // new_g] and flattens, then trims to ceil(new_g * N / orig_g).
+  const int64_t n_conv     = N / (int64_t)orig_g + 1;
+  const int64_t total      = (int64_t)new_g * n_conv;
+  const int64_t target_len =
+      ((int64_t)new_g * N + (int64_t)orig_g - 1) / (int64_t)orig_g;
+  const int64_t out_len    = std::min(target_len, total);
   out.assign((size_t)out_len, 0.f);
 
-  // For output index n, the corresponding low-rate index is n*M/L; phase
-  // is (n*M) mod L. Convolution centers on the prototype filter midpoint
-  // (half_zc input samples), so input start index is
-  //   base = floor(n*M / L) - half_zc + 1
-  // and we read taps_per_phase samples from there.
-  const int half = k.half_zc;
-  const int taps = k.taps_per_phase;
-
-  for (int64_t n = 0; n < out_len; ++n) {
-    int64_t nm = n * (int64_t)k.M;
-    int64_t base_low = nm / (int64_t)k.L;
-    int phase = (int)(nm - base_low * (int64_t)k.L);
-    int64_t in_start = base_low - (half - 1);
-
-    const float *phase_taps = &k.taps[(size_t)phase * (size_t)taps];
+  for (int64_t m = 0; m < out_len; ++m) {
+    const int64_t n     = m / (int64_t)new_g;          // conv row
+    const int     j     = (int)(m % (int64_t)new_g);   // output phase
+    const float  *ktaps = &k.taps[(size_t)j * (size_t)taps];
+    // First input index touched by this conv row (after un-padding):
+    //   in_padded[n*orig_g .. n*orig_g + taps − 1]
+    //   in_padded[i] = (i < width) ? 0
+    //                : (i − width < N ? in[i − width] : 0)
+    const int64_t base = n * (int64_t)orig_g - (int64_t)width;
     double acc = 0.0;
-    for (int t = 0; t < taps; ++t) {
-      int64_t idx = in_start + t;
+    for (int p = 0; p < taps; ++p) {
+      const int64_t idx = base + (int64_t)p;
       float s = 0.f;
-      if (idx >= 0 && idx < N) {
+      if ((unsigned long long)idx < (unsigned long long)N) {
         s = in[(size_t)idx];
       }
-      acc += (double)phase_taps[t] * (double)s;
+      acc += (double)ktaps[p] * (double)s;
     }
-    out[(size_t)n] = (float)acc;
+    out[(size_t)m] = (float)acc;
   }
   return true;
 }

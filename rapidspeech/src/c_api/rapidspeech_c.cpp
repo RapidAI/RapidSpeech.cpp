@@ -3,6 +3,7 @@
 #include "core/rs_processor.h"
 #include "arch/funasr-nano.h"
 #include "arch/omnivoice.h"
+#include "arch/sensevoice.h"
 #include "rapidspeech.h"
 #include "utils/rs_log.h"
 #include <cstdarg>
@@ -230,7 +231,7 @@ RS_API int32_t rs_process(rs_context_t *ctx) {
     // Route to TTS or ASR processing based on model architecture
     const std::string &arch = ctx->processor->GetArchName();
     if (arch == "openvoice2" || arch == "OmniVoice" ||
-        arch == "cosyvoice3-llm") {
+        arch == "cosyvoice3-llm" || arch == "cosyvoice3") {
       result = ctx->processor->ProcessTTS();
     } else {
       result = ctx->processor->Process();
@@ -596,14 +597,14 @@ RS_API const char *rs_get_backend_name(const rs_context_t *ctx) {
 
 RS_API void rs_set_imatrix_callback(rs_context_t *ctx,
                                      void (*callback)(void *userdata,
-                                                      struct ggml_cgraph *gf),
+                                                      struct ggml_tensor *node),
                                      void *userdata) {
     if (!ctx || !ctx->model) return;
 
-    std::function<void(struct ggml_cgraph *)> cb;
+    std::function<void(struct ggml_tensor *)> cb;
     if (callback) {
-        cb = [callback, userdata](struct ggml_cgraph *gf) {
-            callback(userdata, gf);
+        cb = [callback, userdata](struct ggml_tensor *node) {
+            callback(userdata, node);
         };
     }
 
@@ -613,6 +614,10 @@ RS_API void rs_set_imatrix_callback(rs_context_t *ctx,
     }
     if (auto *funasr = dynamic_cast<FunASRNanoModel *>(ctx->model.get())) {
         funasr->set_imatrix_callback(cb);
+        return;
+    }
+    if (auto *sv = dynamic_cast<SenseVoiceModel *>(ctx->model.get())) {
+        sv->set_imatrix_callback(cb);
         return;
     }
 }

@@ -53,6 +53,9 @@ struct TtsArgs {
   const char *bert_path = nullptr;      // ZH BERT (1024-dim) GGUF, OpenVoice2 ZH
   const char *mbert_path = nullptr;     // multilingual BERT (768-dim) GGUF
   const char *dump_step0 = nullptr;     // CosyVoice3-LLM step-0 logits dump
+  const char *speech_tokenizer_path = nullptr; // CosyVoice3 speech tokenizer GGUF
+  const char *campplus_path = nullptr;         // CosyVoice3 CAM++ speaker GGUF
+  const char *prompt_tokens_bin = nullptr;     // CosyVoice3 prompt-tokens int32 LE blob
   int seed = 42;
   int n_steps = 32;
   int n_threads = 4;
@@ -75,6 +78,11 @@ static void print_usage(const char *prog) {
 	      << "      --ref-text <text>    Transcript of the reference audio\n"
       << "      --bert <path>        ZH BERT GGUF (1024-dim, OpenVoice2 ZH only)\n"
       << "      --mbert <path>       Multilingual BERT GGUF (768-dim)\n"
+      << "      --speech-tokenizer <path>\n"
+      << "                          CosyVoice3 speech tokenizer GGUF (required for --ref)\n"
+      << "      --campplus <path>    CosyVoice3 CAM++ speaker embedding GGUF (required for --ref)\n"
+      << "      --prompt-tokens-bin <path>\n"
+      << "                          CosyVoice3 prompt-tokens int32 LE blob (debug override)\n"
       << "      --instruct <text>    Voice description (default: male)\n"
       << "      --lang <lang>        Target language (default: English)\n"
       << "      --seed <n>           Random seed (default: 42)\n"
@@ -105,6 +113,12 @@ static bool parse_args(int argc, char **argv, TtsArgs &args) {
       args.bert_path = argv[++i];
     } else if (a == "--mbert" && i + 1 < argc) {
       args.mbert_path = argv[++i];
+    } else if (a == "--speech-tokenizer" && i + 1 < argc) {
+      args.speech_tokenizer_path = argv[++i];
+    } else if (a == "--campplus" && i + 1 < argc) {
+      args.campplus_path = argv[++i];
+    } else if (a == "--prompt-tokens-bin" && i + 1 < argc) {
+      args.prompt_tokens_bin = argv[++i];
     } else if (a == "--instruct" && i + 1 < argc) {
       args.instruct = argv[++i];
     } else if (a == "--lang" && i + 1 < argc) {
@@ -207,6 +221,18 @@ int main(int argc, char **argv) {
   if (args.mbert_path && args.mbert_path[0]) {
     set_env_var("RS_MBERT_PATH", args.mbert_path);
     LOG_INFO("mBERT:   %s", args.mbert_path);
+  }
+  if (args.speech_tokenizer_path && args.speech_tokenizer_path[0]) {
+    set_env_var("RS_CV3_SPEECH_TOKENIZER_PATH", args.speech_tokenizer_path);
+    LOG_INFO("CV3 speech tokenizer: %s", args.speech_tokenizer_path);
+  }
+  if (args.campplus_path && args.campplus_path[0]) {
+    set_env_var("RS_CV3_CAMPPLUS_PATH", args.campplus_path);
+    LOG_INFO("CV3 CAM++: %s", args.campplus_path);
+  }
+  if (args.prompt_tokens_bin && args.prompt_tokens_bin[0]) {
+    set_env_var("RS_CV3_PROMPT_TOKENS_BIN", args.prompt_tokens_bin);
+    LOG_INFO("CV3 prompt-tokens bin: %s", args.prompt_tokens_bin);
   }
   if (args.dump_step0 && args.dump_step0[0]) {
     // CosyVoice3-LLM reads this env var inside Decode (Phase-2 debug hook).
