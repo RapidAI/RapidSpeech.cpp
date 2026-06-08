@@ -129,10 +129,10 @@ static bool parse_args(int argc, char **argv, ImatrixArgs &args) {
 // Static collector and callback for C API
 static IMatrixCollector *g_collector = nullptr;
 
-static void imatrix_callback(void *userdata, struct ggml_cgraph *gf) {
+static void imatrix_callback(void *userdata, struct ggml_tensor *node) {
     (void)userdata;
     if (g_collector) {
-        g_collector->collect_from_graph(gf);
+        g_collector->collect_node(node);
     }
 }
 

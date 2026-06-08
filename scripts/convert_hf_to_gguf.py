@@ -61,9 +61,18 @@ def write_tensor(writer: GGUFWriter, name: str, data_torch: torch.Tensor, ftype:
     # Convert to numpy
     data = data_torch.detach().float().numpy()
 
-    # Specific type handling for FSMN and specific VAD layers as per reference
+    # FSMN / VAD-specific weights are stored as F16 by convention.
     if 'fsmn_block.weight' in name or name.startswith('_model.'):
         data = data.astype(np.float16)
+    # Keep embedding / lm_head / CTC output projection in F32 even when the
+    # rest of the model is F16: their large-vocab matmul on GPU (Metal/CUDA)
+    # loses precision in the F16 kernel and produces degenerate logits.
+    # Matches rs-quantize's non-K_M skip list (examples/quantize/quantize.cpp).
+    elif (name.endswith("embed_tokens.weight") or
+          name.endswith("lm_head.weight") or
+          name.endswith("ctc.ctc_lo.weight") or
+          name.endswith("ctc_out_linear.weight")):
+        data = data.astype(np.float32)
     elif ftype == GGMLQuantizationType.F16 and data.ndim == 2 and name.endswith(".weight"):
         data = data.astype(np.float16)
     else:
