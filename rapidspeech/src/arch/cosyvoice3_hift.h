@@ -5,6 +5,7 @@
 #include "ggml.h"
 #include "gguf.h"
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <memory>

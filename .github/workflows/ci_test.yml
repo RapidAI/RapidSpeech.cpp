@@ -125,14 +125,16 @@ jobs:
         with:
           cuda: '12.4.0'
           method: 'network'
-          sub-packages: '["nvcc", "cudart-dev"]'
+          sub-packages: '["nvcc", "cudart-dev", "libcublas", "libcublas-dev"]'
 
       - name: Configure only (verify CMake options)
         run: |
           cmake -B build-${{ matrix.backend }} \
                 ${{ matrix.cmake_flags }} \
                 -DRS_BUILD_TESTS=OFF \
-                -DRS_BUILD_CLI=OFF
+                -DRS_BUILD_CLI=OFF \
+                -DGGML_NATIVE=OFF \
+                -DCMAKE_CUDA_ARCHITECTURES="70;75;80;86;89"
 
   python-bindings-test:
     name: Python Bindings (${{ matrix.os }}, Python ${{ matrix.python-version }})
