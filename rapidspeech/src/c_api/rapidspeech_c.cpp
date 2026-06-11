@@ -1,6 +1,7 @@
 #include "core/rs_context.h"
 #include "core/rs_model.h"
 #include "core/rs_processor.h"
+#include "arch/cosyvoice3.h"
 #include "arch/funasr-nano.h"
 #include "arch/omnivoice.h"
 #include "arch/sensevoice.h"
@@ -618,6 +619,10 @@ RS_API void rs_set_imatrix_callback(rs_context_t *ctx,
     }
     if (auto *sv = dynamic_cast<SenseVoiceModel *>(ctx->model.get())) {
         sv->set_imatrix_callback(cb);
+        return;
+    }
+    if (auto *cv3 = dynamic_cast<CosyVoice3LMModel *>(ctx->model.get())) {
+        cv3->set_imatrix_callback(cb);
         return;
     }
 }

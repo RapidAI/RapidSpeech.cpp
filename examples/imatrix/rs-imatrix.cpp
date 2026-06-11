@@ -1,11 +1,15 @@
 /**
  * rs-imatrix — Importance Matrix collection tool for activation-aware quantization.
  *
- * Supports two modes:
+ * Supports three modes:
  *   TTS calibration (OmniVoice): runs built-in calibration sentences through
  *     the model's diffusion + LLM forward and collects activation stats.
  *   ASR calibration (FunASRNano): pushes a list of wav files through the
  *     encoder/CTC/LLM and collects activation stats.
+ *   CV3 calibration (CosyVoice3): runs ~40 zh+en sentences across multiple
+ *     seeds (default 8) through LM + Flow DiT, collecting stats on both.
+ *     Uses the GGUF's baked cv3.default_voice.* tuple by default;
+ *     --voice <baked-voice.gguf> overrides it with an external bake.
  *
  * Mode is auto-detected from the model architecture; --audio-list selects
  * ASR mode explicitly.
@@ -27,6 +31,12 @@
  *       --audio-list  <file>   Text file with one wav path per line
  *       --use-llm              Run the LLM 2nd-pass decoder too (default: off)
  *       --ctc-precheck         Run a CTC precheck before LLM (default: off)
+ *
+ * Options (CosyVoice3):
+ *       --voice       <path>   Optional baked voice GGUF (overrides the
+ *                              unified GGUF's cv3.default_voice.* tuple)
+ *       --n-seeds     <n>      Seeds per sentence (default: 8, ~320 passes total)
+ *       --text-list   <file>   Override built-in 40-sentence corpus
  */
 
 #include "imatrix_collector.h"
@@ -48,7 +58,10 @@ struct ImatrixArgs {
     const char *model_path = nullptr;
     const char *output_path = nullptr;
     const char *audio_list = nullptr;
+    const char *voice_path = nullptr;
+    const char *text_list = nullptr;
     int n_steps = 8;
+    int n_seeds = 8;
     int n_threads = 4;
     bool use_gpu = false;
     bool use_llm = false;
@@ -75,6 +88,57 @@ static const char *kCalibrationTexts[] = {
     "Reading books helps improve vocabulary and comprehension.",
 };
 
+// CosyVoice3 calibration sentences — 20 Chinese + 20 English. Combined with
+// --n-seeds (default 8) the LM + Flow DiT see ~320 forward passes covering
+// short/long, news/dialog/literary, and common phonetic regimes. The pair
+// (language, text) is run as a single tuple.
+struct Cv3Sentence { const char *lang; const char *text; };
+static const Cv3Sentence kCv3Sentences[] = {
+    // ----- Chinese -----
+    {"Chinese", "你好，欢迎使用语音合成系统。"},
+    {"Chinese", "今天天气真不错，适合出去走走。"},
+    {"Chinese", "我们一起去公园散步好吗？"},
+    {"Chinese", "请问最近的地铁站在哪里？"},
+    {"Chinese", "这家餐厅的菜品非常美味，服务也很周到。"},
+    {"Chinese", "人工智能正在改变我们的生活方式。"},
+    {"Chinese", "希望你以后能够做得比我还好。"},
+    {"Chinese", "春天来了，柳树发芽，花儿盛开。"},
+    {"Chinese", "他用一辈子的努力，证明了知识可以改变命运。"},
+    {"Chinese", "孩子们在操场上欢快地奔跑、追逐、嬉戏。"},
+    {"Chinese", "经过仔细分析，我们决定采用第二个方案。"},
+    {"Chinese", "明天上午九点的会议改到下午三点举行。"},
+    {"Chinese", "国家发展改革委发布了新一轮的产业政策。"},
+    {"Chinese", "这本书讲述了一位年轻科学家的成长故事。"},
+    {"Chinese", "无论遇到什么困难，都不要轻易放弃自己的梦想。"},
+    {"Chinese", "深夜的城市，霓虹闪烁，街道空旷得让人有些恍惚。"},
+    {"Chinese", "他端起茶杯，轻轻抿了一口，眼神望向窗外。"},
+    {"Chinese", "音乐响起的那一刻，所有人都静静地坐了下来。"},
+    {"Chinese", "一二三四五六七八九十，百千万亿。"},
+    {"Chinese", "二零二六年六月十二日，星期五。"},
+
+    // ----- English -----
+    {"English", "Hello, welcome to the speech synthesis system."},
+    {"English", "The weather today is wonderful for a walk in the park."},
+    {"English", "Could you please tell me where the nearest subway station is?"},
+    {"English", "This restaurant has delicious food and excellent service."},
+    {"English", "Artificial intelligence is transforming the way we live and work."},
+    {"English", "I hope that one day you will surpass even my best work."},
+    {"English", "Spring has arrived; the willows are budding and flowers are blooming."},
+    {"English", "He spent his entire life proving that knowledge can change destiny."},
+    {"English", "Children were running, chasing, and laughing on the playground."},
+    {"English", "After careful analysis, we decided to adopt the second proposal."},
+    {"English", "Tomorrow's nine o'clock meeting has been moved to three in the afternoon."},
+    {"English", "The agency announced a new round of industrial development policies."},
+    {"English", "This book tells the story of a young scientist's coming of age."},
+    {"English", "No matter what difficulties you face, never give up on your dreams."},
+    {"English", "Late at night the city's neon lights flicker over empty streets."},
+    {"English", "He raised the teacup, took a small sip, and gazed out the window."},
+    {"English", "The moment the music began, everyone quietly took their seats."},
+    {"English", "One, two, three, four, five, six, seven, eight, nine, ten."},
+    {"English", "On June twelfth, twenty twenty-six, a Friday afternoon."},
+    {"English", "Quantization aware calibration reduces perplexity at the same bit width."},
+};
+
 static void print_usage(const char *prog) {
     std::cerr
         << "Usage:\n"
@@ -90,7 +154,11 @@ static void print_usage(const char *prog) {
         << "ASR (FunASRNano):\n"
         << "      --audio-list  <file>   Text file: one wav path per line\n"
         << "      --use-llm              Also run the 2nd-pass LLM decoder\n"
-        << "      --ctc-precheck         Run CTC precheck before LLM\n"
+        << "      --ctc-precheck         Run CTC precheck before LLM\n\n"
+        << "CosyVoice3:\n"
+        << "      --voice       <path>   Optional baked voice GGUF (overrides GGUF default_voice)\n"
+        << "      --n-seeds     <n>      Seeds per sentence (default: 8, ~320 passes total)\n"
+        << "      --text-list   <file>   Override built-in 40-sentence corpus\n"
         << std::endl;
 }
 
@@ -113,6 +181,12 @@ static bool parse_args(int argc, char **argv, ImatrixArgs &args) {
             args.use_llm = true;
         } else if (a == "--ctc-precheck") {
             args.ctc_precheck = true;
+        } else if (a == "--voice" && i + 1 < argc) {
+            args.voice_path = argv[++i];
+        } else if (a == "--n-seeds" && i + 1 < argc) {
+            args.n_seeds = std::stoi(argv[++i]);
+        } else if (a == "--text-list" && i + 1 < argc) {
+            args.text_list = argv[++i];
         } else if (a == "-h" || a == "--help") {
             print_usage(argv[0]);
             return false;
@@ -245,18 +319,97 @@ static int run_asr(rs_context_t *ctx, const ImatrixArgs &args) {
     return n_success;
 }
 
+static int run_cv3(rs_context_t *ctx, const ImatrixArgs &args,
+                   const std::vector<std::pair<std::string, std::string>> &sentences) {
+    LOG_INFO("CosyVoice3 calibration: %zu sentences × %d seeds = %d forward passes",
+             sentences.size(), args.n_seeds,
+             (int)sentences.size() * args.n_seeds);
+
+    int n_success = 0;
+    int n_total = 0;
+    for (int seed_idx = 0; seed_idx < args.n_seeds; ++seed_idx) {
+        const int seed = 42 + seed_idx * 17;
+        for (size_t i = 0; i < sentences.size(); ++i) {
+            const auto &[lang, text] = sentences[i];
+            ++n_total;
+            LOG_INFO("[%3d/%3d] seed=%d lang=%s text=\"%s\"",
+                     n_total, (int)sentences.size() * args.n_seeds, seed,
+                     lang.c_str(), text.c_str());
+
+            rs_set_tts_params(ctx, "male", lang.c_str(), seed);
+            rs_reset(ctx);
+            if (rs_push_text(ctx, text.c_str()) != RS_OK) {
+                LOG_ERROR("PushText failed at %d", n_total);
+                continue;
+            }
+            bool ok = true;
+            while (true) {
+                int ret = rs_process(ctx);
+                if (ret < 0) { ok = false; break; }
+                if (ret == 0) break;
+                float *chunk = nullptr;
+                while (rs_get_audio_output(ctx, &chunk) > 0) {}
+            }
+            if (ok) n_success++;
+        }
+    }
+    LOG_INFO("CV3 calibration done: %d/%d passes succeeded", n_success, n_total);
+    return n_success;
+}
+
+static std::vector<std::pair<std::string, std::string>>
+load_cv3_sentences(const ImatrixArgs &args) {
+    std::vector<std::pair<std::string, std::string>> out;
+    if (args.text_list) {
+        // Format: "<lang>\t<text>" per line. Lang defaults to English when
+        // no tab present; comment lines start with '#'.
+        std::ifstream in(args.text_list);
+        if (!in) {
+            LOG_ERROR("Failed to open --text-list: %s", args.text_list);
+            return out;
+        }
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            size_t tab = line.find('\t');
+            if (tab == std::string::npos) {
+                out.emplace_back("English", line);
+            } else {
+                out.emplace_back(line.substr(0, tab), line.substr(tab + 1));
+            }
+        }
+        LOG_INFO("Loaded %zu sentences from %s", out.size(), args.text_list);
+    } else {
+        int n = (int)(sizeof(kCv3Sentences) / sizeof(kCv3Sentences[0]));
+        out.reserve((size_t)n);
+        for (int i = 0; i < n; ++i) {
+            out.emplace_back(kCv3Sentences[i].lang, kCv3Sentences[i].text);
+        }
+    }
+    return out;
+}
+
 int main(int argc, char **argv) {
     ImatrixArgs args;
     if (!parse_args(argc, argv, args)) return 1;
 
     const bool asr_mode = args.audio_list != nullptr;
 
+    // CV3 expects its baked voice via env var, which must be set BEFORE
+    // rs_init_from_file (Load reads it). Harmless for non-CV3 archs.
+    if (args.voice_path) {
+        setenv("RS_CV3_VOICE_PATH", args.voice_path, 1);
+    }
+
     LOG_INFO("Importance Matrix Collection Tool");
-    LOG_INFO("Mode: %s", asr_mode ? "ASR" : "TTS");
+    LOG_INFO("Mode: %s", asr_mode ? "ASR" : "TTS/CV3");
     LOG_INFO("Model: %s", args.model_path);
     LOG_INFO("Output: %s", args.output_path);
     LOG_INFO("Threads: %d  GPU: %s",
              args.n_threads, args.use_gpu ? "ON" : "OFF");
+    if (args.voice_path) {
+        LOG_INFO("Voice (CV3): %s", args.voice_path);
+    }
 
     // ---- Init via C API ----
     rs_init_params_t params = rs_default_params();
@@ -276,6 +429,12 @@ int main(int argc, char **argv) {
     LOG_INFO("Arch: %s  SampleRate: %d  Backend: %s",
              meta.arch_name, meta.audio_sample_rate, rs_get_backend_name(ctx));
 
+    const bool cv3_mode = !asr_mode &&
+        std::string(meta.arch_name).rfind("cosyvoice3", 0) == 0;
+    if (cv3_mode && !args.voice_path) {
+        LOG_INFO("CV3: using GGUF baked default_voice (no --voice override)");
+    }
+
     // ---- Setup collector and hook ----
     IMatrixCollector collector;
     g_collector = &collector;
@@ -283,7 +442,14 @@ int main(int argc, char **argv) {
 
     // ---- Run calibration ----
     auto t_start = std::chrono::steady_clock::now();
-    int n_success = asr_mode ? run_asr(ctx, args) : run_tts(ctx, args);
+    int n_success;
+    if (asr_mode) {
+        n_success = run_asr(ctx, args);
+    } else if (cv3_mode) {
+        n_success = run_cv3(ctx, args, load_cv3_sentences(args));
+    } else {
+        n_success = run_tts(ctx, args);
+    }
     auto t_end = std::chrono::steady_clock::now();
     float elapsed =
         std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count() / 1000.0f;

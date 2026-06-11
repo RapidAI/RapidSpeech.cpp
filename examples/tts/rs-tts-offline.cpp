@@ -56,6 +56,8 @@ struct TtsArgs {
   const char *speech_tokenizer_path = nullptr; // CosyVoice3 speech tokenizer GGUF
   const char *campplus_path = nullptr;         // CosyVoice3 CAM++ speaker GGUF
   const char *prompt_tokens_bin = nullptr;     // CosyVoice3 prompt-tokens int32 LE blob
+  const char *voice_path = nullptr;            // CosyVoice3 pre-baked voice GGUF
+  const char *save_voice_path = nullptr;       // CosyVoice3 voice bake output GGUF
   int seed = 42;
   int n_steps = 32;
   int n_threads = 4;
@@ -83,6 +85,8 @@ static void print_usage(const char *prog) {
       << "      --campplus <path>    CosyVoice3 CAM++ speaker embedding GGUF (required for --ref)\n"
       << "      --prompt-tokens-bin <path>\n"
       << "                          CosyVoice3 prompt-tokens int32 LE blob (debug override)\n"
+      << "      --voice <path>       CosyVoice3 pre-baked voice GGUF (replaces --ref, no tokenizer/CAM++ needed)\n"
+      << "      --save-voice <path>  CosyVoice3: bake the resolved voice tuple to this GGUF for later reuse\n"
       << "      --instruct <text>    Voice description (default: male)\n"
       << "      --lang <lang>        Target language (default: English)\n"
       << "      --seed <n>           Random seed (default: 42)\n"
@@ -119,6 +123,10 @@ static bool parse_args(int argc, char **argv, TtsArgs &args) {
       args.campplus_path = argv[++i];
     } else if (a == "--prompt-tokens-bin" && i + 1 < argc) {
       args.prompt_tokens_bin = argv[++i];
+    } else if (a == "--voice" && i + 1 < argc) {
+      args.voice_path = argv[++i];
+    } else if (a == "--save-voice" && i + 1 < argc) {
+      args.save_voice_path = argv[++i];
     } else if (a == "--instruct" && i + 1 < argc) {
       args.instruct = argv[++i];
     } else if (a == "--lang" && i + 1 < argc) {
@@ -233,6 +241,14 @@ int main(int argc, char **argv) {
   if (args.prompt_tokens_bin && args.prompt_tokens_bin[0]) {
     set_env_var("RS_CV3_PROMPT_TOKENS_BIN", args.prompt_tokens_bin);
     LOG_INFO("CV3 prompt-tokens bin: %s", args.prompt_tokens_bin);
+  }
+  if (args.voice_path && args.voice_path[0]) {
+    set_env_var("RS_CV3_VOICE_PATH", args.voice_path);
+    LOG_INFO("CV3 voice (reuse): %s", args.voice_path);
+  }
+  if (args.save_voice_path && args.save_voice_path[0]) {
+    set_env_var("RS_CV3_SAVE_VOICE_PATH", args.save_voice_path);
+    LOG_INFO("CV3 voice (bake to): %s", args.save_voice_path);
   }
   if (args.dump_step0 && args.dump_step0[0]) {
     // CosyVoice3-LLM reads this env var inside Decode (Phase-2 debug hook).
