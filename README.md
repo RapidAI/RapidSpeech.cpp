@@ -109,7 +109,7 @@ cmake --build build --config Release
 
 Build artifacts are located in the `build/` directory:
 - `rs-asr-offline` — Offline ASR command-line tool
-- `rs-asr-online` — Online (streaming) ASR command-line tool
+- `rs-asr-vad-online` — VAD-segmented quasi-streaming ASR command-line tool
 - `rs-tts-offline` — Offline TTS command-line tool
 - `rs-quantize` — Model quantization tool
 
@@ -154,12 +154,12 @@ Parameters:
 | `--silence-ms` | Silence duration to split segments (ms) | 600 |
 | `--max-segment-s` | Max segment length for ASR input (seconds) | 30.0 |
 
-#### Online / Streaming Recognition (rs-asr-online)
+#### VAD-Segmented Quasi-Streaming Recognition (rs-asr-vad-online)
 
 **WAV file (simulate streaming):**
 
 ```bash
-./build/rs-asr-online \
+./build/rs-asr-vad-online \
   -m /path/to/funasr-nano-fp16.gguf \
   -v /path/to/silero_vad_v6.gguf \
   -w /path/to/audio.wav \
@@ -171,7 +171,7 @@ Parameters:
 **Microphone (live mode):**
 
 ```bash
-./build/rs-asr-online \
+./build/rs-asr-vad-online \
   -m /path/to/funasr-nano-fp16.gguf \
   -v /path/to/silero_vad_v6.gguf \
   --mic \
@@ -181,7 +181,7 @@ Parameters:
 **Two-pass mode (CTC fast pass + LLM rescoring, FunASR-Nano only):**
 
 ```bash
-./build/rs-asr-online \
+./build/rs-asr-vad-online \
   -m /path/to/funasr-nano-fp16.gguf \
   -v /path/to/silero_vad_v6.gguf \
   -w /path/to/audio.wav \
@@ -420,7 +420,7 @@ underlying API surface.
 | 🐍 **Python** | `pip install rapidspeech` → offline / online ASR (with neural VAD, 2-pass LLM rescoring), offline / streaming TTS, voice cloning | [`python-api-examples/README.md`](python-api-examples/README.md) |
 | 🌐 **Browser (WebAssembly)** | Three-tab demo: offline ASR, mic-driven online ASR, offline TTS. Runs locally with WebGPU + pthreads | [`wasm-examples/README.md`](wasm-examples/README.md) |
 | 🟩 **Node.js** | CLI built on the same WASM module: file → ASR (with optional VAD + 2-pass), text → TTS (with voice cloning) | [`node-api-example/README.md`](node-api-example/README.md) |
-| 💻 **C++ CLI** | `rs-asr-offline` / `rs-asr-online` / `rs-tts-offline` / `rs-quantize` | this README (sections above) |
+| 💻 **C++ CLI** | `rs-asr-offline` / `rs-asr-vad-online` / `rs-tts-offline` / `rs-quantize` | this README (sections above) |
 | ☁️ **Colab notebook** | Build the CLI on a free T4, run ASR/TTS, use the Python API end-to-end | [`colab/README.md`](colab/README.md) |
 | 🤗 **HuggingFace Space** | Deploy the browser demo as a Docker-SDK Space (COOP/COEP-ready) | [`huggingface-space/HOWTO.md`](huggingface-space/HOWTO.md) |
 
@@ -472,7 +472,7 @@ python scripts/convert_hf_to_gguf.py \
 
 ### Silero VAD Model (safetensors → GGUF)
 
-To convert the Silero VAD model for use with `rs-asr-online` or offline VAD segmentation:
+To convert the Silero VAD model for use with `rs-asr-vad-online` or offline VAD segmentation:
 
 ```bash
 python scripts/convert_silero_to_gguf.py \

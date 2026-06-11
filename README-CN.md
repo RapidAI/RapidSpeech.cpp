@@ -58,6 +58,7 @@
 - [x] OmniVoice（单阶段非自回归扩散 TTS，多语种 + 声音克隆）
 - [ ] CosyVoice3
 - [ ] Qwen3-TTS
+- [ ] MOSS‑TTS‑Realtime
 
 ------
 
@@ -107,7 +108,7 @@ cmake --build build --config Release
 
 构建产物位于 `build/` 目录：
 - `rs-asr-offline` — 离线 ASR 命令行工具
-- `rs-asr-online` — 在线（流式）ASR 命令行工具
+- `rs-asr-vad-online` — VAD 切段的伪流式 ASR 命令行工具
 - `rs-tts-offline` — 离线 TTS 命令行工具
 - `rs-quantize` — 模型量化工具
 
@@ -152,12 +153,12 @@ cmake --build build --config Release
 | `--silence-ms` | 静默时长超过该值则切分段落（ms） | 600 |
 | `--max-segment-s` | ASR 输入的最大分段长度（秒） | 30.0 |
 
-#### 在线/流式识别（rs-asr-online）
+#### VAD 切段伪流式识别（rs-asr-vad-online）
 
 **WAV 文件（模拟流式）：**
 
 ```bash
-./build/rs-asr-online \
+./build/rs-asr-vad-online \
   -m /path/to/funasr-nano-fp16.gguf \
   -v /path/to/silero_vad_v6.gguf \
   -w /path/to/audio.wav \
@@ -169,7 +170,7 @@ cmake --build build --config Release
 **麦克风实时识别：**
 
 ```bash
-./build/rs-asr-online \
+./build/rs-asr-vad-online \
   -m /path/to/funasr-nano-fp16.gguf \
   -v /path/to/silero_vad_v6.gguf \
   --mic \
@@ -179,7 +180,7 @@ cmake --build build --config Release
 **两遍模式（CTC 快速解码 + LLM 重打分，仅 FunASR-Nano 支持）：**
 
 ```bash
-./build/rs-asr-online \
+./build/rs-asr-vad-online \
   -m /path/to/funasr-nano-fp16.gguf \
   -v /path/to/silero_vad_v6.gguf \
   -w /path/to/audio.wav \
@@ -416,7 +417,7 @@ for chunk in chunks:
 | 🐍 **Python** | `pip install rapidspeech` → 离线 / 流式 ASR（神经 VAD + 2-pass LLM 重打分）、离线 / 流式 TTS、声音克隆 | [`python-api-examples/README.md`](python-api-examples/README.md) |
 | 🌐 **浏览器（WebAssembly）** | 三标签页演示：离线 ASR、麦克风在线 ASR、离线 TTS。本地运行，WebGPU + pthreads | [`wasm-examples/README.md`](wasm-examples/README.md) |
 | 🟩 **Node.js** | 复用 WASM 模块的 CLI：文件 → ASR（可选 VAD + 2-pass）、文本 → TTS（可选声音克隆） | [`node-api-example/README.md`](node-api-example/README.md) |
-| 💻 **C++ CLI** | `rs-asr-offline` / `rs-asr-online` / `rs-tts-offline` / `rs-quantize` | 本 README 上方章节 |
+| 💻 **C++ CLI** | `rs-asr-offline` / `rs-asr-vad-online` / `rs-tts-offline` / `rs-quantize` | 本 README 上方章节 |
 | ☁️ **Colab Notebook** | 在免费 T4 上编译 CLI、跑 ASR/TTS、使用 Python API 全流程 | [`colab/README.md`](colab/README.md) |
 | 🤗 **HuggingFace Space** | 以 Docker SDK 部署浏览器 demo（自动配好 COOP/COEP） | [`huggingface-space/HOWTO.md`](huggingface-space/HOWTO.md) |
 
@@ -468,7 +469,7 @@ python scripts/convert_hf_to_gguf.py \
 
 ### Silero VAD 模型（safetensors → GGUF）
 
-用于 `rs-asr-online` 或离线 VAD 分段的 Silero VAD 模型转换：
+用于 `rs-asr-vad-online` 或离线 VAD 分段的 Silero VAD 模型转换：
 
 ```bash
 python scripts/convert_silero_to_gguf.py \
