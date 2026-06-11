@@ -125,7 +125,13 @@ jobs:
         with:
           cuda: '12.4.0'
           method: 'network'
-          sub-packages: '["nvcc", "cudart-dev", "libcublas", "libcublas-dev"]'
+          sub-packages: '["nvcc", "cudart-dev"]'
+
+      - name: Install cuBLAS (Linux)
+        if: matrix.backend == 'cuda'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcublas-12-4 libcublas-dev-12-4
 
       - name: Configure only (verify CMake options)
         run: |
