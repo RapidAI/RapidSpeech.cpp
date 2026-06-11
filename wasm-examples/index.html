@@ -32,6 +32,7 @@
       <button class="tab-btn active" data-tab="asr-offline">ASR Offline</button>
       <button class="tab-btn"        data-tab="asr-online">ASR Online</button>
       <button class="tab-btn"        data-tab="tts-offline">TTS Offline</button>
+      <button class="tab-btn"        data-tab="kws">KWS</button>
     </nav>
 
     <!-- ─── ASR Offline ─────────────────────────────────────── -->
@@ -279,8 +280,79 @@
       </div>
     </section>
 
+    <!-- ─── KWS (Wake word) ─────────────────────────────────── -->
+    <section data-page="kws" hidden>
+      <div class="card">
+        <div class="card-title">Model (SenseVoice GGUF)</div>
+        <div class="form-row">
+          <label>Model URL</label>
+          <input type="text" data-id="model-url"
+                 placeholder="https://huggingface.co/RapidAI/RapidSpeech/resolve/main/ASR/SenseVoice/sensevoice-small-q4_k_m.gguf"
+                 value="https://huggingface.co/RapidAI/RapidSpeech/resolve/main/ASR/SenseVoice/sensevoice-small-q4_k_m.gguf"
+          >
+        </div>
+        <div class="form-row">
+          <label>Threads</label>
+          <input type="number" data-id="n-threads" value="2" min="1" max="8">
+        </div>
+        <div class="progress-container" data-id="progress-container">
+          <div class="progress-track"><div class="progress-fill" data-id="progress-bar"></div></div>
+          <div class="progress-info" data-id="progress-info"></div>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-load" data-id="load-btn">Load Model</button>
+        </div>
+        <div class="status idle" data-id="status">Paste keywords + enter a SenseVoice URL, then Load.</div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Keywords
+          (one per line — sherpa-onnx format:
+           <code>tok-id tok-id … [:boost] [#threshold] [@phrase]</code>;
+           generate with <code>scripts/sensevoice_tokenize.py</code>)</div>
+        <div class="form-row">
+          <label style="min-width: 110px;">keywords.txt</label>
+          <textarea data-id="keywords" rows="6" style="flex:1;font-family:ui-monospace,Menlo,monospace;"
+                    placeholder="14225 4096 11362 11540 @你好小智"
+                    value="小 爱 同 学 #0.35 @小爱同学\nHe y ▁Si ri #0.35 @Hey_Siri\n你 好 问 问 #0.35 @你好问问"></textarea>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Tuning</div>
+        <div class="form-row">
+          <label>Window (ms)</label>
+          <input type="number" data-id="window-ms" value="1600" min="400" max="6000" step="100">
+          <label style="min-width: 80px;">Hop (ms)</label>
+          <input type="number" data-id="hop-ms" value="200" min="80" max="1000" step="20">
+          <label style="min-width: 110px;">Debounce (ms)</label>
+          <input type="number" data-id="debounce-ms" value="1500" min="0" max="5000" step="100">
+        </div>
+        <div class="form-row">
+          <label>Default threshold</label>
+          <input type="range" data-id="threshold" min="0" max="0.95" step="0.01" value="0">
+          <span class="range-value" data-id="threshold-val">0.00</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Microphone</div>
+        <div class="btn-row">
+          <button class="btn btn-primary"   data-id="start-btn" disabled>Start</button>
+          <button class="btn btn-secondary" data-id="stop-btn"  disabled>Stop</button>
+          <button class="btn btn-ghost"     data-id="clear-btn">Clear</button>
+          <span class="vad-info" data-id="info" style="flex:1;"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Hits</div>
+        <div class="transcript" data-id="hits"></div>
+      </div>
+    </section>
+
     <div class="footer">
-      <a href="https://github.com/lovemefan/RapidSpeech.cpp" target="_blank">RapidSpeech.cpp</a>
+      <a href="https://github.com/RapidAI/RapidSpeech.cpp" target="_blank">RapidSpeech.cpp</a>
       &mdash; GGUF speech models, in your browser.
     </div>
   </div>
@@ -294,6 +366,7 @@
   <script src="pages/asr-offline.js"></script>
   <script src="pages/asr-online.js"></script>
   <script src="pages/tts-offline.js"></script>
+  <script src="pages/kws.js"></script>
   <!-- Tab router -->
   <script src="app.js"></script>
 </body>
