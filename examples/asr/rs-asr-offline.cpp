@@ -5,17 +5,31 @@
  *   WAV file
  *     → VAD segmentation (Silero or FireRed, auto-detected from GGUF arch)
  *       → Per-segment ASR inference (FunASR-Nano / SenseVoice)
- *         → Timestamped transcription output
+ *       → Per-segment CAMPPlus speaker embedding + clustering (optional)
+ *         → Timestamped transcription output with speaker labels
  *
  * Usage:
  *   rs-asr-offline -m <asr.gguf> -w <audio.wav> [options]
  *   rs-asr-offline -m <asr.gguf> -w <audio.wav> -v <vad.gguf> [options]
+ *   rs-asr-offline -m <asr.gguf> -w <audio.wav> -v <vad.gguf> \
+ *                  --speaker <campplus.gguf> [options]
  *
  * Options:
  *   -m, --model <path>       ASR model path (required)
  *   -w, --wav <path>         WAV file path (required)
  *   -v, --vad <path>         VAD GGUF path — Silero or FireRed
  *                            (optional, auto-detected from general.architecture)
+ *   -s, --speaker <path>     CAMPPlus speaker model GGUF — enables speaker
+ *                            diarization, each segment gets a speaker label
+ *       --spk-cluster <m>    Clustering method: spectral | ahc
+ *                            (default: spectral — auto speaker count via
+ *                            max eigengap, no threshold needed)
+ *       --spk-threshold <f>  AHC cosine similarity threshold; higher → more
+ *                            speakers (ahc only, default: 0.5)
+ *       --num-speakers <n>   Fixed (oracle) number of speakers, skips auto
+ *                            estimation (default: auto)
+ *       --max-speakers <n>   Max speakers for spectral auto estimation
+ *                            (default: 10)
  *   -t, --threads <n>        CPU threads (default: 4)
  *       --gpu <true|false>   Enable GPU acceleration (default: true)
  *       --vad-threshold <f>  VAD speech probability threshold (default: 0.5)
@@ -52,6 +66,8 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <limits>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -123,6 +139,7 @@ struct OfflineArgs {
   const char *model_path = nullptr;
   const char *wav_path = nullptr;
   const char *vad_path = nullptr;
+  const char *speaker_path = nullptr;
   int n_threads = 4;
   bool use_gpu = true;
   float vad_threshold = 0.5f;
@@ -131,6 +148,10 @@ struct OfflineArgs {
   int preroll_ms = 0;
   float prob_smooth = 0.3f;
   float max_segment_s = 30.0f;
+  std::string spk_cluster = "spectral"; // spectral | ahc
+  float spk_threshold = 0.5f;           // ahc only
+  int num_speakers = 0;                 // 0 = auto
+  int max_speakers = 10;                // spectral auto estimation cap
 };
 
 static bool parse_bool(const std::string &v) {
@@ -147,6 +168,17 @@ static void print_usage(const char *prog) {
       << "  -v, --vad <path>         VAD GGUF path — Silero or FireRed\n"
       << "                           (optional, auto-detected from "
          "general.architecture)\n"
+      << "  -s, --speaker <path>     CAMPPlus speaker model GGUF — enables\n"
+         "                           speaker diarization per segment\n"
+      << "      --spk-cluster <m>    Clustering method: spectral | ahc\n"
+         "                           (default: spectral — auto speaker count\n"
+         "                           via max eigengap, no threshold needed)\n"
+      << "      --spk-threshold <f>  AHC cosine similarity threshold; higher\n"
+         "                           → more speakers (ahc only, default: 0.5)\n"
+      << "      --num-speakers <n>   Fixed (oracle) number of speakers, skips\n"
+         "                           auto estimation (default: auto)\n"
+      << "      --max-speakers <n>   Max speakers for spectral auto\n"
+         "                           estimation (default: 10)\n"
       << "  -t, --threads <n>        CPU threads (default: 4)\n"
       << "      --gpu <true|false>   Enable GPU acceleration (default: true)\n"
       << "      --vad-threshold <f>  VAD speech probability threshold "
@@ -174,6 +206,20 @@ static bool parse_args(int argc, char **argv, OfflineArgs &args) {
       args.wav_path = argv[++i];
     } else if ((a == "-v" || a == "--vad") && i + 1 < argc) {
       args.vad_path = argv[++i];
+    } else if ((a == "-s" || a == "--speaker") && i + 1 < argc) {
+      args.speaker_path = argv[++i];
+    } else if (a == "--spk-cluster" && i + 1 < argc) {
+      args.spk_cluster = argv[++i];
+      if (args.spk_cluster != "spectral" && args.spk_cluster != "ahc") {
+        std::cerr << "Error: --spk-cluster must be 'spectral' or 'ahc'\n";
+        return false;
+      }
+    } else if (a == "--spk-threshold" && i + 1 < argc) {
+      args.spk_threshold = std::stof(argv[++i]);
+    } else if (a == "--num-speakers" && i + 1 < argc) {
+      args.num_speakers = std::stoi(argv[++i]);
+    } else if (a == "--max-speakers" && i + 1 < argc) {
+      args.max_speakers = std::stoi(argv[++i]);
     } else if ((a == "-t" || a == "--threads") && i + 1 < argc) {
       args.n_threads = std::stoi(argv[++i]);
     } else if (a == "--gpu" && i + 1 < argc) {
@@ -449,6 +495,421 @@ firered_segment(const std::vector<float> &pcm, FireRedVadModel &vad_model,
 }
 
 // ─────────────────────────────────────────────────────
+// Speaker clustering: agglomerative hierarchical clustering with
+// average linkage on cosine similarity.
+//
+// num_speakers > 0 — merge until exactly that many clusters remain.
+// num_speakers = 0 — merge while the best pair's average similarity
+//                    is >= threshold (auto speaker count).
+// Returns one label per embedding; labels are renumbered in order of
+// first appearance (segment order = time order).
+// ─────────────────────────────────────────────────────
+static std::vector<int>
+cluster_speaker_embeddings(const std::vector<std::vector<float>> &embs,
+                           int dim, float threshold, int num_speakers) {
+  const int n = (int)embs.size();
+  std::vector<int> labels(n, 0);
+  if (n <= 1)
+    return labels;
+
+  std::vector<float> sim((size_t)n * n, 1.0f);
+  for (int i = 0; i < n; ++i) {
+    for (int j = i + 1; j < n; ++j) {
+      float c = rs_speaker_cosine(embs[i].data(), embs[j].data(), dim);
+      sim[(size_t)i * n + j] = c;
+      sim[(size_t)j * n + i] = c;
+    }
+  }
+
+  std::vector<std::vector<int>> clusters(n);
+  for (int i = 0; i < n; ++i)
+    clusters[i] = {i};
+
+  auto avg_link = [&](const std::vector<int> &a, const std::vector<int> &b) {
+    double s = 0.0;
+    for (int i : a)
+      for (int j : b)
+        s += sim[(size_t)i * n + j];
+    return (float)(s / ((double)a.size() * (double)b.size()));
+  };
+
+  while ((int)clusters.size() > 1) {
+    float best = -2.0f;
+    int bi = -1, bj = -1;
+    for (size_t i = 0; i < clusters.size(); ++i) {
+      for (size_t j = i + 1; j < clusters.size(); ++j) {
+        float s = avg_link(clusters[i], clusters[j]);
+        if (s > best) {
+          best = s;
+          bi = (int)i;
+          bj = (int)j;
+        }
+      }
+    }
+    bool do_merge = (num_speakers > 0)
+                        ? ((int)clusters.size() > num_speakers)
+                        : (best >= threshold);
+    if (!do_merge)
+      break;
+    clusters[bi].insert(clusters[bi].end(), clusters[bj].begin(),
+                        clusters[bj].end());
+    clusters.erase(clusters.begin() + bj);
+  }
+
+  std::sort(clusters.begin(), clusters.end(),
+            [](const std::vector<int> &a, const std::vector<int> &b) {
+              return *std::min_element(a.begin(), a.end()) <
+                     *std::min_element(b.begin(), b.end());
+            });
+  for (size_t k = 0; k < clusters.size(); ++k)
+    for (int idx : clusters[k])
+      labels[idx] = (int)k;
+  return labels;
+}
+
+// ─────────────────────────────────────────────────────
+// Spectral clustering — port of 3D-Speaker's SpectralCluster
+// (speakerlab/process/cluster.py, itself adapted from speechbrain).
+//
+// Pipeline: cosine affinity → p-pruning (keep top-p per row) →
+// symmetrize → unnormalized Laplacian → eigendecomposition →
+// speaker count = max eigengap among smallest eigenvalues (or oracle)
+// → k-means on the first num_spk eigenvectors.
+//
+// No similarity threshold needed; speaker count is auto-estimated.
+// ─────────────────────────────────────────────────────
+
+// Cyclic Jacobi eigendecomposition of a symmetric matrix A (n×n,
+// row-major; destroyed). Outputs eigenvalues ascending in `w` and
+// eigenvectors as columns of `V` (V[i*n+k] = i-th component of the
+// k-th eigenvector). O(n^3) per sweep — fine for n = segment count.
+static void jacobi_eigh(std::vector<double> &A, int n, std::vector<double> &w,
+                        std::vector<double> &V) {
+  V.assign((size_t)n * n, 0.0);
+  for (int i = 0; i < n; ++i)
+    V[(size_t)i * n + i] = 1.0;
+
+  double frob2 = 0.0;
+  for (size_t i = 0; i < A.size(); ++i)
+    frob2 += A[i] * A[i];
+  const double tol = 1e-12 * std::max(1.0, frob2);
+
+  for (int sweep = 0; sweep < 100; ++sweep) {
+    double off = 0.0;
+    for (int p = 0; p < n; ++p)
+      for (int q = p + 1; q < n; ++q)
+        off += A[(size_t)p * n + q] * A[(size_t)p * n + q];
+    if (off < tol)
+      break;
+
+    for (int p = 0; p < n; ++p) {
+      for (int q = p + 1; q < n; ++q) {
+        const double apq = A[(size_t)p * n + q];
+        if (std::fabs(apq) < 1e-300)
+          continue;
+        const double app = A[(size_t)p * n + p];
+        const double aqq = A[(size_t)q * n + q];
+        const double theta = (aqq - app) / (2.0 * apq);
+        const double t = (theta >= 0.0 ? 1.0 : -1.0) /
+                         (std::fabs(theta) + std::sqrt(theta * theta + 1.0));
+        const double c = 1.0 / std::sqrt(t * t + 1.0);
+        const double s = t * c;
+
+        // A ← Jᵀ·A·J applied as two passes (columns, then rows).
+        for (int k = 0; k < n; ++k) {
+          const double akp = A[(size_t)k * n + p];
+          const double akq = A[(size_t)k * n + q];
+          A[(size_t)k * n + p] = c * akp - s * akq;
+          A[(size_t)k * n + q] = s * akp + c * akq;
+        }
+        for (int k = 0; k < n; ++k) {
+          const double apk = A[(size_t)p * n + k];
+          const double aqk = A[(size_t)q * n + k];
+          A[(size_t)p * n + k] = c * apk - s * aqk;
+          A[(size_t)q * n + k] = s * apk + c * aqk;
+        }
+        for (int k = 0; k < n; ++k) {
+          const double vkp = V[(size_t)k * n + p];
+          const double vkq = V[(size_t)k * n + q];
+          V[(size_t)k * n + p] = c * vkp - s * vkq;
+          V[(size_t)k * n + q] = s * vkp + c * vkq;
+        }
+      }
+    }
+  }
+
+  w.resize(n);
+  for (int i = 0; i < n; ++i)
+    w[i] = A[(size_t)i * n + i];
+
+  std::vector<int> order(n);
+  for (int i = 0; i < n; ++i)
+    order[i] = i;
+  std::sort(order.begin(), order.end(),
+            [&](int a, int b) { return w[a] < w[b]; });
+
+  std::vector<double> w_sorted(n);
+  std::vector<double> V_sorted((size_t)n * n);
+  for (int k = 0; k < n; ++k) {
+    w_sorted[k] = w[order[k]];
+    for (int i = 0; i < n; ++i)
+      V_sorted[(size_t)i * n + k] = V[(size_t)i * n + order[k]];
+  }
+  w = std::move(w_sorted);
+  V = std::move(V_sorted);
+}
+
+// k-means with k-means++ seeding on row-major X (n × d).
+// Runs n_init restarts, keeps the labeling with the lowest inertia.
+static std::vector<int> kmeans_cluster(const std::vector<double> &X, int n,
+                                       int d, int k) {
+  std::vector<int> best_labels(n, 0);
+  if (k <= 1 || n <= 1)
+    return best_labels;
+  k = std::min(k, n);
+
+  std::mt19937 rng(42); // deterministic CLI output
+  const int n_init = 10;
+  const int max_iter = 100;
+  double best_inertia = std::numeric_limits<double>::max();
+
+  auto dist2 = [&](const double *a, const double *b) {
+    double s = 0.0;
+    for (int j = 0; j < d; ++j) {
+      const double diff = a[j] - b[j];
+      s += diff * diff;
+    }
+    return s;
+  };
+
+  std::vector<double> centers((size_t)k * d);
+  std::vector<double> min_d2(n);
+  std::vector<int> labels(n);
+  std::vector<int> counts(k);
+
+  for (int init = 0; init < n_init; ++init) {
+    // k-means++ seeding
+    std::uniform_int_distribution<int> uni(0, n - 1);
+    int first = uni(rng);
+    std::copy(X.begin() + (size_t)first * d, X.begin() + (size_t)(first + 1) * d,
+              centers.begin());
+    for (int i = 0; i < n; ++i)
+      min_d2[i] = dist2(&X[(size_t)i * d], &centers[0]);
+
+    for (int c = 1; c < k; ++c) {
+      double total = 0.0;
+      for (int i = 0; i < n; ++i)
+        total += min_d2[i];
+      int chosen;
+      if (total <= 0.0) {
+        chosen = uni(rng);
+      } else {
+        std::uniform_real_distribution<double> ur(0.0, total);
+        double r = ur(rng), acc = 0.0;
+        chosen = n - 1;
+        for (int i = 0; i < n; ++i) {
+          acc += min_d2[i];
+          if (acc >= r) {
+            chosen = i;
+            break;
+          }
+        }
+      }
+      std::copy(X.begin() + (size_t)chosen * d,
+                X.begin() + (size_t)(chosen + 1) * d,
+                centers.begin() + (size_t)c * d);
+      for (int i = 0; i < n; ++i)
+        min_d2[i] =
+            std::min(min_d2[i], dist2(&X[(size_t)i * d], &centers[(size_t)c * d]));
+    }
+
+    // Lloyd iterations
+    std::fill(labels.begin(), labels.end(), -1);
+    for (int iter = 0; iter < max_iter; ++iter) {
+      bool changed = false;
+      for (int i = 0; i < n; ++i) {
+        int best_c = 0;
+        double best_d = std::numeric_limits<double>::max();
+        for (int c = 0; c < k; ++c) {
+          const double dd = dist2(&X[(size_t)i * d], &centers[(size_t)c * d]);
+          if (dd < best_d) {
+            best_d = dd;
+            best_c = c;
+          }
+        }
+        if (labels[i] != best_c) {
+          labels[i] = best_c;
+          changed = true;
+        }
+      }
+      if (!changed)
+        break;
+
+      std::fill(centers.begin(), centers.end(), 0.0);
+      std::fill(counts.begin(), counts.end(), 0);
+      for (int i = 0; i < n; ++i) {
+        counts[labels[i]]++;
+        for (int j = 0; j < d; ++j)
+          centers[(size_t)labels[i] * d + j] += X[(size_t)i * d + j];
+      }
+      for (int c = 0; c < k; ++c) {
+        if (counts[c] > 0) {
+          for (int j = 0; j < d; ++j)
+            centers[(size_t)c * d + j] /= (double)counts[c];
+        } else {
+          // Empty cluster: re-seed from the point farthest from its center.
+          int far_i = 0;
+          double far_d = -1.0;
+          for (int i = 0; i < n; ++i) {
+            const double dd =
+                dist2(&X[(size_t)i * d], &centers[(size_t)labels[i] * d]);
+            if (dd > far_d) {
+              far_d = dd;
+              far_i = i;
+            }
+          }
+          std::copy(X.begin() + (size_t)far_i * d,
+                    X.begin() + (size_t)(far_i + 1) * d,
+                    centers.begin() + (size_t)c * d);
+        }
+      }
+    }
+
+    double inertia = 0.0;
+    for (int i = 0; i < n; ++i)
+      inertia += dist2(&X[(size_t)i * d], &centers[(size_t)labels[i] * d]);
+    if (inertia < best_inertia) {
+      best_inertia = inertia;
+      best_labels = labels;
+    }
+  }
+  return best_labels;
+}
+
+// Renumber arbitrary cluster ids so the first-seen segment gets label 0
+// (segment order = time order → "Speaker 1" appears first in output).
+static void renumber_labels(std::vector<int> &labels) {
+  std::vector<int> remap;
+  for (int &l : labels) {
+    int found = -1;
+    for (size_t i = 0; i < remap.size(); ++i) {
+      if (remap[i] == l) {
+        found = (int)i;
+        break;
+      }
+    }
+    if (found < 0) {
+      remap.push_back(l);
+      found = (int)remap.size() - 1;
+    }
+    l = found;
+  }
+}
+
+struct SpectralClusterOpts {
+  int min_num_spks = 1;
+  int max_num_spks = 10;
+  float pval = 0.02f;
+  int min_pnum = 6;
+  int oracle_num = 0; // 0 = auto via max eigengap
+};
+
+static std::vector<int>
+spectral_cluster_embeddings(const std::vector<std::vector<float>> &embs,
+                            int dim, const SpectralClusterOpts &opts) {
+  const int n = (int)embs.size();
+  std::vector<int> labels(n, 0);
+  if (n <= 1)
+    return labels;
+
+  // 1. Cosine affinity matrix
+  std::vector<double> M((size_t)n * n, 1.0);
+  for (int i = 0; i < n; ++i) {
+    for (int j = i + 1; j < n; ++j) {
+      const double c =
+          (double)rs_speaker_cosine(embs[i].data(), embs[j].data(), dim);
+      M[(size_t)i * n + j] = c;
+      M[(size_t)j * n + i] = c;
+    }
+  }
+
+  // 2. p-pruning: per row, zero out the n_elems smallest similarities,
+  //    keeping at least min_pnum entries (mirrors cluster.py p_pruning).
+  int n_elems = (int)((1.0f - opts.pval) * (float)n);
+  n_elems = std::min(n_elems, n - opts.min_pnum);
+  if (n_elems > 0) {
+    std::vector<int> idx(n);
+    for (int i = 0; i < n; ++i) {
+      for (int j = 0; j < n; ++j)
+        idx[j] = j;
+      double *row = &M[(size_t)i * n];
+      std::sort(idx.begin(), idx.end(),
+                [row](int a, int b) { return row[a] < row[b]; });
+      for (int e = 0; e < n_elems; ++e)
+        row[idx[e]] = 0.0;
+    }
+  }
+
+  // 3. Symmetrize: 0.5 * (A + Aᵀ)
+  for (int i = 0; i < n; ++i) {
+    for (int j = i + 1; j < n; ++j) {
+      const double v = 0.5 * (M[(size_t)i * n + j] + M[(size_t)j * n + i]);
+      M[(size_t)i * n + j] = v;
+      M[(size_t)j * n + i] = v;
+    }
+  }
+
+  // 4. Unnormalized Laplacian: L = D − M (diagonal of M zeroed,
+  //    D_i = Σ_j |M_ij|)
+  for (int i = 0; i < n; ++i)
+    M[(size_t)i * n + i] = 0.0;
+  std::vector<double> L((size_t)n * n);
+  for (int i = 0; i < n; ++i) {
+    double deg = 0.0;
+    for (int j = 0; j < n; ++j)
+      deg += std::fabs(M[(size_t)i * n + j]);
+    for (int j = 0; j < n; ++j)
+      L[(size_t)i * n + j] = -M[(size_t)i * n + j];
+    L[(size_t)i * n + i] = deg;
+  }
+
+  // 5. Eigendecomposition (ascending)
+  std::vector<double> w, V;
+  jacobi_eigh(L, n, w, V);
+
+  // 6. Speaker count: oracle, or max eigengap among the smallest
+  //    eigenvalues — argmax over gaps of w[min_spks-1 .. max_spks].
+  int num_spk;
+  if (opts.oracle_num > 0) {
+    num_spk = std::min(opts.oracle_num, n);
+  } else {
+    const int lo = opts.min_num_spks - 1;
+    const int hi = std::min(opts.max_num_spks + 1, n); // exclusive
+    num_spk = opts.min_num_spks;
+    double best_gap = -std::numeric_limits<double>::max();
+    for (int i = lo; i + 1 < hi; ++i) {
+      const double gap = w[i + 1] - w[i];
+      if (gap > best_gap) {
+        best_gap = gap;
+        num_spk = (i - lo) + opts.min_num_spks;
+      }
+    }
+    num_spk = std::max(1, std::min(num_spk, n));
+  }
+
+  // 7. Spectral embeddings: first num_spk eigenvector columns (n × k)
+  std::vector<double> spec_emb((size_t)n * num_spk);
+  for (int i = 0; i < n; ++i)
+    for (int c = 0; c < num_spk; ++c)
+      spec_emb[(size_t)i * num_spk + c] = V[(size_t)i * n + c];
+
+  // 8. k-means
+  labels = kmeans_cluster(spec_emb, n, num_spk, num_spk);
+  renumber_labels(labels);
+  return labels;
+}
+
+// ─────────────────────────────────────────────────────
 // main
 // ─────────────────────────────────────────────────────
 int main(int argc, char **argv) {
@@ -646,12 +1107,93 @@ int main(int argc, char **argv) {
   if (split_count > 0)
     LOG_INFO("Split %d long segment(s) (max %.1fs per segment)", split_count, args.max_segment_s);
 
-  // ── 5. ASR inference per segment ───────────────────────
+  // ── 5. Speaker diarization (if CAMPPlus model provided) ─
   if (filtered.empty()) {
     LOG_INFO("No speech detected in audio");
     rs_free(asr_ctx);
     return 0;
   }
+
+  std::vector<int> spk_labels; // empty = diarization disabled
+  int n_speakers = 0;
+
+  if (args.speaker_path) {
+    LOG_INFO("Speaker model: %s", args.speaker_path);
+
+    rs_speaker_t *sp = rs_speaker_init_from_file(args.speaker_path,
+                                                 args.n_threads, args.use_gpu);
+    if (!sp) {
+      rs_error_info_t err = rs_get_last_error();
+      LOG_ERROR("Speaker model init failed: %s", err.message);
+      rs_free(asr_ctx);
+      return 1;
+    }
+
+    const int spk_dim = rs_speaker_dim(sp);
+    if (args.num_speakers > 0) {
+      LOG_INFO("Speaker embedding: dim=%d  cluster=%s  num-speakers=%d",
+               spk_dim, args.spk_cluster.c_str(), args.num_speakers);
+    } else if (args.spk_cluster == "ahc") {
+      LOG_INFO("Speaker embedding: dim=%d  cluster=ahc  threshold=%.2f",
+               spk_dim, args.spk_threshold);
+    } else {
+      LOG_INFO("Speaker embedding: dim=%d  cluster=spectral  max-speakers=%d",
+               spk_dim, args.max_speakers);
+    }
+
+    std::vector<std::vector<float>> embeddings;
+    embeddings.reserve(filtered.size());
+    bool embed_ok = true;
+
+    auto t_spk0 = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < filtered.size(); ++i) {
+      std::cout << "\r  Speaker embedding: " << (i + 1) << "/"
+                << filtered.size() << std::flush;
+      std::vector<float> emb((size_t)spk_dim, 0.0f);
+      rs_error_t rc = rs_speaker_embed(sp, filtered[i].pcm.data(),
+                                       (int32_t)filtered[i].pcm.size(),
+                                       emb.data(), spk_dim);
+      if (rc != RS_OK) {
+        rs_error_info_t err = rs_get_last_error();
+        std::cout << "\n";
+        LOG_ERROR("Speaker embed failed for segment %zu: %s", i + 1,
+                  err.message);
+        embed_ok = false;
+        break;
+      }
+      embeddings.push_back(std::move(emb));
+    }
+    rs_speaker_free(sp);
+
+    if (embed_ok) {
+      auto t_spk1 = std::chrono::steady_clock::now();
+      float spk_s = std::chrono::duration_cast<std::chrono::microseconds>(
+                        t_spk1 - t_spk0)
+                        .count() /
+                    1e6f;
+      std::cout << "\r  Speaker embedding: " << filtered.size() << "/"
+                << filtered.size() << " done (" << std::fixed
+                << std::setprecision(2) << spk_s << "s)\n";
+
+      if (args.spk_cluster == "spectral") {
+        SpectralClusterOpts sc;
+        sc.max_num_spks = std::max(1, args.max_speakers);
+        sc.oracle_num = args.num_speakers;
+        spk_labels = spectral_cluster_embeddings(embeddings, spk_dim, sc);
+      } else {
+        spk_labels = cluster_speaker_embeddings(
+            embeddings, spk_dim, args.spk_threshold, args.num_speakers);
+      }
+      for (int l : spk_labels)
+        n_speakers = std::max(n_speakers, l + 1);
+      LOG_INFO("Speaker diarization: %d speaker(s) across %zu segment(s)",
+               n_speakers, filtered.size());
+    } else {
+      LOG_INFO("Speaker diarization disabled (embedding failed)");
+    }
+  }
+
+  // ── 6. ASR inference per segment ───────────────────────
 
   LOG_INFO("─────────────────────────────────────────────────────────");
   LOG_INFO("Starting ASR inference (%zu segment(s))", filtered.size());
@@ -685,16 +1227,22 @@ int main(int argc, char **argv) {
         1e6f;
     float rtf = seg_dur > 0 ? elapsed / seg_dur : 0.f;
 
-    // Timestamped output
+    // Timestamped output (with speaker label when diarization is on)
+    std::string spk_tag;
+    if (i < spk_labels.size()) {
+      spk_tag = "[Speaker " + std::to_string(spk_labels[i] + 1) + "]  ";
+    }
     if (text && text[0]) {
       std::cout << "\n"
                 << "[" << format_timestamp(seg.start_s) << " → "
-                << format_timestamp(seg.end_s) << "]  " << text << "\n";
+                << format_timestamp(seg.end_s) << "]  " << spk_tag << text
+                << "\n";
       total_segments++;
     } else {
       std::cout << "\n"
                 << "[" << format_timestamp(seg.start_s) << " → "
-                << format_timestamp(seg.end_s) << "]  (no speech recognized)\n";
+                << format_timestamp(seg.end_s) << "]  " << spk_tag
+                << "(no speech recognized)\n";
     }
 
     // Segment stats (dimmed)
