@@ -1087,3 +1087,116 @@ void llm_model::print_info() const {
   LLM_LOG_INFO("  Vocab Size : %d", vocab_.size());
   LLM_LOG_INFO("==================");
 }
+
+llm_model::~llm_model() {
+  // Release backend resources in reverse-allocation order: tensors first
+  // (buffer), then their ctx. Metal's residency-set teardown asserts that
+  // every buffer is released before the device is freed (see ggml-metal-
+  // device.m:618), so leaving these dangling crashes at exit.
+  if (buffer_fused_)   ggml_backend_buffer_free(buffer_fused_);
+  if (ctx_fused_)      ggml_free(ctx_fused_);
+  if (buffer_weights_) ggml_backend_buffer_free(buffer_weights_);
+  if (ctx_weights_)    ggml_free(ctx_weights_);
+}
+
+bool llm_model::fuse_qkv_weights(ggml_backend_t backend) {
+  if (ctx_fused_) return true; // already fused
+
+  if (layers_.empty()) {
+    LLM_LOG_ERROR("fuse_qkv_weights: no layers");
+    return false;
+  }
+
+  // Validate every layer is fuseable (same dtype across wq/wk/wv, same ne[0],
+  // optional biases all F32 if any exist).
+  for (size_t il = 0; il < layers_.size(); ++il) {
+    const auto &l = layers_[il];
+    if (!l.wq || !l.wk || !l.wv) {
+      LLM_LOG_WARN("fuse_qkv_weights: layer %zu missing wq/wk/wv, skipping", il);
+      return false;
+    }
+    if (l.wq->type != l.wk->type || l.wk->type != l.wv->type) {
+      LLM_LOG_WARN("fuse_qkv_weights: layer %zu heterogeneous QKV dtypes, "
+                   "skipping",
+                   il);
+      return false;
+    }
+    if (l.wq->ne[0] != l.wk->ne[0] || l.wk->ne[0] != l.wv->ne[0]) {
+      LLM_LOG_WARN("fuse_qkv_weights: layer %zu mismatched n_embd, skipping",
+                   il);
+      return false;
+    }
+    const bool has_any_bias =
+        l.wq_b != nullptr || l.wk_b != nullptr || l.wv_b != nullptr;
+    const bool has_all_bias =
+        l.wq_b != nullptr && l.wk_b != nullptr && l.wv_b != nullptr;
+    if (has_any_bias && !has_all_bias) {
+      LLM_LOG_WARN("fuse_qkv_weights: layer %zu partial biases, skipping", il);
+      return false;
+    }
+  }
+
+  // Allocate a dedicated ggml_context + backend buffer for the fused tensors.
+  const size_t n_fused = layers_.size() * 2; // wqkv + (optional) wqkv_b
+  ggml_init_params ip = {
+      /*.mem_size   =*/ggml_tensor_overhead() * (n_fused + 8) + (1 << 14),
+      /*.mem_buffer =*/nullptr,
+      /*.no_alloc   =*/true,
+  };
+  ctx_fused_ = ggml_init(ip);
+  if (!ctx_fused_) {
+    LLM_LOG_ERROR("fuse_qkv_weights: ggml_init failed");
+    return false;
+  }
+
+  // Pass 1: create the fused tensors (no data yet).
+  for (auto &l : layers_) {
+    const int64_t ne0 = l.wq->ne[0];
+    const int64_t ne1 = l.wq->ne[1] + l.wk->ne[1] + l.wv->ne[1];
+    l.wqkv = ggml_new_tensor_2d(ctx_fused_, l.wq->type, ne0, ne1);
+    if (l.wq_b) {
+      const int64_t nb = l.wq_b->ne[0] + l.wk_b->ne[0] + l.wv_b->ne[0];
+      l.wqkv_b = ggml_new_tensor_1d(ctx_fused_, l.wq_b->type, nb);
+    }
+  }
+
+  buffer_fused_ = ggml_backend_alloc_ctx_tensors(ctx_fused_, backend);
+  if (!buffer_fused_) {
+    LLM_LOG_ERROR("fuse_qkv_weights: backend buffer alloc failed");
+    ggml_free(ctx_fused_);
+    ctx_fused_ = nullptr;
+    for (auto &l : layers_) { l.wqkv = nullptr; l.wqkv_b = nullptr; }
+    return false;
+  }
+
+  // Pass 2: copy each source tensor's bytes into the right offset of wqkv.
+  // Concat along ne[1]: bytes per row = ne[0] * type_size / blck_size.
+  // For both F16 and Q-quants, ggml_nbytes(t) gives the full tensor size, and
+  // contiguous concat along ne[1] is just (offset_in_rows * row_bytes).
+  auto copy_into = [&](ggml_tensor *dst, ggml_tensor *src, size_t dst_offset) {
+    const size_t bytes = ggml_nbytes(src);
+    std::vector<uint8_t> host(bytes);
+    ggml_backend_tensor_get(src, host.data(), 0, bytes);
+    ggml_backend_tensor_set(dst, host.data(), dst_offset, bytes);
+  };
+
+  for (auto &l : layers_) {
+    // Weight: row stride is the full row (ne[0]) in bytes.
+    const size_t bytes_wq = ggml_nbytes(l.wq);
+    const size_t bytes_wk = ggml_nbytes(l.wk);
+    copy_into(l.wqkv, l.wq, 0);
+    copy_into(l.wqkv, l.wk, bytes_wq);
+    copy_into(l.wqkv, l.wv, bytes_wq + bytes_wk);
+
+    if (l.wqkv_b) {
+      const size_t b_wq = ggml_nbytes(l.wq_b);
+      const size_t b_wk = ggml_nbytes(l.wk_b);
+      copy_into(l.wqkv_b, l.wq_b, 0);
+      copy_into(l.wqkv_b, l.wk_b, b_wq);
+      copy_into(l.wqkv_b, l.wv_b, b_wq + b_wk);
+    }
+  }
+
+  LLM_LOG_INFO("fuse_qkv_weights: built %zu fused QKV tensors", layers_.size());
+  return true;
+}

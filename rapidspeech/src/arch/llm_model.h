@@ -126,6 +126,12 @@ struct llm_layer {
   ggml_tensor *wk_b = nullptr;
   ggml_tensor *wv_b = nullptr;
 
+  // Fused Q/K/V projection (built once at Load; null if not fused).
+  // wqkv:   [n_embd, n_q_out + n_kv_out + n_kv_out]
+  // wqkv_b: [n_q_out + n_kv_out + n_kv_out]  (F32, broadcast bias)
+  ggml_tensor *wqkv = nullptr;
+  ggml_tensor *wqkv_b = nullptr;
+
   // QK normalization (optional, for Qwen)
   ggml_tensor *attn_q_norm = nullptr;
   ggml_tensor *attn_q_norm_b = nullptr;
@@ -157,7 +163,7 @@ struct llm_layer {
 class llm_model {
 public:
   llm_model() = default;
-  ~llm_model() = default;
+  ~llm_model();
 
   /**
    * Load model from GGUF file
@@ -250,6 +256,22 @@ private:
   bool load_tensors_from_file(struct gguf_context *ctx_gguf,
                               const std::string &file_path,
                               ggml_backend_t backend);
+
+public:
+  /**
+   * Build per-layer fused QKV weight (`wqkv`) and bias (`wqkv_b`) once
+   * after weights are loaded. After this call, `build_attention_layer`
+   * implementations can prefer the fused path and avoid 2 mul_mat + 2 add
+   * dispatches per layer (× 24 layers per AR step on CV3).
+   *
+   * Skips layers where wq/wk/wv have heterogeneous dtypes or are missing.
+   * Safe to call multiple times — no-op after the first successful build.
+   */
+  bool fuse_qkv_weights(ggml_backend_t backend);
+
+private:
+  ggml_backend_buffer *buffer_fused_ = nullptr;
+  struct ggml_context *ctx_fused_ = nullptr;
 };
 
 using llm_model_ptr = std::shared_ptr<llm_model>;

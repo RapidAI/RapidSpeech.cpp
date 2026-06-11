@@ -628,13 +628,9 @@ ggml_tensor *llm_graph_builder::build_ffn(ggml_context *ctx, ggml_tensor *cur,
 
   switch (ffn_type) {
   case llm_ffn_type::FFN_SWIGLU: {
-    // SwiGLU: gate * sigmoid(gate) * up
     ggml_tensor *gate_out = ggml_mul_mat(ctx, w_gate, cur);
-    gate_out = ggml_silu(ctx, gate_out);
-
-    ggml_tensor *up_out = ggml_mul_mat(ctx, w_up, cur);
-
-    result = ggml_mul(ctx, gate_out, up_out);
+    ggml_tensor *up_out   = ggml_mul_mat(ctx, w_up,   cur);
+    result = ggml_swiglu_split(ctx, gate_out, up_out);
     result = ggml_mul_mat(ctx, w_down, result);
     break;
   }
@@ -741,13 +737,9 @@ ggml_tensor *llm_build_ffn(ggml_context *ctx, ggml_tensor *cur, ggml_tensor *up,
 
   switch (ffn_type) {
   case llm_ffn_type::FFN_SWIGLU: {
-    // SwiGLU: gate * sigmoid(gate) * up
     ggml_tensor *gate_out = ggml_mul_mat(ctx, gate, cur);
-    gate_out = ggml_silu(ctx, gate_out);
-
-    ggml_tensor *up_out = ggml_mul_mat(ctx, up, cur);
-
-    result = ggml_mul(ctx, gate_out, up_out);
+    ggml_tensor *up_out   = ggml_mul_mat(ctx, up,   cur);
+    result = ggml_swiglu_split(ctx, gate_out, up_out);
     result = ggml_mul_mat(ctx, down, result);
     break;
   }
