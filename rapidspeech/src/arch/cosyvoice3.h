@@ -3,13 +3,41 @@
 #include "core/rs_context.h"
 #include "core/rs_model.h"
 #include "cosyvoice3_ras.h"
+#include "ggml-backend.h"
+#include "ggml.h"
 #include "llm_graph.h"
 #include "llm_model.h"
 #include "qwen2.h"
+#include <functional>
 #include <memory>
 #include <random>
 #include <string>
 #include <vector>
+
+// Arm an imatrix per-node observer (when cb is non-empty) on the given sched,
+// run graph_compute, disarm. Mirrors the OmniVoice pattern at
+// omnivoice.cpp:3056 — per-node firing keeps src1 live during the callback,
+// which is required for activation capture because the sched's buffer reuse
+// may overwrite src1 with downstream output once compute returns.
+inline enum ggml_status cv3_sched_compute(
+    ggml_backend_sched_t sched, struct ggml_cgraph *gf,
+    std::function<void(struct ggml_tensor *)> *cb) {
+  const bool armed = cb && (bool)*cb;
+  if (armed) {
+    auto trampoline = [](struct ggml_tensor *t, bool ask, void *ud) -> bool {
+      if (ask) return true;
+      auto *c = static_cast<std::function<void(struct ggml_tensor *)> *>(ud);
+      (*c)(t);
+      return true;
+    };
+    ggml_backend_sched_set_eval_callback(sched, trampoline, cb);
+  }
+  enum ggml_status status = ggml_backend_sched_graph_compute(sched, gf);
+  if (armed) {
+    ggml_backend_sched_set_eval_callback(sched, nullptr, nullptr);
+  }
+  return status;
+}
 
 // Forward declarations to avoid a header explosion.
 class CosyVoice3FlowModel;
@@ -104,6 +132,12 @@ public:
   int32_t StopTokenId() const { return stop_token_id_; }
   int32_t SpeechVocabSize() const { return speech_vocab_; }
 
+  // Activation-aware quantization hook. Setting a non-empty callback arms the
+  // sched eval observer on every LM + Flow compute (HiFT is intentionally
+  // excluded: its conv kernels have ne[0]=3..16 and fail K-quant alignment
+  // anyway). Pass an empty std::function to disarm.
+  void set_imatrix_callback(std::function<void(struct ggml_tensor *)> cb);
+
 private:
   // Original LLM AR loop — implemented in cosyvoice3_decode.cpp.
   bool RunLM(CosyVoice3State &state, ggml_backend_sched_t sched);
@@ -116,6 +150,12 @@ private:
                                    ggml_context *gguf_data);
   bool TryLoadExternalCampplus(const char *path);
   bool TryLoadExternalTokenizer(const char *path);
+
+  // Voice bake/reuse: a standalone voice GGUF carries the same
+  // `cv3.default_voice.*` tensors as the unified model, so a baked voice can
+  // replace the speech-tokenizer + CAMPPlus forward passes entirely.
+  bool TryLoadVoiceFile(const char *path);
+  bool SaveVoiceFile(const CosyVoice3State &state, const char *path);
 
 private:
   RSModelMeta meta_;
@@ -137,6 +177,7 @@ private:
   std::unique_ptr<CosyVoice3HiFTModel> hift_;
   bool flow_ready_ = false;
   bool hift_ready_ = false;
+  bool voice_saved_ = false;  // RS_CV3_SAVE_VOICE_PATH writes at most once
 
   // Tokenizer + CAMPPlus live in separate GGUFs, loaded lazily via env vars
   // RS_CV3_SPEECH_TOKENIZER_PATH / RS_CV3_CAMPPLUS_PATH.
@@ -169,4 +210,7 @@ private:
   std::string pending_ref_text_;
 
   std::string ref_text_;
+
+  // imatrix observer — cv3_sched_compute reads &imatrix_cb_ to arm/disarm.
+  std::function<void(struct ggml_tensor *)> imatrix_cb_;
 };

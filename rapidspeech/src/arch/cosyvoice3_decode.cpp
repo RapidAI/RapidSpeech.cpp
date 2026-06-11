@@ -46,7 +46,8 @@ std::vector<float> project_speech_logits(ggml_backend_sched_t sched,
                                          ggml_tensor *speech_lm_head,
                                          float rms_eps,
                                          const float *hidden, int d_model,
-                                         int speech_vocab) {
+                                         int speech_vocab,
+                                         std::function<void(struct ggml_tensor *)> *imatrix_cb) {
   ggml_init_params ip = {ggml_graph_overhead() + 8 * ggml_tensor_overhead(), nullptr,
                           true};
   ggml_context *ctx = ggml_init(ip);
@@ -78,7 +79,7 @@ std::vector<float> project_speech_logits(ggml_backend_sched_t sched,
     return {};
   }
   ggml_backend_tensor_set(h, hidden, 0, (size_t)d_model * sizeof(float));
-  if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+  if (cv3_sched_compute(sched, gf, imatrix_cb) != GGML_STATUS_SUCCESS) {
     RS_LOG_ERR("CosyVoice3-LLM: speech_lm_head compute failed");
     ggml_free(ctx);
     return {};
@@ -268,7 +269,7 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
   cparams.n_ctx = (uint32_t)(total_T + s.max_speech_tokens + 32);
   cparams.n_batch = (uint32_t)total_T;
   cparams.n_ubatch = cparams.n_batch;
-  cparams.flash_attn = false;
+  cparams.flash_attn = true;
 
   auto builder = std::make_unique<llm_build_qwen2>(*llm_model_, cparams, sched);
 
@@ -324,7 +325,7 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
     pf->set_causal_mask(m, (uint32_t)total_T, 0);
   }
 
-  if (ggml_backend_sched_graph_compute(sched, pf->get_graph()) !=
+  if (cv3_sched_compute(sched, pf->get_graph(), &imatrix_cb_) !=
       GGML_STATUS_SUCCESS) {
     RS_LOG_ERR("CosyVoice3-LLM: prefill compute failed");
     ggml_free(ctx_emb);
@@ -396,7 +397,8 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
   // ----- Project last hidden → speech logits.
   std::vector<float> logits = project_speech_logits(
       sched, llm_model_->output_norm(), llm_model_->speech_lm_head(),
-      hp.f_norm_rms_eps, last_hidden.data(), d_model, speech_vocab_);
+      hp.f_norm_rms_eps, last_hidden.data(), d_model, speech_vocab_,
+      &imatrix_cb_);
   if ((int)logits.size() != speech_vocab_) {
     RS_LOG_ERR("CosyVoice3-LLM: empty step-0 logits");
     return false;
@@ -625,7 +627,7 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
       dec->set_causal_mask(m, 1, s.n_cached);
     }
 
-    if (ggml_backend_sched_graph_compute(sched, dec->get_graph()) !=
+    if (cv3_sched_compute(sched, dec->get_graph(), &imatrix_cb_) !=
         GGML_STATUS_SUCCESS) {
       RS_LOG_ERR("CosyVoice3-LLM: AR step %d compute failed", step);
       ggml_free(ctx_step);
@@ -663,7 +665,8 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
     // Project hidden → logits via speech_lm_head.
     std::vector<float> step_logits = project_speech_logits(
         sched, llm_model_->output_norm(), llm_model_->speech_lm_head(),
-        hp.f_norm_rms_eps, step_hidden.data(), d_model, speech_vocab_);
+        hp.f_norm_rms_eps, step_hidden.data(), d_model, speech_vocab_,
+        &imatrix_cb_);
     if ((int)step_logits.size() != speech_vocab_) {
       RS_LOG_ERR("CosyVoice3-LLM: AR step %d empty logits", step);
       break;

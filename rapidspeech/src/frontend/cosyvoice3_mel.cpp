@@ -206,7 +206,8 @@ const Mel80Tables &tables_80() {
     Mel80Tables t;
     t.hann.resize(k24NFft);
     for (int i = 0; i < k24NFft; ++i)
-      t.hann[i] = 0.5 - 0.5 * std::cos(2.0 * M_PI * i / (double)(k24NFft - 1));
+      t.hann[i] =
+          0.5 - 0.5 * std::cos(2.0 * M_PI * i / (double)k24NFft);
     t.cos_tab.resize(k24NFft);
     t.sin_tab.resize(k24NFft);
     for (int i = 0; i < k24NFft; ++i) {
@@ -246,7 +247,10 @@ int compute_log_mel_80_24k(const float *pcm_24k, int n_samples,
                            std::vector<float> &out) {
   if (!pcm_24k || n_samples <= 0) { out.clear(); return 0; }
   const auto &T = tables_80();
-  const int pad = k24NFft / 2;
+  // Matcha's mel_spectrogram pads with (n_fft - hop_size)/2 on each side and
+  // calls torch.stft(center=False). The result is equivalent to a centered
+  // STFT with pad = (n_fft - hop_size)/2.
+  const int pad = (k24NFft - k24Hop) / 2;
   std::vector<float> padded((size_t)(n_samples + 2 * pad));
   for (int i = 0; i < pad; ++i) {
     int src = pad - i; if (src >= n_samples) src = n_samples - 1;
@@ -266,6 +270,7 @@ int compute_log_mel_80_24k(const float *pcm_24k, int n_samples,
   out.assign((size_t)k24NMels * n_frames, 0.f);
   std::vector<double> buf(k24NFft);
   std::vector<double> power(k24NBins);
+  std::vector<double> mag(k24NBins);
   for (int t = 0; t < n_frames; ++t) {
     const int off = t * k24Hop;
     for (int j = 0; j < k24NFft; ++j)
@@ -273,11 +278,14 @@ int compute_log_mel_80_24k(const float *pcm_24k, int n_samples,
     real_power_spectrum(buf.data(), k24NFft,
                         T.cos_tab.data(), T.sin_tab.data(),
                         power.data());
+    // Matcha: spec = sqrt(|X|^2 + 1e-9) — magnitude, not power.
+    for (int k = 0; k < k24NBins; ++k)
+      mag[k] = std::sqrt(power[k] + 1e-9);
     for (int m = 0; m < k24NMels; ++m) {
       const float *row = &T.mel_fb[(size_t)m * k24NBins];
       double acc = 0.0;
-      for (int k = 0; k < k24NBins; ++k) acc += (double)row[k] * power[k];
-      // natural log (FunAudio convention for `prompt_feat`)
+      for (int k = 0; k < k24NBins; ++k) acc += (double)row[k] * mag[k];
+      // Matcha: spectral_normalize_torch = log(clamp(x, min=1e-5)).
       out[(size_t)t * k24NMels + m] = (float)std::log(std::max(acc, 1e-5));
     }
   }

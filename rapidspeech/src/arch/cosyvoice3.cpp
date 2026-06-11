@@ -13,6 +13,7 @@
 #include "utils/rs_wav.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -50,6 +51,15 @@ CosyVoice3LMModel::~CosyVoice3LMModel() {
     if (eg->ctx_data) ggml_free(eg->ctx_data);
     eg->buf = nullptr; eg->ctx_gguf = nullptr; eg->ctx_data = nullptr;
   }
+}
+
+void CosyVoice3LMModel::set_imatrix_callback(
+    std::function<void(struct ggml_tensor *)> cb) {
+  // Propagate to Flow first (DiT is the main calibration target). HiFT is
+  // skipped intentionally — its conv kernels (ne[0]=3..16) fail K-quant
+  // alignment so imatrix data on them would never be consumed.
+  if (flow_) flow_->set_imatrix_callback(cb);
+  imatrix_cb_ = std::move(cb);
 }
 
 // =====================================================================
@@ -135,6 +145,12 @@ bool CosyVoice3LMModel::Load(const std::unique_ptr<rs_context_t> &ctx,
     return false;
   }
 
+  // Build fused QKV weights (best-effort optimization). Skip on failure —
+  // qwen2.cpp falls back to the 3× mul_mat path when layer.wqkv is null.
+  if (!llm_model_->fuse_qkv_weights(backend_)) {
+    RS_LOG_WARN("CosyVoice3: fuse_qkv_weights failed; using unfused QKV path");
+  }
+
   if (llm_model_->speech_embd()) {
     speech_vocab_ = (int32_t)llm_model_->speech_embd()->ne[1];
   }
@@ -198,6 +214,13 @@ bool CosyVoice3LMModel::Load(const std::unique_ptr<rs_context_t> &ctx,
 
   // Default voice tuple (baked at conversion time). All three are optional.
   TryLoadDefaultVoiceFromGGUF(ctx->ctx_gguf, ctx->gguf_data);
+
+  // Pre-baked voice GGUF (overrides the unified GGUF's default voice). Lets
+  // production runs reuse a cached speech-token/feat/embedding tuple without
+  // loading the speech tokenizer or CAMPPlus at all.
+  if (const char *p = std::getenv("RS_CV3_VOICE_PATH")) {
+    TryLoadVoiceFile(p);
+  }
 
   // Optional external GGUFs for runtime voice cloning via --ref.
   if (const char *p = std::getenv("RS_CV3_CAMPPLUS_PATH")) {
@@ -263,6 +286,137 @@ bool CosyVoice3LMModel::TryLoadDefaultVoiceFromGGUF(gguf_context *ctx_gguf,
               default_prompt_token_.size(), default_prompt_feat_.size(),
               default_embedding_.size());
   return true;
+}
+
+// =====================================================================
+// Voice bake/reuse — standalone voice GGUF (cv3.default_voice.* tensors).
+// Baking caches the speech-tokenizer + CAMPPlus outputs so production
+// synthesis with a fixed voice skips both forward passes (and both model
+// files).
+// =====================================================================
+
+bool CosyVoice3LMModel::TryLoadVoiceFile(const char *path) {
+  if (!path || !*path) return false;
+  ggml_context *ctx_data = nullptr;
+  struct gguf_init_params gp = { /*.no_alloc=*/false, /*.ctx=*/&ctx_data };
+  gguf_context *ctx_gguf = gguf_init_from_file(path, gp);
+  if (!ctx_gguf) {
+    RS_LOG_ERR("CosyVoice3: failed to open voice GGUF: %s", path);
+    return false;
+  }
+  // no_alloc=false → tensor data lives in host memory inside ctx_data.
+  auto pull_f32 = [&](const char *name, std::vector<float> &dst) {
+    ggml_tensor *t = ggml_get_tensor(ctx_data, name);
+    if (!t || !t->data || t->type != GGML_TYPE_F32) return false;
+    dst.assign((size_t)ggml_nelements(t), 0.f);
+    std::memcpy(dst.data(), t->data, dst.size() * sizeof(float));
+    return true;
+  };
+  auto pull_i32 = [&](const char *name, std::vector<int32_t> &dst) {
+    ggml_tensor *t = ggml_get_tensor(ctx_data, name);
+    if (!t || !t->data || t->type != GGML_TYPE_I32) return false;
+    dst.assign((size_t)ggml_nelements(t), 0);
+    std::memcpy(dst.data(), t->data, dst.size() * sizeof(int32_t));
+    return true;
+  };
+
+  std::vector<int32_t> text_ids, tok;
+  std::vector<float> feat, emb;
+  pull_i32("cv3.default_voice.prompt_text_ids", text_ids);
+  pull_i32("cv3.default_voice.prompt_token", tok);
+  pull_f32("cv3.default_voice.prompt_feat", feat);
+  const bool has_emb = pull_f32("cv3.default_voice.embedding", emb);
+
+  std::string ref_text;
+  {
+    const int key = gguf_find_key(ctx_gguf, "cv3.voice.ref_text");
+    if (key >= 0) ref_text = gguf_get_val_str(ctx_gguf, key);
+  }
+  gguf_free(ctx_gguf);
+  ggml_free(ctx_data);
+
+  if (!has_emb) {
+    RS_LOG_ERR("CosyVoice3: voice GGUF %s lacks cv3.default_voice.embedding",
+               path);
+    return false;
+  }
+  default_prompt_text_ids_ = std::move(text_ids);
+  default_prompt_token_    = std::move(tok);
+  default_prompt_feat_     = std::move(feat);
+  default_embedding_       = std::move(emb);
+  RS_LOG_INFO("CosyVoice3: voice loaded from %s (text_ids=%zu tok=%zu "
+              "feat=%zux80 emb=%zu ref_text='%s')",
+              path, default_prompt_text_ids_.size(),
+              default_prompt_token_.size(), default_prompt_feat_.size() / 80,
+              default_embedding_.size(), ref_text.c_str());
+  return true;
+}
+
+bool CosyVoice3LMModel::SaveVoiceFile(const CosyVoice3State &state,
+                                      const char *path) {
+  if (!path || !*path) return false;
+  if (state.embedding.empty()) {
+    RS_LOG_ERR("CosyVoice3: cannot save voice — state has no embedding");
+    return false;
+  }
+  const size_t data_bytes =
+      (state.prompt_text_token_ids.size() + state.prompt_token.size()) *
+          sizeof(int32_t) +
+      (state.prompt_feat.size() + state.embedding.size()) * sizeof(float);
+  ggml_init_params ip = {
+      /*.mem_size=*/data_bytes + 4 * ggml_tensor_overhead() + 1024,
+      /*.mem_buffer=*/nullptr,
+      /*.no_alloc=*/false,
+  };
+  ggml_context *ctx = ggml_init(ip);
+  if (!ctx) return false;
+  gguf_context *g = gguf_init_empty();
+  gguf_set_val_str(g, "general.architecture", "cosyvoice3-voice");
+  if (!ref_text_.empty()) {
+    gguf_set_val_str(g, "cv3.voice.ref_text", ref_text_.c_str());
+  }
+
+  auto add_i32 = [&](const char *name, const std::vector<int32_t> &v) {
+    if (v.empty()) return;
+    ggml_tensor *t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t)v.size());
+    ggml_set_name(t, name);
+    std::memcpy(t->data, v.data(), v.size() * sizeof(int32_t));
+    gguf_add_tensor(g, t);
+  };
+  add_i32("cv3.default_voice.prompt_text_ids", state.prompt_text_token_ids);
+  add_i32("cv3.default_voice.prompt_token", state.prompt_token);
+  if (!state.prompt_feat.empty()) {
+    // Host layout is row-major [T, 80] (80 mel bins contiguous per frame) →
+    // ggml ne0=80 (fastest), ne1=T.
+    const int64_t T = (int64_t)(state.prompt_feat.size() / 80);
+    ggml_tensor *t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 80, T);
+    ggml_set_name(t, "cv3.default_voice.prompt_feat");
+    std::memcpy(t->data, state.prompt_feat.data(),
+                state.prompt_feat.size() * sizeof(float));
+    gguf_add_tensor(g, t);
+  }
+  {
+    ggml_tensor *t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
+                                        (int64_t)state.embedding.size());
+    ggml_set_name(t, "cv3.default_voice.embedding");
+    std::memcpy(t->data, state.embedding.data(),
+                state.embedding.size() * sizeof(float));
+    gguf_add_tensor(g, t);
+  }
+
+  const bool ok = gguf_write_to_file(g, path, /*only_meta=*/false);
+  gguf_free(g);
+  ggml_free(ctx);
+  if (ok) {
+    RS_LOG_INFO("CosyVoice3: voice baked to %s (text_ids=%zu tok=%zu "
+                "feat=%zux80 emb=%zu)",
+                path, state.prompt_text_token_ids.size(),
+                state.prompt_token.size(), state.prompt_feat.size() / 80,
+                state.embedding.size());
+  } else {
+    RS_LOG_ERR("CosyVoice3: failed to write voice GGUF: %s", path);
+  }
+  return ok;
 }
 
 bool CosyVoice3LMModel::TryLoadExternalCampplus(const char *path) {
@@ -466,36 +620,44 @@ bool CosyVoice3LMModel::PushReferenceAudio(RSState &state, const float *samples,
     return false;
   }
 
-  // 5) Align prompt_feat length to exactly `prompt_token.size() *
-  //    token_mel_ratio` mel frames. The Flow's encode graph assumes the
-  //    prompt mel grid is the upsampled token grid; mismatched lengths
-  //    cause an out-of-bounds read when we readback `mu` later.
+  // 5) Align prompt_feat and prompt_token. Mirrors PT
+  //    CosyVoiceFrontEnd.frontend_zero_shot (resample_rate==24000):
+  //        token_len = min(speech_feat.shape[1] // 2, speech_token.shape[1])
+  //        speech_feat  = speech_feat[:, :2*token_len]
+  //        speech_token = speech_token[:, :token_len]
+  //    Both are clipped — neither side is ever extended. Previously RS would
+  //    pad prompt_feat with a duplicated last frame to match an oversized
+  //    token count, which inflated prompt_feat by 1 frame and silently fed
+  //    an extra token into Flow.
   constexpr int kTokenMelRatio = 2;
-  const int want_T_pt_mel = (int)prompt_token.size() * kTokenMelRatio;
-  if ((int)(prompt_feat.size() / 80) > want_T_pt_mel) {
-    prompt_feat.resize((size_t)want_T_pt_mel * 80);
-  } else if ((int)(prompt_feat.size() / 80) < want_T_pt_mel) {
-    // Pad with the last frame repeated.
-    const int cur = (int)(prompt_feat.size() / 80);
-    std::vector<float> last(80, 0.f);
-    if (cur > 0) {
-      std::memcpy(last.data(),
-                  prompt_feat.data() + (size_t)(cur - 1) * 80,
-                  80 * sizeof(float));
-    }
-    prompt_feat.resize((size_t)want_T_pt_mel * 80);
-    for (int t = cur; t < want_T_pt_mel; ++t) {
-      std::memcpy(prompt_feat.data() + (size_t)t * 80, last.data(),
-                  80 * sizeof(float));
-    }
-  }
+  const int mel_T   = (int)(prompt_feat.size() / 80);
+  const int n_tok   = (int)prompt_token.size();
+  const int token_len = std::min(mel_T / kTokenMelRatio, n_tok);
+  prompt_feat.resize((size_t)token_len * kTokenMelRatio * 80);
+  prompt_token.resize((size_t)token_len);
 
   // 6) Write everything into the state.
   s.prompt_token = std::move(prompt_token);
   s.prompt_feat  = std::move(prompt_feat);
   s.embedding    = std::move(cs.embedding);
+  // Debug: dump prompt_feat (post-align) for PT cross-check.
+  // Format: int32 T_pt_mel, int32 mel_dim(=80), then f32 feat[T*mel_dim].
+  // Memory order matches RS_CV3_DUMP_FLOW_ENC: mel-fast (each frame's 80
+  // mel-bins contiguous), i.e. row-major [T, mel_dim].
+  if (const char *p = std::getenv("RS_CV3_DUMP_PROMPT_FEAT")) {
+    if (FILE *f = std::fopen(p, "wb")) {
+      int32_t hdr[2] = {(int32_t)(s.prompt_feat.size() / 80), 80};
+      std::fwrite(hdr, sizeof(int32_t), 2, f);
+      std::fwrite(s.prompt_feat.data(), sizeof(float), s.prompt_feat.size(), f);
+      std::fclose(f);
+      RS_LOG_INFO("CosyVoice3: dumped prompt_feat [%d, 80] -> %s",
+                  hdr[0], p);
+    }
+  }
   RS_LOG_INFO("CosyVoice3: ref voice ready (tok=%zu, feat=%dx80, emb=%zu)",
-              s.prompt_token.size(), want_T_pt_mel, s.embedding.size());
+              s.prompt_token.size(),
+              (int)(s.prompt_feat.size() / 80),
+              s.embedding.size());
   return true;
 }
 
@@ -547,6 +709,10 @@ bool CosyVoice3LMModel::PrepareVoice(CosyVoice3State &state,
 
 bool CosyVoice3LMModel::Decode(RSState &state, ggml_backend_sched_t sched) {
   auto &s = static_cast<CosyVoice3State &>(state);
+  using clk = std::chrono::steady_clock;
+  auto ms = [](clk::time_point a, clk::time_point b) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count() / 1000.0;
+  };
   // Voice prep MUST run before RunLM — CosyVoice3 was trained always with a
   // voice prior, so the LM expects `[sos][sys_prefix + eop + ref_text +
   // tts_text][task][prompt_speech_token]` as input. With no prompt speech
@@ -554,10 +720,18 @@ bool CosyVoice3LMModel::Decode(RSState &state, ggml_backend_sched_t sched) {
   // greedy mode). PrepareVoice fills state.{prompt_text_token_ids,
   // prompt_token, prompt_feat, embedding} from the baked default when the
   // user didn't supply --ref.
+  auto t_prep0 = clk::now();
   if (flow_ready_ && hift_ready_) {
     if (!PrepareVoice(s, sched)) return false;
+    // Bake the resolved voice tuple once so later runs can reuse it via
+    // RS_CV3_VOICE_PATH (skipping the tokenizer + CAMPPlus forwards).
+    if (const char *p = std::getenv("RS_CV3_SAVE_VOICE_PATH")) {
+      if (!voice_saved_ && SaveVoiceFile(s, p)) voice_saved_ = true;
+    }
   }
+  auto t_lm0 = clk::now();
   if (!RunLM(s, sched)) return false;
+  auto t_lm1 = clk::now();
   // Debug knob: override the LM-sampled tokens with a binary dump of int32
   // ids. Lets us localize Flow/HiFT bugs by feeding PT-generated tokens
   // into the C++ post-LLM pipeline.
@@ -588,10 +762,12 @@ bool CosyVoice3LMModel::Decode(RSState &state, ggml_backend_sched_t sched) {
     // Legacy `cosyvoice3-llm` path: token-only output via GetTranscription.
     return true;
   }
+  auto t_flow0 = clk::now();
   if (!flow_->RunFlow(s, sched)) {
     RS_LOG_ERR("CosyVoice3: RunFlow failed");
     return false;
   }
+  auto t_flow1 = clk::now();
   // Debug knob: override Flow's mel output with a binary dump
   // (header: int32 T, int32 mel_dim; payload: f32 row-major [T, mel_dim]).
   // Lets us test HiFT in isolation with a known-good mel.
@@ -613,6 +789,13 @@ bool CosyVoice3LMModel::Decode(RSState &state, ggml_backend_sched_t sched) {
     RS_LOG_ERR("CosyVoice3: RunHiFT failed");
     return false;
   }
+  auto t_hift1 = clk::now();
+  RS_LOG_INFO("CosyVoice3 timings: PrepareVoice=%.1fms LM=%.1fms (%zu tok) "
+              "Flow=%.1fms HiFT=%.1fms total=%.1fms",
+              ms(t_prep0, t_lm0), ms(t_lm0, t_lm1),
+              s.speech_token_ids.size(),
+              ms(t_flow0, t_flow1), ms(t_flow1, t_hift1),
+              ms(t_prep0, t_hift1));
   return true;
 }
 

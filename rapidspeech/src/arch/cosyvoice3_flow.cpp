@@ -172,10 +172,13 @@ bool CosyVoice3FlowModel::Load(gguf_context *ctx_gguf, ggml_context *gguf_data,
   if (!LoadTensors(tensors)) return false;
   if (!AllocSinusoidalEmbed(backend)) return false;
 
-  // Cosine schedule: 11 timesteps, 10 Euler steps (matches reference).
-  t_span_.resize(11);
-  for (int i = 0; i <= 10; ++i)
-    t_span_[i] = 1.0f - std::cos(0.1f * 0.5f * M_PI * (float)i);
+  // Cosine schedule scaled to euler_steps_: t[i] = 1 - cos((1/N) * pi/2 * i),
+  // so t[0]=0, t[N]=1 regardless of N. Matches the upstream ref's t_span for
+  // N=10 (the original constant 0.1 == 1/10).
+  t_span_.resize((size_t)euler_steps_ + 1);
+  const float c = 1.0f / (float)euler_steps_;
+  for (int i = 0; i <= euler_steps_; ++i)
+    t_span_[i] = 1.0f - std::cos(c * 0.5f * M_PI * (float)i);
 
   RS_LOG_INFO("Flow loaded: depth=%d dim=%d heads=%d head_dim=%d ff=%d "
               "mel=%d cfg=%.2f euler_steps=%d",
@@ -327,7 +330,13 @@ bool CosyVoice3FlowModel::AllocSinusoidalEmbed(ggml_backend_t backend) {
 }
 
 void CosyVoice3FlowModel::SetEulerSteps(int n) {
-  if (n >= 2 && n <= 64) euler_steps_ = n;
+  if (n >= 2 && n <= 64) {
+    euler_steps_ = n;
+    t_span_.resize((size_t)euler_steps_ + 1);
+    const float c = 1.0f / (float)euler_steps_;
+    for (int i = 0; i <= euler_steps_; ++i)
+      t_span_[i] = 1.0f - std::cos(c * 0.5f * M_PI * (float)i);
+  }
 }
 
 // =====================================================================
@@ -804,7 +813,7 @@ bool CosyVoice3FlowModel::RunFlow(CosyVoice3State &state,
     ggml_backend_tensor_set(t_emb, state.embedding.data(), 0,
                             spk_dim_in_ * sizeof(float));
 
-    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+    if (cv3_sched_compute(sched, gf, &imatrix_cb_) != GGML_STATUS_SUCCESS) {
       RS_LOG_ERR("Flow: encode compute failed");
       ggml_free(ctx);
       return false;
@@ -819,6 +828,21 @@ bool CosyVoice3FlowModel::RunFlow(CosyVoice3State &state,
                             h_cond.size() * sizeof(float));
     ggml_backend_tensor_get(enc.spks, h_spks.data(), 0,
                             h_spks.size() * sizeof(float));
+    // Debug: dump (mu, cond, spks) tensors for PT cross-check.
+    // Format: int32 T_mel, int32 mel_dim, then f32 mu[mel_dim*T_mel],
+    //         f32 cond[mel_dim*T_mel], f32 spks[mel_dim].
+    if (const char *p = std::getenv("RS_CV3_DUMP_FLOW_ENC")) {
+      if (FILE *f = std::fopen(p, "wb")) {
+        int32_t hdr[2] = {T_mel, mel_dim_};
+        std::fwrite(hdr, sizeof(int32_t), 2, f);
+        std::fwrite(h_mu.data(),   sizeof(float), h_mu.size(),   f);
+        std::fwrite(h_cond.data(), sizeof(float), h_cond.size(), f);
+        std::fwrite(h_spks.data(), sizeof(float), h_spks.size(), f);
+        std::fclose(f);
+        RS_LOG_INFO("Flow: dumped encode (mu,cond,spks) [%d, %d] -> %s",
+                    T_mel, mel_dim_, p);
+      }
+    }
     ggml_free(ctx);
     ggml_backend_sched_reset(sched);
   }
@@ -884,11 +908,11 @@ bool CosyVoice3FlowModel::RunFlow(CosyVoice3State &state,
     }
     ggml_backend_tensor_set(x_in,  h_x.data(), 0,
                             h_x.size() * sizeof(float));
-    ggml_backend_tensor_set(mu_in, h_mu.data(), 0,
-                            h_mu.size() * sizeof(float));
+    ggml_backend_tensor_set(mu_in,   h_mu.data(),   0,
+                            h_mu.size()   * sizeof(float));
     ggml_backend_tensor_set(cond_in, h_cond.data(), 0,
                             h_cond.size() * sizeof(float));
-    ggml_backend_tensor_set(spk_in, h_spks.data(), 0,
+    ggml_backend_tensor_set(spk_in,  h_spks.data(), 0,
                             h_spks.size() * sizeof(float));
 
     // Build position_ids on the host: [T_mel, 2] with each batch slot
@@ -902,7 +926,7 @@ bool CosyVoice3FlowModel::RunFlow(CosyVoice3State &state,
                               pids.size() * sizeof(int32_t));
     }
 
-    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+    if (cv3_sched_compute(sched, gf, &imatrix_cb_) != GGML_STATUS_SUCCESS) {
       RS_LOG_ERR("Flow: step compute failed (step=%d)", step);
       ggml_free(ctx);
       return false;

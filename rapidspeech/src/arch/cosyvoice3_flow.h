@@ -73,6 +73,13 @@ public:
   /** Override the default 10 Euler steps (e.g. from a CLI flag). */
   void SetEulerSteps(int n);
 
+  // Activation-aware quantization hook. The Flow DiT is the most
+  // quantization-sensitive part of CV3 (10-step CFM trajectory accumulates
+  // error), so imatrix calibration is mainly aimed here.
+  void set_imatrix_callback(std::function<void(struct ggml_tensor *)> cb) {
+    imatrix_cb_ = std::move(cb);
+  }
+
 private:
   // -------------------------------------------------------------------------
   // Bound weight tensors (pointers into the GGUF-backed ggml_context).
@@ -146,13 +153,16 @@ private:
   int spk_dim_in_ = 192;
   float cfg_rate_ = 0.7f;
 
-  // Cosine schedule: t_span[0..10]; 10 Euler steps (indices 1..10).
+  // Cosine schedule: t_span[0..euler_steps_]; populated in Load()/SetEulerSteps.
   std::vector<float> t_span_;
-  int euler_steps_ = 10;
+  int euler_steps_ = 5;
 
   // Backing buffer for the sinus-embed table (so we own its lifetime).
   ggml_backend_buffer_t time_emb_buf_ = nullptr;
   ggml_context *cctx_owned_ = nullptr;
+
+  // imatrix observer — cv3_sched_compute reads &imatrix_cb_ to arm/disarm.
+  std::function<void(struct ggml_tensor *)> imatrix_cb_;
 
   // -------------------------------------------------------------------------
   // Internal helpers

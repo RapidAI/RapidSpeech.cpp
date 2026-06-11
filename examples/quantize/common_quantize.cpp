@@ -210,11 +210,13 @@ static std::pair<int, int> extract_layer_info(const std::string &name) {
       {"model.layers.",                  28},  // Qwen3-style LLM
       {"llm.layers.",                    28},  // Qwen3 (alt name)
       {"llm.model.layers.",              28},  // FunASR LLM
+      {"blk.",                           24},  // llama.cpp/GGUF LLM (CosyVoice3 LLM uses this)
       {"encoder.encoders.",              50},  // SenseVoice/FunASR main
       {"encoder.tp_encoders.",           20},  // SenseVoice/FunASR TP
       {"semantic_model.encoder.layers.", 12},  // HuBERT
       {"ctc_decoder.blocks.",             5},  // FunASR CTC decoder
       {"audio_adaptor.blocks.",           2},  // FunASR audio adaptor
+      {"flow.decoder.estimator.transformer_blocks.", 22},  // CosyVoice3 Flow DiT
   };
   for (const auto &pi : prefixes) {
     size_t pos = name.find(pi.prefix);
@@ -246,47 +248,71 @@ static bool name_ends_with(const std::string &name, const char *suffix) {
 static tensor_category categorize_tensor(const std::string &name) {
   // Token embeddings (may have prefixes like "llm.", "model.")
   if (name_ends_with(name, "embed_tokens.weight") ||
-      name == "embed.weight") {
+      name == "embed.weight" ||
+      // llama.cpp / GGUF-converted naming.
+      name == "token_embd.weight" ||
+      // CosyVoice3 speech codebook embedding (6761 → 896).
+      name == "cosyvoice3.speech_embd.weight") {
     return tensor_category::TOKEN_EMBD;
   }
   // Output projection
   if (name_ends_with(name, "lm_head.weight") ||
       name_ends_with(name, "ctc.ctc_lo.weight") ||
-      name_ends_with(name, "ctc_out_linear.weight")) {
+      name_ends_with(name, "ctc_out_linear.weight") ||
+      // llama.cpp-style top of the head.
+      name == "output.weight" ||
+      // CosyVoice3 speech-token head (896 → 6761).
+      name == "cosyvoice3.speech_lm_head.weight") {
     return tensor_category::OUTPUT;
   }
   // Attention V (most sensitive to quantization)
   if (name.find("v_proj.weight") != std::string::npos ||
-      name.find("linear_v.weight") != std::string::npos) {
+      name.find("linear_v.weight") != std::string::npos ||
+      // CosyVoice3 Flow DiT uses diffusers naming `attn.to_{q,k,v,out.0}`.
+      name.find("attn.to_v.weight") != std::string::npos ||
+      // llama.cpp / GGUF-converted naming for Qwen-style LLMs.
+      name.find("attn_v.weight") != std::string::npos) {
     return tensor_category::ATTENTION_V;
   }
   // Attention K
   if (name.find("k_proj.weight") != std::string::npos ||
-      name.find("linear_k.weight") != std::string::npos) {
+      name.find("linear_k.weight") != std::string::npos ||
+      name.find("attn.to_k.weight") != std::string::npos ||
+      name.find("attn_k.weight") != std::string::npos) {
     return tensor_category::ATTENTION_K;
   }
   // Attention Q
   if (name.find("q_proj.weight") != std::string::npos ||
-      name.find("linear_q.weight") != std::string::npos) {
+      name.find("linear_q.weight") != std::string::npos ||
+      name.find("attn.to_q.weight") != std::string::npos ||
+      name.find("attn_q.weight") != std::string::npos) {
     return tensor_category::ATTENTION_Q;
   }
   // Attention Output
   if (name.find("o_proj.weight") != std::string::npos ||
       name.find("out_proj.weight") != std::string::npos ||
-      name.find("linear_out.weight") != std::string::npos) {
+      name.find("linear_out.weight") != std::string::npos ||
+      name.find("attn.to_out.0.weight") != std::string::npos ||
+      name.find("attn_output.weight") != std::string::npos) {
     return tensor_category::ATTENTION_OUTPUT;
   }
   // FFN Up / Gate
   if (name.find("up_proj.weight") != std::string::npos ||
-      name.find("w_1.weight") != std::string::npos) {
+      name.find("w_1.weight") != std::string::npos ||
+      // CosyVoice3 Flow DiT FF: ff.ff.0.0 = linear + GELU, ff.ff.2 = linear.
+      name.find("ff.ff.0.0.weight") != std::string::npos ||
+      name.find("ffn_up.weight") != std::string::npos) {
     return tensor_category::FFN_UP;
   }
-  if (name.find("gate_proj.weight") != std::string::npos) {
+  if (name.find("gate_proj.weight") != std::string::npos ||
+      name.find("ffn_gate.weight") != std::string::npos) {
     return tensor_category::FFN_GATE;
   }
   // FFN Down
   if (name.find("down_proj.weight") != std::string::npos ||
-      name.find("w_2.weight") != std::string::npos) {
+      name.find("w_2.weight") != std::string::npos ||
+      name.find("ff.ff.2.weight") != std::string::npos ||
+      name.find("ffn_down.weight") != std::string::npos) {
     return tensor_category::FFN_DOWN;
   }
   if (name.find("intermediate_dense.weight") != std::string::npos) {
@@ -315,11 +341,33 @@ rs_get_qtype_for_tensor(const rs_quantize_options &opts, const std::string &name
   };
 
   // Demote to an alignment-safe type when the preferred k-quant block (256)
-  // does not divide ne[0]. Small leading dims (e.g. ctc_decoder w_2 with
-  // ne[0]=128) cannot use Q4_K/Q5_K/Q6_K/IQ*; fall back to Q8_0 (block=32)
-  // when possible, otherwise keep the original dtype.
+  // does not divide ne[0] (e.g. Qwen2-0.5B hidden=896, ctc_decoder w_2 with
+  // ne[0]=128). Pick a block-32 fallback at *similar bpw* rather than the
+  // heavy Q8_0 default — for Qwen-style LLMs this halves attn/ffn size on
+  // every demote, instead of overspending 8.5 bpw when the user asked for 4.
   auto pick = [tensor, &align_check](ggml_type preferred) -> ggml_type {
     if (align_check(preferred)) return preferred;
+    ggml_type demote;
+    switch (preferred) {
+    case GGML_TYPE_IQ1_S: case GGML_TYPE_IQ1_M:
+    case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
+    case GGML_TYPE_Q2_K:
+    case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S:
+    case GGML_TYPE_Q3_K:
+    case GGML_TYPE_Q4_K:
+    case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS:
+      demote = GGML_TYPE_Q4_0;  // ~4.5 bpw block-32
+      break;
+    case GGML_TYPE_Q5_K:
+      demote = GGML_TYPE_Q5_0;  // ~5.5 bpw block-32
+      break;
+    case GGML_TYPE_Q6_K:
+      demote = GGML_TYPE_Q8_0;  // no Q6_0; closest block-32 is Q8_0
+      break;
+    default:
+      demote = GGML_TYPE_Q8_0;
+    }
+    if (align_check(demote)) return demote;
     if (align_check(GGML_TYPE_Q8_0)) return GGML_TYPE_Q8_0;
     return tensor->type;
   };
