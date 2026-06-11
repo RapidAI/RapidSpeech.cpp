@@ -98,8 +98,13 @@ static bool rs_model_quantize(const std::string &fname_inp,
   std::vector<std::string> to_skip = {
       // FSMN block weights — 1D convolution, quantization hurts accuracy
       "encoder.*.fsmn_block.weight",
-      // Norm weights — small tensors, quantization not beneficial
-      ".*norm.*weight",
+      // Norm scale/bias — small 1D tensors, quantization not beneficial.
+      // Pattern anchors at the end so it does NOT swallow projection layers
+      // that happen to live under a `*_norm` parent (e.g. Flow DiT
+      // `attn_norm.linear.weight`, which is a 1024x6144 AdaLN modulation
+      // matrix — the largest weight family in the model).
+      ".*norm\\.weight",
+      ".*norm\\.bias",
       // VAD parameters (if present in model)
       "_model.stft.forward_basis_buffer.weight",
       "_model.encoder.*.reparam_conv.weight",
@@ -119,7 +124,28 @@ static bool rs_model_quantize(const std::string &fname_inp,
       "fc2.weight",
       // HuBERT semantic encoder weights — ggml graph uses dup/concat ops that
       // don't support quantized types; only used for voice cloning (~50 MB)
-      "semantic_model.*.weight"};
+      "semantic_model.*.weight",
+      // CosyVoice3 HiFT vocoder: previously skipped wholesale. Re-enabled
+      // because the conv kernels are small but plentiful (~40 MB f16) and the
+      // alignment-safe demote (Q4_0 block 32) means quantized HiFT is in
+      // budget. If audio noise becomes a problem, re-skip with
+      //   "hift\\..*\\.weight"
+      // CosyVoice3 Flow ancillary tensors: token-embedding lookup, conv1d
+      // pre/lookahead, time/positional/conditioning embeddings, output proj.
+      // All small (<5 MB each) and precision-critical for the CFM trajectory.
+      // NOTE: per-block AdaLN modulation (attn_norm.linear.weight) is *not*
+      // skipped — it's 1024x6144 (24 MB/block x 22 blocks = 528 MB), the
+      // largest single weight family in Flow DiT, and a plain matmul that
+      // quantizes cleanly under K-quants.
+      "flow\\.input_embedding\\.weight",
+      "flow\\.spk_embed_affine_layer\\.weight",
+      "flow\\.pre_lookahead_layer\\..*\\.weight",
+      "flow\\.decoder\\.estimator\\.time_embed\\..*\\.weight",
+      "flow\\.decoder\\.estimator\\.input_embed\\..*\\.weight",
+      "flow\\.decoder\\.estimator\\.norm_out\\..*\\.weight",
+      "flow\\.decoder\\.estimator\\.proj_out\\.weight",
+      // CosyVoice3 baked voice tuple — kept at original F32 (host metadata).
+      "cv3\\.default_voice\\..*"};
 
   // For non-mixed strategies (bare Q*_K / IQ*): default policy is to keep
   // embed/lm_head/ctc at source precision (F32/F16) because the GPU F16
