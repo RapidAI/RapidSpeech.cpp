@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
 Convert OpenVoice2 (MeloTTS) models to GGUF format.
-Reads directly from cached HuggingFace PyTorch checkpoints (.pth).
+Reads from a local MeloTTS checkpoint/config pair, or directly from cached
+HuggingFace PyTorch checkpoints (.pth).
 
 Usage:
   python3 convert_openvoice2_v2.py --lang ZH --output-dir ./models [--f16]
+  python3 convert_openvoice2_v2.py --lang ZH \
+      --checkpoint /path/to/G_266000.pth \
+      --config /path/to/config.json \
+      --output models/openvoice2-custom.gguf [--f16]
 """
 
-import argparse, json, os, struct, sys, torch
+import argparse, json, os, struct, sys
 import numpy as np
 
 # GGUF constants
@@ -121,6 +126,59 @@ def get_cached_model_path(lang):
     raise FileNotFoundError(f"No checkpoint found in {model_dir}")
 
 
+def find_checkpoint(model_dir):
+    """Find a MeloTTS checkpoint in a local model directory."""
+    candidates = []
+    for fname in os.listdir(model_dir):
+        if fname.endswith(".pth") or fname.endswith(".pt"):
+            candidates.append(fname)
+    if not candidates:
+        raise FileNotFoundError(f"No .pth/.pt checkpoint found in {model_dir}")
+    # Prefer MeloTTS generator checkpoints such as G_266000.pth.
+    candidates.sort(key=lambda name: (not name.startswith("G_"), name))
+    return os.path.join(model_dir, candidates[0])
+
+
+def resolve_model_paths(args):
+    """Resolve checkpoint/config paths for either local or HF-cache conversion."""
+    if args.checkpoint:
+        checkpoint_path = args.checkpoint
+        model_dir = args.model_dir or os.path.dirname(os.path.abspath(checkpoint_path))
+    elif args.model_dir:
+        model_dir = args.model_dir
+        checkpoint_path = find_checkpoint(model_dir)
+    else:
+        model_dir, checkpoint_path = get_cached_model_path(args.lang)
+
+    config_path = args.config or os.path.join(model_dir, "config.json")
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(
+            f"config.json not found: {config_path}\n"
+            "MeloTTS conversion needs the matching training config.json "
+            "for symbols, tones, languages, sample rate, and model dimensions."
+        )
+    return model_dir, checkpoint_path, config_path
+
+
+def torch_load(path):
+    import torch
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def unwrap_state_dict(checkpoint):
+    """Unwrap common PyTorch/Lightning checkpoint containers."""
+    state_dict = checkpoint
+    for key in ("model", "state_dict", "module"):
+        if isinstance(state_dict, dict) and key in state_dict and isinstance(state_dict[key], dict):
+            state_dict = state_dict[key]
+    return state_dict
+
+
 def reshape_pt_to_ggml(arr):
     """Reverse PyTorch shape to get ggml-compatible layout.
 
@@ -197,6 +255,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--lang", type=str, required=True, choices=["ZH", "EN"],
                         help="Language: ZH or EN")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Local MeloTTS .pth/.pt checkpoint, e.g. G_266000.pth")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Matching MeloTTS config.json. Defaults to <model-dir>/config.json")
+    parser.add_argument("--model-dir", type=str, default=None,
+                        help="Local directory containing config.json and a .pth/.pt checkpoint")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Output GGUF path. Defaults to <output-dir>/openvoice2-base-<lang>.gguf")
     parser.add_argument("--output-dir", type=str, default="./models")
     parser.add_argument("--f16", action="store_true", help="Store large weights as F16")
     args = parser.parse_args()
@@ -204,28 +270,28 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     dtype = GGML_TYPE_F16 if args.f16 else GGML_TYPE_F32
 
-    # Find cached model
-    model_dir, checkpoint_path = get_cached_model_path(args.lang)
+    # Resolve local checkpoint/config, or fall back to the cached HF model.
+    try:
+        model_dir, checkpoint_path, config_path = resolve_model_paths(args)
+    except FileNotFoundError as exc:
+        sys.exit(str(exc))
     print(f"Loading model from: {checkpoint_path}")
 
     # Load config
-    with open(os.path.join(model_dir, "config.json")) as f:
+    with open(config_path) as f:
         config = json.load(f)
     data_cfg = config["data"]
     model_cfg = config["model"]
 
     # Load state dict from PyTorch checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    # The checkpoint may be a dict with "model" or "state_dict" key, or the state_dict itself
-    if isinstance(checkpoint, dict) and "model" in checkpoint:
-        # Lightning checkpoint
-        state_dict = checkpoint["model"]
-        if isinstance(state_dict, dict) and "state_dict" in state_dict:
-            state_dict = state_dict["state_dict"]
-    elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-        state_dict = checkpoint["state_dict"]
-    else:
-        state_dict = checkpoint
+    try:
+        checkpoint = torch_load(checkpoint_path)
+    except ModuleNotFoundError as exc:
+        if exc.name == "torch":
+            sys.exit("Python package 'torch' is required: python3 -m pip install torch")
+        raise
+    # The checkpoint may be a dict with "model" or "state_dict" key, or the state_dict itself.
+    state_dict = unwrap_state_dict(checkpoint)
 
     # Convert torch tensors to numpy
     numpy_state = {}
@@ -271,7 +337,10 @@ def main():
     dtype_name = "F16" if args.f16 else "F32"
     print(f"Converted {n_conv} tensors (dtype={dtype_name})")
 
-    out_path = os.path.join(args.output_dir, f"openvoice2-base-{args.lang.lower()}.gguf")
+    out_path = args.output or os.path.join(args.output_dir, f"openvoice2-base-{args.lang.lower()}.gguf")
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     writer.write(out_path)
 
 

@@ -11,6 +11,9 @@
 // Forward-declare BertModel so this header doesn't pull in ggml.h.
 namespace rapidspeech { class BertModel; }
 
+// Forward decl — definition in frontend/wetext_normalizer.h.
+namespace rs { class WeTextNormalizer; }
+
 // =====================================================================
 // OpenVoice2 TTS Model (MeloTTS/VITS base + Tone Color Converter)
 //
@@ -182,6 +185,10 @@ private:
   // either or both may be null (corresponding branch then feeds zeros).
   std::unique_ptr<rapidspeech::BertModel> zh_bert_;
   std::unique_ptr<rapidspeech::BertModel> mbert_;
+
+  // Lazy-initialised WeTextProcessing TN (Chinese). Built on first ZH
+  // PushText call; pass-through if FST data is missing.
+  std::unique_ptr<rs::WeTextNormalizer> tn_;
 
   bool MapTensors(std::map<std::string, struct ggml_tensor*>& all_tensors);
 

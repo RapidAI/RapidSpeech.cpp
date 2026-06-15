@@ -1,14 +1,17 @@
 #include "openvoice2.h"
 #include "arch/bert.h"
 #include "core/rs_context.h"
+#include "frontend/wetext_normalizer.h"
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "utils/rs_log.h"
+#include "utils/rs_data_paths.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <numeric>
@@ -127,6 +130,30 @@ static struct ggml_tensor *layer_norm(struct ggml_context *ctx,
   return x;
 }
 
+static int32_t resolve_speaker_id(struct ggml_tensor *emb_g_w,
+                                  int32_t requested_sid,
+                                  const char *stage) {
+  if (!emb_g_w) return requested_sid;
+  int64_t n_spk = emb_g_w->ne[1] > 0 ? emb_g_w->ne[1] : 1;
+  if (requested_sid >= 0 && requested_sid < n_spk) return requested_sid;
+
+  int32_t sid = requested_sid < 0 ? 0 : static_cast<int32_t>(n_spk - 1);
+  RS_LOG_WARN("OpenVoice2: %s speaker_id=%d out of range for emb_g n_spk=%lld; using %d",
+              stage, requested_sid, (long long)n_spk, sid);
+  return sid;
+}
+
+static bool openvoice2_debug_enabled() {
+  static const bool enabled = []() {
+    const char *v = std::getenv("RS_OPENVOICE2_DEBUG");
+    if (!v || !v[0]) return false;
+    return std::strcmp(v, "0") != 0 &&
+           std::strcmp(v, "false") != 0 &&
+           std::strcmp(v, "FALSE") != 0;
+  }();
+  return enabled;
+}
+
 // =====================================================================
 // Pending-inputs registry for the no_alloc graph-building pattern.
 //
@@ -155,7 +182,7 @@ static void flush_pending_inputs() {
     for (size_t i = 0; i < g_pending_inputs.size(); i++) {
         auto &pi = g_pending_inputs[i];
         ggml_backend_tensor_set(pi.tensor, pi.data.data(), 0, pi.data.size());
-        if (pi.data.size() >= 4) {
+        if (openvoice2_debug_enabled() && pi.data.size() >= 4) {
             float first_val;
             ggml_backend_tensor_get(pi.tensor, &first_val, 0, sizeof(float));
         }
@@ -699,8 +726,42 @@ bool OpenVoice2Model::PushText(RSState& state, const char* text,
   s.tone_ids.clear();
   s.lang_ids.clear();
   std::vector<int32_t> word2ph;
+
+  // Optional WeTextProcessing TN before G2P (ZH only, default on; set
+  // RS_WETEXT=0 to disable). Pass-through if FST data is missing or fails
+  // to load. Mirrors the Kokoro PushText hookup.
+  std::string tn_buf;
+  const char *fe_text = text;
+  if (is_zh) {
+    bool tn_disabled = false;
+    if (const char *e = std::getenv("RS_WETEXT")) tn_disabled = (e[0] == '0');
+    if (!tn_disabled) {
+      if (!tn_) tn_ = std::make_unique<rs::WeTextNormalizer>();
+      if (!tn_->IsLoaded()) {
+        std::vector<std::string> tried_wt;
+        std::string wt_dir = rs::find_data_dir(
+            "wetext", "RS_WETEXT_DATA_DIR", &tried_wt);
+        if (wt_dir.empty()) {
+          std::string joined;
+          for (auto &p : tried_wt) { joined += "\n    "; joined += p; }
+          RS_LOG_WARN(
+              "OpenVoice2: WeText data not found (text normalisation "
+              "disabled). Searched:%s", joined.c_str());
+        } else {
+          tn_->Load(wt_dir + "/zh_tn_tagger.fst",
+                    wt_dir + "/zh_tn_verbalizer.fst");
+        }
+      }
+      tn_buf = tn_->Normalize(text);
+      fe_text = tn_buf.c_str();
+      if (const char *e = std::getenv("RS_WETEXT_DUMP"))
+        if (e[0] == '1')
+          std::fprintf(stderr, "TN: %s -> %s\n", text, fe_text);
+    }
+  }
+
   s.phoneme_ids = text_frontend_.TextToPhonemeIds(
-      text, s.language, &s.tone_ids, &s.lang_ids, s.language_id, /*add_blank=*/true,
+      fe_text, s.language, &s.tone_ids, &s.lang_ids, s.language_id, /*add_blank=*/true,
       &word2ph);
 
   if (s.phoneme_ids.empty()) {
@@ -857,8 +918,8 @@ bool OpenVoice2Model::Encode(const std::vector<float>& input_frames,
   auto& s = static_cast<OpenVoice2State&>(state);
   (void)input_frames;  // TTS doesn't use audio input for encoding
 
-  // TEST MODE: if reference z_p file exists, use it instead of text pipeline
-  {
+  // TEST MODE: if reference z_p file exists, use it instead of text pipeline.
+  if (openvoice2_debug_enabled()) {
     FILE* ftest = fopen("/tmp/z_p_for_cpp.bin", "rb");
     if (ftest) {
       fseek(ftest, 0, SEEK_END);
@@ -1013,6 +1074,7 @@ bool OpenVoice2Model::RunTextEncoder(OpenVoice2State& state,
   int n_heads = hparams_.n_heads;
   int head_dim = C / n_heads;
   int n_layers = hparams_.n_layers;
+  bool debug = openvoice2_debug_enabled();
 
   struct ggml_context *ctx0 = nullptr;
   struct ggml_cgraph *gf = nullptr;
@@ -1051,7 +1113,7 @@ bool OpenVoice2Model::RunTextEncoder(OpenVoice2State& state,
   // Embedding table: [hidden, vocab] (ggml) or [vocab, hidden] (PyTorch)
   if (emb_table && (emb_table->ne[0] >= C || emb_table->ne[1] >= C)) {
     // DEBUG: read raw emb_table values to verify data integrity
-    {
+    if (debug) {
       int n0 = (int)emb_table->ne[0], n1 = (int)emb_table->ne[1];
       int n_read = std::min(10, n0 * n1);
       std::vector<float> raw_emb(n_read);
@@ -1566,9 +1628,11 @@ bool OpenVoice2Model::RunTextEncoder(OpenVoice2State& state,
   {
     auto eg_it = weights_.embeddings.find("emb_g.weight");
     auto sw_it = w.find("text_encoder.encoder.spk_emb_linear.weight");
-    RS_LOG_INFO("OpenVoice2 DEBUG: emb_g.weight %s, spk_emb_linear.weight %s",
-                eg_it != weights_.embeddings.end() ? "FOUND" : "MISSING",
-                sw_it != w.end() ? "FOUND" : "MISSING");
+    if (debug) {
+      RS_LOG_INFO("OpenVoice2 DEBUG: emb_g.weight %s, spk_emb_linear.weight %s",
+                  eg_it != weights_.embeddings.end() ? "FOUND" : "MISSING",
+                  sw_it != w.end() ? "FOUND" : "MISSING");
+    }
     if (eg_it != weights_.embeddings.end() && sw_it != w.end()) {
       struct ggml_tensor *emb_g_w  = eg_it->second;
       struct ggml_tensor *spk_lin_w = sw_it->second;
@@ -1576,24 +1640,28 @@ bool OpenVoice2Model::RunTextEncoder(OpenVoice2State& state,
       auto sb_it = w.find("text_encoder.encoder.spk_emb_linear.bias");
       if (sb_it != w.end()) spk_lin_b = sb_it->second;
 
-      RS_LOG_INFO("OpenVoice2: emb_g.weight shape=[%lld,%lld] type=%d, spk_lin_w shape=[%lld,%lld]",
-                  (long long)emb_g_w->ne[0], (long long)emb_g_w->ne[1], (int)emb_g_w->type,
-                  (long long)spk_lin_w->ne[0], (long long)spk_lin_w->ne[1]);
-      // Dump speaker 1's embedding from emb_g_w (ggml layout: ne0=256 emb_dim, ne1=256 n_spk)
-      // PyTorch row sid: data[sid*256 + j]. Same bytes in ggml. Print first 5 of speaker 1.
-      {
+      int32_t sid = resolve_speaker_id(emb_g_w, state.speaker_id, "TextEncoder");
+      // Dump the selected speaker embedding from emb_g_w (ggml layout: ne0=gin, ne1=n_spk).
+      if (debug) {
+        RS_LOG_INFO("OpenVoice2: emb_g.weight shape=[%lld,%lld] type=%d, spk_lin_w shape=[%lld,%lld]",
+                    (long long)emb_g_w->ne[0], (long long)emb_g_w->ne[1], (int)emb_g_w->type,
+                    (long long)spk_lin_w->ne[0], (long long)spk_lin_w->ne[1]);
         std::vector<float> eg5(5);
-        // Speaker 1: offset = 1 * 256 floats = 1024 bytes
-        ggml_backend_tensor_get(emb_g_w, eg5.data(), 1*256*sizeof(float), 5*sizeof(float));
-        RS_LOG_INFO("OpenVoice2: emb_g[sid=1] first5 (offset 256 floats) = [%.4f, %.4f, %.4f, %.4f, %.4f]",
+        int64_t gin = emb_g_w->ne[0];
+        int n_dbg = std::min<int64_t>(5, gin);
+        ggml_backend_tensor_get(emb_g_w, eg5.data(),
+                                (size_t)sid * gin * sizeof(float),
+                                n_dbg * sizeof(float));
+        RS_LOG_INFO("OpenVoice2: emb_g[sid=%d] first5 = [%.4f, %.4f, %.4f, %.4f, %.4f]",
+                    sid,
                     eg5[0], eg5[1], eg5[2], eg5[3], eg5[4]);
-        // Also speaker 0 for sanity
-        ggml_backend_tensor_get(emb_g_w, eg5.data(), 0, 5*sizeof(float));
+        // Also speaker 0 for sanity.
+        ggml_backend_tensor_get(emb_g_w, eg5.data(), 0, n_dbg * sizeof(float));
         RS_LOG_INFO("OpenVoice2: emb_g[sid=0] first5 = [%.4f, %.4f, %.4f, %.4f, %.4f]",
                     eg5[0], eg5[1], eg5[2], eg5[3], eg5[4]);
       }
-      // Dump first 5 of spk_lin_w
-      {
+      // Dump first 5 of spk_lin_w.
+      if (debug) {
         std::vector<float> sw5(5);
         ggml_backend_tensor_get(spk_lin_w, sw5.data(), 0, 5*sizeof(float));
         RS_LOG_INFO("OpenVoice2: spk_lin_w first5 = [%.4f, %.4f, %.4f, %.4f, %.4f]",
@@ -1609,13 +1677,14 @@ bool OpenVoice2Model::RunTextEncoder(OpenVoice2State& state,
       struct ggml_tensor *sid_t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
       ggml_set_name(sid_t, "spk_id_te");
       ggml_set_input(sid_t);
-      int32_t sid = state.speaker_id;
       register_pending_input(sid_t, &sid, sizeof(int32_t));
 
       // emb_g_w: [gin_channels=256, n_spk=256], get_rows → [256, 1]
       struct ggml_tensor *g_vec = ggml_get_rows(ctx0, emb_g_w, sid_t);
-      ggml_set_name(g_vec, "g_vec_dbg");
-      ggml_set_output(g_vec);
+      if (debug) {
+        ggml_set_name(g_vec, "g_vec_dbg");
+        ggml_set_output(g_vec);
+      }
       // spk_lin_w: [ne0=256, ne1=192] (PyTorch [192,256] reversed) → mul_mat gives [192,1]
       g_proj_te = ggml_mul_mat(ctx0, spk_lin_w, g_vec);
       if (spk_lin_b) {
@@ -1635,11 +1704,15 @@ bool OpenVoice2Model::RunTextEncoder(OpenVoice2State& state,
 
     // Speaker conditioning at cond_layer_idx=2: x = x + g_proj (before attention)
     if (layer == 2 && g_proj_te) {
-      ggml_set_name(g_proj_te, "g_proj_te_dbg");
-      ggml_set_output(g_proj_te);
+      if (debug) {
+        ggml_set_name(g_proj_te, "g_proj_te_dbg");
+        ggml_set_output(g_proj_te);
+      }
       cur = ggml_add(ctx0, cur, g_proj_te);
-      ggml_set_name(cur, "layer_2_after_g_add");
-      ggml_set_output(cur);
+      if (debug) {
+        ggml_set_name(cur, "layer_2_after_g_add");
+        ggml_set_output(cur);
+      }
     }
 
     // --- Self-Attention ---
@@ -1723,7 +1796,7 @@ bool OpenVoice2Model::RunTextEncoder(OpenVoice2State& state,
     // --- Self-Attention block ---
     if (norm1_w && q_w && k_w && v_w && o_w) {
       // Quick sanity: read raw norm1_w values (only layer 0)
-      if (layer == 0) {
+      if (debug && layer == 0) {
         std::vector<float> nw(10);
         ggml_backend_tensor_get(norm1_w, nw.data(), 0, 10*sizeof(float));
         RS_LOG_INFO("OpenVoice2: layer0 norm1_w first10=%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
@@ -1732,7 +1805,7 @@ bool OpenVoice2Model::RunTextEncoder(OpenVoice2State& state,
       static const bool no_relpos = std::getenv("RS_NO_RELPOS") != nullptr;
       struct ggml_tensor *erk_use = no_relpos ? nullptr : emb_rel_k;
       struct ggml_tensor *erv_use = no_relpos ? nullptr : emb_rel_v;
-      if (layer == 1 && emb_rel_k) {
+      if (debug && layer == 1 && emb_rel_k) {
         size_t nelem = (size_t)emb_rel_k->ne[0] * emb_rel_k->ne[1] * (emb_rel_k->ne[2] ? emb_rel_k->ne[2] : 1);
         std::vector<float> tmp(nelem);
         if (emb_rel_k->type == GGML_TYPE_F32) {
@@ -1750,7 +1823,7 @@ bool OpenVoice2Model::RunTextEncoder(OpenVoice2State& state,
           ctx0, cur, q_w, q_b, k_w, k_b, v_w, v_b, o_w, o_b,
           erk_use, erv_use, n_heads, head_dim, T);
       // Debug: checkpoint raw attention output (before residual+LN)
-      {
+      if (debug) {
         ggml_set_name(attn_out, ("layer_" + std::to_string(layer) + "_attn_raw").c_str());
         layer_checkpoints.push_back(attn_out);
         if (!g_q_debug.empty()) {
@@ -1801,7 +1874,7 @@ bool OpenVoice2Model::RunTextEncoder(OpenVoice2State& state,
       // Debug: checkpoint after attention + post-norm
       {
         ggml_set_name(cur, ("layer_" + std::to_string(layer) + "_attn_norm").c_str());
-        layer_checkpoints.push_back(cur);
+        if (debug) layer_checkpoints.push_back(cur);
       }
     } else {
       RS_LOG_WARN("OpenVoice2: text_encoder layer %d missing attention weights, skipping", layer);
@@ -1814,7 +1887,7 @@ bool OpenVoice2Model::RunTextEncoder(OpenVoice2State& state,
       if (k_size <= 0) k_size = 3;
       if (conv1_w->ne[1] >= C) {
         // Debug: print weight shapes and values for layer 0
-        if (layer == 0) {
+        if (debug && layer == 0) {
           RS_LOG_INFO("OpenVoice2: L0 FFN conv1_w shape=%lldx%lldx%lld (k_size=%d, C=%d), conv2_w shape=%lldx%lldx%lld",
               (long long)conv1_w->ne[0], (long long)conv1_w->ne[1], (long long)conv1_w->ne[2], k_size, C,
               (long long)conv2_w->ne[0], (long long)conv2_w->ne[1], (long long)conv2_w->ne[2]);
@@ -1835,7 +1908,7 @@ bool OpenVoice2Model::RunTextEncoder(OpenVoice2State& state,
         struct ggml_tensor *ffn_h = conv1d_im2col(ctx0, cur, conv1_w, conv1_b, k_size,
                             k_size / 2, C, conv1_w->ne[2]);
         // Debug layer 0 FFN intermediate
-        if (layer == 0) {
+        if (debug && layer == 0) {
           RS_LOG_INFO("OpenVoice2: L0 ffn_h(pre-relu) shape=%lldx%lld",
               (long long)ffn_h->ne[0], (long long)ffn_h->ne[1]);
         }
@@ -1846,7 +1919,7 @@ bool OpenVoice2Model::RunTextEncoder(OpenVoice2State& state,
         struct ggml_tensor *ffn_out = conv1d_im2col(ctx0, ffn_h, conv2_w, conv2_b, k_size,
                             k_size / 2, conv2_w->ne[1], conv2_w->ne[2]);
         // Debug layer 0 FFN output
-        if (layer == 0) {
+        if (debug && layer == 0) {
           RS_LOG_INFO("OpenVoice2: L0 ffn_out shape=%lldx%lld",
               (long long)ffn_out->ne[0], (long long)ffn_out->ne[1]);
           ggml_set_name(ffn_out, "layer_0_ffn_raw");
@@ -1871,7 +1944,7 @@ bool OpenVoice2Model::RunTextEncoder(OpenVoice2State& state,
 
     // Save checkpoint for this layer (after FFN + norm)
     ggml_set_name(cur, ("layer_" + std::to_string(layer) + "_ffn_out").c_str());
-    layer_checkpoints.push_back(cur);
+    if (debug) layer_checkpoints.push_back(cur);
   }
 
   // --- Final LayerNorm ---
@@ -1904,7 +1977,7 @@ bool OpenVoice2Model::RunTextEncoder(OpenVoice2State& state,
   struct ggml_tensor *stats = nullptr;
   if (proj_w) {
     // Debug: verify proj weight values
-    {
+    if (debug) {
       int nproj = (int)(proj_w->ne[0] * proj_w->ne[1] * proj_w->ne[2]);
       int nread = std::min(20, nproj);
       std::vector<float> pw(nread);
@@ -1932,12 +2005,14 @@ bool OpenVoice2Model::RunTextEncoder(OpenVoice2State& state,
   // Build graph: mark all checkpoints, emb_out, text_encoder_out, and proj_stats
   // as outputs so their buffers are preserved after graph computation.
   // Without this, intermediate tensors get buffer-reuse'd and show garbage.
-  for (auto* ckpt : layer_checkpoints) {
-    ggml_set_output(ckpt);
-    ggml_build_forward_expand(gf, ckpt);
+  if (debug) {
+    for (auto* ckpt : layer_checkpoints) {
+      ggml_set_output(ckpt);
+      ggml_build_forward_expand(gf, ckpt);
+    }
+    ggml_set_output(emb_out_tensor);
+    ggml_build_forward_expand(gf, emb_out_tensor);
   }
-  ggml_set_output(emb_out_tensor);
-  ggml_build_forward_expand(gf, emb_out_tensor);
   ggml_set_output(cur);
   ggml_build_forward_expand(gf, cur);
   struct ggml_tensor *graph_out = stats ? stats : cur;
@@ -1984,7 +2059,7 @@ bool OpenVoice2Model::RunTextEncoder(OpenVoice2State& state,
   ggml_backend_sched_graph_compute(sched, gf);
 
   // Debug: read embedding output values from the saved tensor (before layers)
-  {
+  if (debug) {
     std::vector<float> emb_data(C * T);
     ggml_backend_tensor_get(emb_out_tensor, emb_data.data(), 0, emb_data.size() * sizeof(float));
     float emin=1e9, emax=-1e9; double esum=0, eabs=0;
@@ -2010,42 +2085,42 @@ bool OpenVoice2Model::RunTextEncoder(OpenVoice2State& state,
   }
 
   // --- Per-layer diagnostics ---
-  for (size_t li = 0; li < layer_checkpoints.size(); li++) {
-    auto* ckpt = layer_checkpoints[li];
-    int ckpt_C = (int)ckpt->ne[0];
-    int ckpt_T = (int)ckpt->ne[1];
-    size_t total = (size_t)ckpt->ne[0] * (size_t)ckpt->ne[1]
-                 * (size_t)(ckpt->ne[2] ? ckpt->ne[2] : 1)
-                 * (size_t)(ckpt->ne[3] ? ckpt->ne[3] : 1);
-    std::vector<float> ckpt_data(total);
-    ggml_backend_tensor_get(ckpt, ckpt_data.data(), 0,
-                            ckpt_data.size() * sizeof(float));
-    float cmin = 1e9, cmax = -1e9;
-    double csum = 0;
-    int nzero = 0;
-    for (size_t i = 0; i < ckpt_data.size(); i++) {
-      float v = ckpt_data[i];
-      if (v < cmin) cmin = v;
-      if (v > cmax) cmax = v;
-      csum += v;
-      if (v == 0.0f) nzero++;
-    }
-    const char* lbl = ckpt->name ? ckpt->name : "?";
-    RS_LOG_INFO("OpenVoice2: ckpt[%zu] %s -> [%.4f..%.4f] mean=%.4f nonzero=%d/%d",
-                li, lbl, cmin, cmax, (float)(csum / ckpt_data.size()),
-                (int)(ckpt_data.size() - nzero), (int)ckpt_data.size());
-    // Dump each layer for direct comparison with PyTorch reference
-    char path[256];
-    snprintf(path, sizeof(path), "/tmp/cpp_%s.bin", lbl);
-    FILE* f = fopen(path, "wb");
-    if (f) {
-      fwrite(ckpt_data.data(), 1, ckpt_data.size() * sizeof(float), f);
-      fclose(f);
+  if (debug) {
+    for (size_t li = 0; li < layer_checkpoints.size(); li++) {
+      auto* ckpt = layer_checkpoints[li];
+      size_t total = (size_t)ckpt->ne[0] * (size_t)ckpt->ne[1]
+                   * (size_t)(ckpt->ne[2] ? ckpt->ne[2] : 1)
+                   * (size_t)(ckpt->ne[3] ? ckpt->ne[3] : 1);
+      std::vector<float> ckpt_data(total);
+      ggml_backend_tensor_get(ckpt, ckpt_data.data(), 0,
+                              ckpt_data.size() * sizeof(float));
+      float cmin = 1e9, cmax = -1e9;
+      double csum = 0;
+      int nzero = 0;
+      for (size_t i = 0; i < ckpt_data.size(); i++) {
+        float v = ckpt_data[i];
+        if (v < cmin) cmin = v;
+        if (v > cmax) cmax = v;
+        csum += v;
+        if (v == 0.0f) nzero++;
+      }
+      const char* lbl = ckpt->name ? ckpt->name : "?";
+      RS_LOG_INFO("OpenVoice2: ckpt[%zu] %s -> [%.4f..%.4f] mean=%.4f nonzero=%d/%d",
+                  li, lbl, cmin, cmax, (float)(csum / ckpt_data.size()),
+                  (int)(ckpt_data.size() - nzero), (int)ckpt_data.size());
+      // Dump each layer for direct comparison with PyTorch reference.
+      char path[256];
+      snprintf(path, sizeof(path), "/tmp/cpp_%s.bin", lbl);
+      FILE* f = fopen(path, "wb");
+      if (f) {
+        fwrite(ckpt_data.data(), 1, ckpt_data.size() * sizeof(float), f);
+        fclose(f);
+      }
     }
   }
 
   // Debug: inspect speaker-conditioning tensors at runtime
-  {
+  if (debug) {
     struct ggml_tensor *st = ggml_graph_get_tensor(gf, "spk_id_te");
     if (st) {
       int32_t sval = -999;
@@ -2137,7 +2212,7 @@ bool OpenVoice2Model::RunTextEncoder(OpenVoice2State& state,
     RS_LOG_INFO("OpenVoice2: proj m_p [%.4f..%.4f] logs_p [%.4f..%.4f]",
                 mp_min, mp_max, lp_min, lp_max);
     // Dump m_p / logs_p for comparison with PyTorch
-    {
+    if (debug) {
       FILE* f1 = fopen("/tmp/cpp_m_p.bin", "wb");
       if (f1) { fwrite(state.m_p.data(), 1, state.m_p.size() * sizeof(float), f1); fclose(f1); }
       FILE* f2 = fopen("/tmp/cpp_logs_p.bin", "wb");
@@ -2146,7 +2221,7 @@ bool OpenVoice2Model::RunTextEncoder(OpenVoice2State& state,
       if (f3) { fwrite(state.encoder_hidden.data(), 1, state.encoder_hidden.size() * sizeof(float), f3); fclose(f3); }
     }
     // Print first 5 values for comparison with PyTorch
-    if (T > 0 && C >= 5) {
+    if (debug && T > 0 && C >= 5) {
       RS_LOG_INFO("OpenVoice2: first 5 hidden: %.4f, %.4f, %.4f, %.4f, %.4f",
                   state.encoder_hidden[0], state.encoder_hidden[1],
                   state.encoder_hidden[2], state.encoder_hidden[3],
@@ -2207,6 +2282,7 @@ bool OpenVoice2Model::RunDurationPredictor(OpenVoice2State& state,
 
   int T = state.encoder_T;
   int C = hparams_.hidden_channels;
+  bool debug = openvoice2_debug_enabled();
 
   struct ggml_context *ctx0 = nullptr;
   struct ggml_cgraph *gf = nullptr;
@@ -2279,7 +2355,7 @@ bool OpenVoice2Model::RunDurationPredictor(OpenVoice2State& state,
       struct ggml_tensor *sid_t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
       ggml_set_name(sid_t, "spk_id_dp");
       ggml_set_input(sid_t);
-      int32_t sid = state.speaker_id;
+      int32_t sid = resolve_speaker_id(emb_g_w, state.speaker_id, "DurationPredictor");
       register_pending_input(sid_t, &sid, sizeof(int32_t));
 
       struct ggml_tensor *g_vec = ggml_get_rows(ctx0, emb_g_w, sid_t);
@@ -2309,7 +2385,7 @@ bool OpenVoice2Model::RunDurationPredictor(OpenVoice2State& state,
   }
   struct ggml_tensor *dp_after_conv1 = cur;
   ggml_set_name(dp_after_conv1, "dp_after_conv1");
-  ggml_set_output(dp_after_conv1);
+  if (debug) ggml_set_output(dp_after_conv1);
 
     int cur_ch = cur->ne[0];
     cur = ggml_relu(ctx0, cur);
@@ -2318,7 +2394,7 @@ bool OpenVoice2Model::RunDurationPredictor(OpenVoice2State& state,
     }
   struct ggml_tensor *dp_after_norm1 = cur;
   ggml_set_name(dp_after_norm1, "dp_after_norm1");
-  ggml_set_output(dp_after_norm1);
+  if (debug) ggml_set_output(dp_after_norm1);
 
   // Conv block 1
   if (conv1_w) {
@@ -2340,7 +2416,7 @@ bool OpenVoice2Model::RunDurationPredictor(OpenVoice2State& state,
   }
   struct ggml_tensor *dp_after_norm2 = cur;
   ggml_set_name(dp_after_norm2, "dp_after_norm2");
-  ggml_set_output(dp_after_norm2);
+  if (debug) ggml_set_output(dp_after_norm2);
 
   // Projection to 1 dimension
   // proj weight may be 3D [1, in, 1] (1x1 conv) → squeeze to 2D [in, 1]
@@ -2351,7 +2427,7 @@ bool OpenVoice2Model::RunDurationPredictor(OpenVoice2State& state,
 
   struct ggml_tensor *dp_logw = cur;
   ggml_set_name(dp_logw, "dp_logw");
-  ggml_set_output(dp_logw);
+  if (debug) ggml_set_output(dp_logw);
 
   // Squeeze channel dimension: [1, T] → [T]
   cur = ggml_reshape_1d(ctx0, cur, T);
@@ -2362,10 +2438,12 @@ bool OpenVoice2Model::RunDurationPredictor(OpenVoice2State& state,
   ggml_set_name(cur, "durations");
   ggml_set_output(cur);
   ggml_build_forward_expand(gf, cur);
-  ggml_build_forward_expand(gf, dp_after_conv1);
-  ggml_build_forward_expand(gf, dp_after_norm1);
-  ggml_build_forward_expand(gf, dp_after_norm2);
-  ggml_build_forward_expand(gf, dp_logw);
+  if (debug) {
+    ggml_build_forward_expand(gf, dp_after_conv1);
+    ggml_build_forward_expand(gf, dp_after_norm1);
+    ggml_build_forward_expand(gf, dp_after_norm2);
+    ggml_build_forward_expand(gf, dp_logw);
+  }
 
   // --- Execute ---
   ggml_backend_sched_reset(sched);
@@ -2383,31 +2461,33 @@ bool OpenVoice2Model::RunDurationPredictor(OpenVoice2State& state,
   ggml_backend_sched_graph_compute(sched, gf);
 
   // Log intermediate DP values for debugging
-  auto log_dp_tensor = [](struct ggml_tensor *t, const char *label) {
-    int64_t n = t->ne[0] * t->ne[1];
-    std::vector<float> d(n);
-    ggml_backend_tensor_get(t, d.data(), 0, d.size() * sizeof(float));
-    float mn=1e9, mx=-1e9; double s=0;
-    for (auto v:d){if(v<mn)mn=v;if(v>mx)mx=v;s+=v;}
-    RS_LOG_INFO("DP %s [%lld,%lld] -> [%.4f..%.4f] mean=%.4f first5: %.4f,%.4f,%.4f,%.4f,%.4f",
-        label, (long long)t->ne[0], (long long)t->ne[1], mn, mx, (float)(s/d.size()),
-        d.size()>0?d[0]:0, d.size()>1?d[1]:0, d.size()>2?d[2]:0, d.size()>3?d[3]:0, d.size()>4?d[4]:0);
-  };
-  log_dp_tensor(dp_after_conv1, "after_conv1");
-  log_dp_tensor(dp_after_norm1, "after_relu+norm1");
-  log_dp_tensor(dp_after_norm2, "after_relu+norm2");
-  {
-    int64_t n = dp_logw->ne[0] * dp_logw->ne[1];
-    std::vector<float> d(n);
-    ggml_backend_tensor_get(dp_logw, d.data(), 0, d.size() * sizeof(float));
-    float mn=1e9, mx=-1e9; double s=0;
-    for (auto v:d){if(v<mn)mn=v;if(v>mx)mx=v;s+=v;}
-    RS_LOG_INFO("DP logw [%.4f..%.4f] mean=%.4f values: %s",
-        mn, mx, (float)(s/d.size()),
-        [&](){
-          std::string r; for(size_t i=0;i<d.size()&&i<T;i++){if(i>0)r+=",";r+=std::to_string(d[i]);}
-          return r;
-        }().c_str());
+  if (debug) {
+    auto log_dp_tensor = [](struct ggml_tensor *t, const char *label) {
+      int64_t n = t->ne[0] * t->ne[1];
+      std::vector<float> d(n);
+      ggml_backend_tensor_get(t, d.data(), 0, d.size() * sizeof(float));
+      float mn=1e9, mx=-1e9; double s=0;
+      for (auto v:d){if(v<mn)mn=v;if(v>mx)mx=v;s+=v;}
+      RS_LOG_INFO("DP %s [%lld,%lld] -> [%.4f..%.4f] mean=%.4f first5: %.4f,%.4f,%.4f,%.4f,%.4f",
+          label, (long long)t->ne[0], (long long)t->ne[1], mn, mx, (float)(s/d.size()),
+          d.size()>0?d[0]:0, d.size()>1?d[1]:0, d.size()>2?d[2]:0, d.size()>3?d[3]:0, d.size()>4?d[4]:0);
+    };
+    log_dp_tensor(dp_after_conv1, "after_conv1");
+    log_dp_tensor(dp_after_norm1, "after_relu+norm1");
+    log_dp_tensor(dp_after_norm2, "after_relu+norm2");
+    {
+      int64_t n = dp_logw->ne[0] * dp_logw->ne[1];
+      std::vector<float> d(n);
+      ggml_backend_tensor_get(dp_logw, d.data(), 0, d.size() * sizeof(float));
+      float mn=1e9, mx=-1e9; double s=0;
+      for (auto v:d){if(v<mn)mn=v;if(v>mx)mx=v;s+=v;}
+      RS_LOG_INFO("DP logw [%.4f..%.4f] mean=%.4f values: %s",
+          mn, mx, (float)(s/d.size()),
+          [&](){
+            std::string r; for(size_t i=0;i<d.size()&&i<T;i++){if(i>0)r+=",";r+=std::to_string(d[i]);}
+            return r;
+          }().c_str());
+    }
   }
 
   // --- Read output ---
@@ -2444,6 +2524,7 @@ bool OpenVoice2Model::RunFlowDecoder(OpenVoice2State& state,
   int n_mels = hparams_.n_mels;
   int T_mel = state.total_mel_frames;
   int C = hparams_.hidden_channels;
+  bool debug = openvoice2_debug_enabled();
   int T_txt = state.encoder_T;
 
 
@@ -2506,7 +2587,7 @@ bool OpenVoice2Model::RunFlowDecoder(OpenVoice2State& state,
       struct ggml_tensor *sid_t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
       ggml_set_name(sid_t, "spk_id_flow");
       ggml_set_input(sid_t);
-      int32_t sid = state.speaker_id;
+      int32_t sid = resolve_speaker_id(emb_g_w, state.speaker_id, "FlowDecoder");
       register_pending_input(sid_t, &sid, sizeof(int32_t));
       flow_g_vec = ggml_get_rows(ctx0, emb_g_w, sid_t);
     }
@@ -2644,12 +2725,16 @@ bool OpenVoice2Model::RunFlowDecoder(OpenVoice2State& state,
 
     // Check if this is a Chinese-style (pre+enc+post) or English-style (WaveNet) flow
     bool is_chinese_flow = (pre_w && post_w && n_enc_layers > 0);
-    RS_LOG_INFO("Flow %d: n_enc_layers=%d, pre_w=%p, post_w=%p, is_chinese=%d",
-                flow, n_enc_layers, (void*)pre_w, (void*)post_w, (int)is_chinese_flow);
-    for (int l = 0; l < n_enc_layers; l++) {
+    if (debug) {
+      RS_LOG_INFO("Flow %d: n_enc_layers=%d, pre_w=%p, post_w=%p, is_chinese=%d",
+                  flow, n_enc_layers, (void*)pre_w, (void*)post_w, (int)is_chinese_flow);
+    }
+    if (debug) {
+      for (int l = 0; l < n_enc_layers; l++) {
         auto& ew = enc_layers[l];
         RS_LOG_INFO("  enc_layer[%d]: norm1_w=%p, q_w=%p, conv1_w=%p",
                     l, (void*)ew.norm1_w, (void*)ew.q_w, (void*)ew.conv1_w);
+      }
     }
 
     if (!is_chinese_flow && (!in_l0_w || !in_l2_w)) {
@@ -2677,11 +2762,15 @@ bool OpenVoice2Model::RunFlowDecoder(OpenVoice2State& state,
         int K_w  = (int)pre_w->ne[0];
         int IC_w = (int)pre_w->ne[1];
         int OC_w = (int)pre_w->ne[2];
-        RS_LOG_INFO("Flow %d: pre_w shape [%d,%d,%d], x_a [%lld,%lld]",
-                    flow, K_w, IC_w, OC_w, (long long)x_a->ne[0], (long long)x_a->ne[1]);
+        if (debug) {
+          RS_LOG_INFO("Flow %d: pre_w shape [%d,%d,%d], x_a [%lld,%lld]",
+                      flow, K_w, IC_w, OC_w, (long long)x_a->ne[0], (long long)x_a->ne[1]);
+        }
         struct ggml_tensor *w_2d = ggml_reshape_2d(ctx0, pre_w, K_w * IC_w, OC_w);
         h = ggml_mul_mat(ctx0, w_2d, x_a);
-        RS_LOG_INFO("Flow %d: after pre_conv h [%lld,%lld]", flow, (long long)h->ne[0], (long long)h->ne[1]);
+        if (debug) {
+          RS_LOG_INFO("Flow %d: after pre_conv h [%lld,%lld]", flow, (long long)h->ne[0], (long long)h->ne[1]);
+        }
         if (pre_b) {
           struct ggml_tensor *b_2d = ggml_reshape_2d(ctx0, pre_b, OC_w, 1);
           h = ggml_add(ctx0, h, b_2d);
@@ -2729,9 +2818,11 @@ bool OpenVoice2Model::RunFlowDecoder(OpenVoice2State& state,
             ctx0, h, q_eff, ew.q_b, k_eff, ew.k_b,
             v_eff, ew.v_b, o_eff, ew.o_b,
             ew.emb_rel_k, ew.emb_rel_v, n_heads, head_dim, h->ne[1]);
-        RS_LOG_INFO("Flow %d layer %d: attn [%lld,%lld], h [%lld,%lld]",
-                    flow, l, (long long)attn->ne[0], (long long)attn->ne[1],
-                    (long long)h->ne[0], (long long)h->ne[1]);
+        if (debug) {
+          RS_LOG_INFO("Flow %d layer %d: attn [%lld,%lld], h [%lld,%lld]",
+                      flow, l, (long long)attn->ne[0], (long long)attn->ne[1],
+                      (long long)h->ne[0], (long long)h->ne[1]);
+        }
         h = ggml_add(ctx0, h, attn);
         h = layer_norm(ctx0, h, ew.norm1_w, ew.norm1_b, 1e-5f);
 
@@ -2741,16 +2832,24 @@ bool OpenVoice2Model::RunFlowDecoder(OpenVoice2State& state,
           int k_sz = (int)ew.conv1_w->ne[0];  // actual kernel size from weight
           int ic = (int)ew.conv1_w->ne[1];
           int oc = (int)ew.conv1_w->ne[2];
-          RS_LOG_INFO("Flow %d layer %d: conv1_w [%d,%d,%d] k_sz=%d pad=%d", flow, l, k_sz, ic, oc, k_sz, k_sz/2);
+          if (debug) {
+            RS_LOG_INFO("Flow %d layer %d: conv1_w [%d,%d,%d] k_sz=%d pad=%d", flow, l, k_sz, ic, oc, k_sz, k_sz/2);
+          }
           struct ggml_tensor *ffn_h = conv1d_im2col(ctx0, h, ew.conv1_w, ew.conv1_b, k_sz, k_sz/2, ic, oc);
-          RS_LOG_INFO("Flow %d layer %d: after ffn conv1 [%lld,%lld]", flow, l, (long long)ffn_h->ne[0], (long long)ffn_h->ne[1]);
+          if (debug) {
+            RS_LOG_INFO("Flow %d layer %d: after ffn conv1 [%lld,%lld]", flow, l, (long long)ffn_h->ne[0], (long long)ffn_h->ne[1]);
+          }
           ffn_h = ggml_relu(ctx0, ffn_h);
           int k_sz2 = (int)ew.conv2_w->ne[0];
           int ic2 = (int)ew.conv2_w->ne[1];
           int oc2 = (int)ew.conv2_w->ne[2];
-          RS_LOG_INFO("Flow %d layer %d: conv2_w [%d,%d,%d] k_sz=%d pad=%d", flow, l, k_sz2, ic2, oc2, k_sz2, k_sz2/2);
+          if (debug) {
+            RS_LOG_INFO("Flow %d layer %d: conv2_w [%d,%d,%d] k_sz=%d pad=%d", flow, l, k_sz2, ic2, oc2, k_sz2, k_sz2/2);
+          }
           struct ggml_tensor *ffn_out = conv1d_im2col(ctx0, ffn_h, ew.conv2_w, ew.conv2_b, k_sz2, k_sz2/2, ic2, oc2);
-          RS_LOG_INFO("Flow %d layer %d: after ffn conv2 [%lld,%lld]", flow, l, (long long)ffn_out->ne[0], (long long)ffn_out->ne[1]);
+          if (debug) {
+            RS_LOG_INFO("Flow %d layer %d: after ffn conv2 [%lld,%lld]", flow, l, (long long)ffn_out->ne[0], (long long)ffn_out->ne[1]);
+          }
           h = ggml_add(ctx0, ffn_out, ffn_in);
           h = layer_norm(ctx0, h, ew.norm2_w, ew.norm2_b, 1e-5f);
         }
@@ -2838,7 +2937,7 @@ bool OpenVoice2Model::RunFlowDecoder(OpenVoice2State& state,
 
   // Upload input data (sampled prior z_p)
   // --- TEST MODE: load z_p from file for comparison against PyTorch ---
-  {
+  if (debug) {
     const char* z_path = "/tmp/z_p_for_cpp.bin";
     FILE* f = fopen(z_path, "rb");
     if (f) {
@@ -2903,7 +3002,7 @@ bool OpenVoice2Model::RunFlowDecoder(OpenVoice2State& state,
   }
 
   // --- TEST MODE: save mel for comparison ---
-  {
+  if (debug) {
     const char* mel_path = "/tmp/mel_cpp.bin";
     FILE* f = fopen(mel_path, "wb");
     if (f) {
@@ -2949,16 +3048,19 @@ bool OpenVoice2Model::RunVocoder(OpenVoice2State& state,
   int n_mels = hparams_.n_mels;
   int T_mel = state.total_mel_frames;
   int hop = hparams_.hop_length;
+  bool debug = openvoice2_debug_enabled();
 
-  RS_LOG_INFO("OpenVoice2: RunVocoder called: mel_start=%d, mel_len=%d, T_mel=%d, n_mels=%d, hop=%d, mel_spec_size=%zu",
-              mel_start, mel_len, T_mel, n_mels, hop, state.mel_spectrogram.size());
-  for (auto& [name, t] : w) {
-    if (t->ne[2] > 1)
-      RS_LOG_INFO("  %s: [%lld, %lld, %lld]", name.c_str(), (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2]);
-    else if (t->ne[1] > 1)
-      RS_LOG_INFO("  %s: [%lld, %lld]", name.c_str(), (long long)t->ne[0], (long long)t->ne[1]);
-    else
-      RS_LOG_INFO("  %s: [%lld]", name.c_str(), (long long)t->ne[0]);
+  if (debug) {
+    RS_LOG_INFO("OpenVoice2: RunVocoder called: mel_start=%d, mel_len=%d, T_mel=%d, n_mels=%d, hop=%d, mel_spec_size=%zu",
+                mel_start, mel_len, T_mel, n_mels, hop, state.mel_spectrogram.size());
+    for (auto& [name, t] : w) {
+      if (t->ne[2] > 1)
+        RS_LOG_INFO("  %s: [%lld, %lld, %lld]", name.c_str(), (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2]);
+      else if (t->ne[1] > 1)
+        RS_LOG_INFO("  %s: [%lld, %lld]", name.c_str(), (long long)t->ne[0], (long long)t->ne[1]);
+      else
+        RS_LOG_INFO("  %s: [%lld]", name.c_str(), (long long)t->ne[0]);
+    }
   }
 
   if (w.empty()) {
@@ -3053,7 +3155,7 @@ bool OpenVoice2Model::RunVocoder(OpenVoice2State& state,
       struct ggml_tensor *sid_t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
       ggml_set_name(sid_t, "spk_id_voc");
       ggml_set_input(sid_t);
-      int32_t sid = state.speaker_id;
+      int32_t sid = resolve_speaker_id(emb_g_w, state.speaker_id, "Vocoder");
       register_pending_input(sid_t, &sid, sizeof(int32_t));
 
       struct ggml_tensor *g_vec = ggml_get_rows(ctx0, emb_g_w, sid_t);
@@ -3284,7 +3386,9 @@ bool OpenVoice2Model::RunVocoder(OpenVoice2State& state,
     if (xs_sum) {
       if (n_rb > 1) xs_sum = ggml_scale(ctx0, xs_sum, 1.0f / (float)n_rb);
       cur = xs_sum;
-      RS_LOG_INFO("OpenVoice2: after MRF[%d] (n_rb=%d) shape=[%lld,%lld]", up, n_rb, (long long)cur->ne[0], (long long)cur->ne[1]);
+      if (debug) {
+        RS_LOG_INFO("OpenVoice2: after MRF[%d] (n_rb=%d) shape=[%lld,%lld]", up, n_rb, (long long)cur->ne[0], (long long)cur->ne[1]);
+      }
     }
   }
 
