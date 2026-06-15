@@ -67,6 +67,13 @@ struct CosyVoice3State : public RSState {
   std::vector<int32_t> text_token_ids;
   std::vector<int32_t> speech_token_ids;
 
+  // Instruct2 mode (matches upstream `inference_instruct2`): when non-empty,
+  // these BPE ids replace `prompt_text_token_ids` in the LM prefix AND the
+  // LM-side prompt_speech_token rows are suppressed (Flow still gets them).
+  // Result: timbre still cloned from ref (Flow path intact), prosody/style
+  // guided by the instruct text instead of by the ref speech tokens.
+  std::vector<int32_t> instruct_text_token_ids;
+
   // Host-side KV after prefill, indexed [layer][kv_dim * n_tokens]
   std::vector<std::vector<float>> host_kv_k;
   std::vector<std::vector<float>> host_kv_v;
@@ -94,6 +101,21 @@ struct CosyVoice3State : public RSState {
   std::vector<float>   audio_output;       // 24 kHz f32    from HiFT
   bool flow_done = false;
   bool hift_done = false;
+
+  // ----- Chunk-streaming state (rs-tts-online) -----------------------------
+  // Upstream `CosyVoice2Model.tts` chunks the LM token stream and runs
+  // Flow+HiFT every `token_hop_len` (25 → 100, doubling) tokens, carrying
+  // 8 mel frames + 3840 PCM samples of overlap between chunks for a
+  // hamming-window crossfade. These fields are zero in the offline path
+  // (`Decode`) and only populated during `DecodeStream`.
+  struct HiFTStreamCache {
+    std::vector<float> mel;     // last mel_cache_len=8 frames, row-major [8 * n_mel]
+    std::vector<float> source;  // last source_cache_len=3840 samples (NSF excitation)
+    std::vector<float> speech;  // last source_cache_len=3840 samples (for hamming crossfade)
+    bool primed = false;        // false before first chunk emitted
+  };
+  HiFTStreamCache hift_stream;
+  int stream_token_offset = 0;  // tokens already emitted to Flow+HiFT
 };
 
 class CosyVoice3LMModel : public ISpeechModel {
@@ -112,6 +134,26 @@ public:
   }
   // Full pipeline: RunLM (text → speech tokens) → Flow (→ mel) → HiFT (→ wav).
   bool Decode(RSState &state, ggml_backend_sched_t sched) override;
+
+  // Chunk-streaming pipeline used by `rs-tts-online`. The LM AR loop fires
+  // `emit` synchronously every time a token chunk (25 → 100, doubling) has
+  // accumulated, after running Flow + HiFT over the new tokens with the
+  // upstream pre-lookahead / overlap-add carry semantics. The pcm buffer
+  // passed to `emit` is owned by `state.audio_output` and remains valid
+  // only until the next chunk is produced.
+  using AudioChunkCallback =
+      std::function<void(const float *pcm, size_t n)>;
+  bool DecodeStream(RSState &state, ggml_backend_sched_t sched,
+                    AudioChunkCallback emit);
+
+  // Per-token observer fired inside the LM AR loop right after each newly
+  // sampled speech token is appended to `state.speech_token_ids`. Returning
+  // `false` aborts decoding cleanly (mapped to a synthetic EOS). Used by
+  // `DecodeStream` to detect chunk boundaries.
+  using LMTokenCallback = std::function<bool(int32_t token)>;
+  void set_lm_token_callback(LMTokenCallback cb) {
+    lm_token_cb_ = std::move(cb);
+  }
   std::string GetTranscription(RSState &state) override;
 
   bool PushText(RSState &state, const char *text,
@@ -213,4 +255,8 @@ private:
 
   // imatrix observer — cv3_sched_compute reads &imatrix_cb_ to arm/disarm.
   std::function<void(struct ggml_tensor *)> imatrix_cb_;
+
+  // Per-token observer fired from RunLM inside the AR loop. Used by
+  // DecodeStream to chunk the speech-token stream. Empty in the offline path.
+  LMTokenCallback lm_token_cb_;
 };

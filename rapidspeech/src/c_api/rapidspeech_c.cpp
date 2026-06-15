@@ -3,6 +3,7 @@
 #include "core/rs_processor.h"
 #include "arch/cosyvoice3.h"
 #include "arch/funasr-nano.h"
+#include "arch/kokoro.h"
 #include "arch/omnivoice.h"
 #include "arch/sensevoice.h"
 #include "rapidspeech.h"
@@ -231,9 +232,23 @@ RS_API int32_t rs_process(rs_context_t *ctx) {
     int result;
     // Route to TTS or ASR processing based on model architecture
     const std::string &arch = ctx->processor->GetArchName();
-    if (arch == "openvoice2" || arch == "OmniVoice" ||
-        arch == "cosyvoice3-llm" || arch == "cosyvoice3") {
-      result = ctx->processor->ProcessTTS();
+    const bool is_tts =
+        (arch == "openvoice2" || arch == "OmniVoice" ||
+         arch == "cosyvoice3-llm" || arch == "cosyvoice3" ||
+         arch == "kokoro");
+    if (is_tts) {
+      // Streaming path: only CosyVoice3 implements it today. Falls back to
+      // the offline ProcessTTS for other arches even if the caller asks for
+      // RS_TASK_TTS_ONLINE.
+      const bool stream_requested =
+          ctx->params.task_type == RS_TASK_TTS_ONLINE;
+      const bool stream_supported =
+          (arch == "cosyvoice3-llm" || arch == "cosyvoice3");
+      if (stream_requested && stream_supported) {
+        result = ctx->processor->ProcessTTSStream();
+      } else {
+        result = ctx->processor->ProcessTTS();
+      }
     } else {
       result = ctx->processor->Process();
     }
@@ -623,6 +638,10 @@ RS_API void rs_set_imatrix_callback(rs_context_t *ctx,
     }
     if (auto *cv3 = dynamic_cast<CosyVoice3LMModel *>(ctx->model.get())) {
         cv3->set_imatrix_callback(cb);
+        return;
+    }
+    if (auto *kk = dynamic_cast<KokoroModel *>(ctx->model.get())) {
+        kk->set_imatrix_callback(cb);
         return;
     }
 }

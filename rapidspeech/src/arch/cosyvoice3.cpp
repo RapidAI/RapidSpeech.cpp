@@ -13,6 +13,7 @@
 #include "utils/rs_wav.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -471,9 +472,30 @@ std::shared_ptr<RSState> CosyVoice3LMModel::CreateState() {
 
 bool CosyVoice3LMModel::PushText(RSState &state, const char *text,
                                  const char *language, const char *instruct) {
-  (void)language; (void)instruct;
+  (void)language;
   auto &s = static_cast<CosyVoice3State &>(state);
   if (!llm_model_) return false;
+
+  // Instruct2 mode (upstream `inference_instruct2`): `instruct_text` replaces
+  // the ref transcript in the LM prefix and llm_prompt_speech_token gets
+  // dropped. The Flow path (prompt_token / prompt_feat / spk_emb) is
+  // untouched, so timbre cloning still works — only prosody is steered by
+  // the instruct text. We treat the OmniVoice gender placeholders
+  // ("male"/"female") as "no instruct" so the shared --instruct CLI flag
+  // keeps doing the right thing for both archs.
+  s.instruct_text_token_ids.clear();
+  if (instruct && *instruct) {
+    std::string iv = instruct;
+    const bool is_ov_gender_placeholder = (iv == "male" || iv == "female" ||
+                                           iv == "Male" || iv == "Female");
+    if (!is_ov_gender_placeholder) {
+      s.instruct_text_token_ids =
+          llm_model_->vocab().tokenize(iv, false);
+      RS_LOG_INFO("CosyVoice3: instruct2 mode (%zu BPE ids from '%s')",
+                  s.instruct_text_token_ids.size(), iv.c_str());
+    }
+  }
+
   if (!text || !*text) {
     s.text_token_ids.clear();
     return true;
@@ -812,6 +834,205 @@ int CosyVoice3LMModel::GetAudioOutput(RSState &state, float **out_data) {
   }
   *out_data = s.audio_output.data();
   return (int)s.audio_output.size();
+}
+
+// =====================================================================
+// DecodeStream — RunLM (with per-token chunking) → RunFlowStreaming →
+// RunHiFTStreaming → emit. Mirrors upstream `CosyVoice2Model.tts` with
+// `token_hop_len=25` doubling to `token_max_hop_len=100` and the
+// 3-token Flow `pre_lookahead_len`.
+//
+// Single-threaded: each chunk runs synchronously inside the LM token
+// callback. The caller (RSProcessor) typically drives this from a
+// background worker so `rs_process` can block on chunk arrival.
+// =====================================================================
+
+bool CosyVoice3LMModel::DecodeStream(RSState &state,
+                                    ggml_backend_sched_t sched,
+                                    AudioChunkCallback emit) {
+  auto &s = static_cast<CosyVoice3State &>(state);
+  if (!flow_ready_ || !hift_ready_) {
+    RS_LOG_ERR("CosyVoice3: DecodeStream requires flow_ + hift_ loaded");
+    return false;
+  }
+  if (!emit) {
+    RS_LOG_ERR("CosyVoice3: DecodeStream needs a non-null emit callback");
+    return false;
+  }
+  using clk = std::chrono::steady_clock;
+  auto ms = [](clk::time_point a, clk::time_point b) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count() / 1000.0;
+  };
+
+  auto t_prep0 = clk::now();
+  if (!PrepareVoice(s, sched)) return false;
+  if (const char *p = std::getenv("RS_CV3_SAVE_VOICE_PATH")) {
+    if (!voice_saved_ && SaveVoiceFile(s, p)) voice_saved_ = true;
+  }
+
+  // Stream tunables (match upstream CosyVoice2Model defaults).
+  constexpr int kTokenHopInit = 25;
+  constexpr int kTokenHopMax  = 100;
+  constexpr int kStreamScale  = 2;
+  // Non-finalize chunks run a reduced CFM trajectory: the tail of each
+  // intermediate chunk is recomputed (with more context) on the next chunk,
+  // so paying for the full 5 Euler steps there is wasted work. The final
+  // (finalize=true) chunk keeps the default to preserve quality of the tail
+  // that actually ships. Net: ~40 % Flow time off non-final chunks.
+  constexpr int kFlowStepsNonFinal = 3;
+  const int kPreLookahead = flow_->pre_lookahead_len();   // 3
+  const int kTokenMelRatio = flow_->token_mel_ratio();    // 2
+  const int kMelDim        = flow_->mel_dim();            // 80
+
+  // Reset streaming state.
+  s.stream_token_offset = 0;
+  s.hift_stream = CosyVoice3State::HiFTStreamCache{};
+  s.flow_done = false;
+  s.hift_done = false;
+  s.audio_output.clear();
+
+  // Prompt-token pad: round prompt_speech_token length up to a multiple
+  // of token_hop_len so the very first chunk's token grid aligns with
+  // the eventual stable hop. Only consumed on the first chunk.
+  int prompt_pad = 0;
+  if (!s.prompt_token.empty()) {
+    const int n_pt = (int)s.prompt_token.size();
+    prompt_pad =
+        ((n_pt + kTokenHopInit - 1) / kTokenHopInit) * kTokenHopInit - n_pt;
+  }
+  int cur_hop = kTokenHopInit;
+
+  const int T_pt_mel = (int)(s.prompt_feat.size() / (size_t)kMelDim);
+
+  // RNG isolation: in the offline path the sequence is
+  //   RunLM (consumes state.rng for sampling)
+  //   → Flow (consumes 1 state.rng then uses local)
+  //   → HiFT (consumes state.rng heavily for NSF source noise)
+  // In streaming the LM and the post-LM pipeline interleave per chunk, so
+  // unless we keep their RNG streams separated the LM token output drifts
+  // away from the offline reference (and from any fixed --seed). Snapshot
+  // here and swap around every Flow+HiFT call.
+  std::mt19937 pipeline_rng = s.rng;   // start from the same seed
+  // Per-stage accumulators so we can attribute the streaming overhead.
+  double total_flow_ms = 0.0, total_hift_ms = 0.0;
+  int    chunks_emitted = 0;
+  auto run_one_chunk = [&](int slice_end, bool finalize) -> bool {
+    std::mt19937 lm_rng_saved = s.rng;
+    s.rng = pipeline_rng;
+    // RAII-ish restore: capture both flow/hift error paths.
+    auto restore_rng = [&]() {
+      pipeline_rng = s.rng;
+      s.rng = lm_rng_saved;
+    };
+    auto t_flow0 = clk::now();
+    // 1) Flow over speech_token_ids[0..slice_end]. Non-finalize keeps
+    //    the prompt mel attached so we can slice by stream_token_offset.
+    const int n_steps_override = finalize ? -1 : kFlowStepsNonFinal;
+    if (!flow_->RunFlowStreaming(s, sched, slice_end, finalize,
+                                 n_steps_override)) {
+      RS_LOG_ERR("CosyVoice3-stream: RunFlowStreaming failed at slice=%d",
+                 slice_end);
+      restore_rng();
+      return false;
+    }
+    auto t_flow1 = clk::now();
+    total_flow_ms += ms(t_flow0, t_flow1);
+    // 2) Locate the "new" mel slice for this chunk inside s.mel_output.
+    //    Layouts:
+    //      finalize=false: [T_pt_mel + slice_end*ratio, mel_dim]
+    //      finalize=true : [(slice_end - 0)*ratio, mel_dim]   (prompt already trimmed)
+    int mel_start, mel_end;
+    if (finalize) {
+      mel_start = s.stream_token_offset * kTokenMelRatio;
+      mel_end   = slice_end * kTokenMelRatio;
+    } else {
+      mel_start = T_pt_mel + s.stream_token_offset * kTokenMelRatio;
+      mel_end   = T_pt_mel + slice_end * kTokenMelRatio;
+      // Upstream drops the lookahead-affected tail before HiFT so the
+      // chunk is "stable" — those mel frames will be recomputed (with
+      // more context) on the next chunk's Flow pass.
+      mel_end  -= kPreLookahead * kTokenMelRatio;
+    }
+    if (mel_end <= mel_start) {
+      // Nothing to emit yet (e.g. prompt_pad consumed everything).
+      restore_rng();
+      return true;
+    }
+    const int mel_chunk_T = mel_end - mel_start;
+    const float *mel_ptr =
+        s.mel_output.data() + (size_t)mel_start * kMelDim;
+
+    // 3) HiFT (with cross-chunk hamming crossfade + source/mel caches).
+    std::vector<float> emit_pcm;
+    auto t_hift0 = clk::now();
+    if (!hift_->RunHiFTStreaming(s, sched, mel_ptr, mel_chunk_T,
+                                 finalize, emit_pcm)) {
+      RS_LOG_ERR("CosyVoice3-stream: RunHiFTStreaming failed");
+      restore_rng();
+      return false;
+    }
+    auto t_hift1 = clk::now();
+    total_hift_ms += ms(t_hift0, t_hift1);
+    chunks_emitted++;
+    if (!emit_pcm.empty()) {
+      emit(emit_pcm.data(), emit_pcm.size());
+    }
+    restore_rng();
+    return true;
+  };
+
+  // Per-token callback fires after every newly sampled speech token has
+  // been appended to s.speech_token_ids. Returns false to abort the LM
+  // (mapped to a synthetic EOS inside RunLM).
+  std::atomic<bool> stream_ok{true};
+  set_lm_token_callback([&](int32_t /*tok*/) -> bool {
+    const int n = (int)s.speech_token_ids.size();
+    // The first chunk also has to swallow `prompt_pad` aligned tokens.
+    const int extra_pad =
+        (s.stream_token_offset == 0) ? prompt_pad : 0;
+    const int target =
+        s.stream_token_offset + cur_hop + extra_pad + kPreLookahead;
+    if (n >= target) {
+      const int slice_end = s.stream_token_offset + cur_hop + extra_pad
+                            + kPreLookahead;
+      if (!run_one_chunk(slice_end, /*finalize=*/false)) {
+        stream_ok.store(false);
+        return false;
+      }
+      s.stream_token_offset += cur_hop + extra_pad;
+      cur_hop = std::min(kTokenHopMax, cur_hop * kStreamScale);
+    }
+    return true;
+  });
+
+  auto t_lm0 = clk::now();
+  bool lm_ok = RunLM(s, sched);
+  set_lm_token_callback(nullptr);
+  auto t_lm1 = clk::now();
+  if (!lm_ok || !stream_ok.load()) {
+    RS_LOG_ERR("CosyVoice3-stream: RunLM aborted");
+    return false;
+  }
+
+  // Final drain: any tokens past stream_token_offset get emitted as the
+  // last (finalize=true) chunk so cache is cleared and the hamming tail
+  // isn't deferred.
+  const int total = (int)s.speech_token_ids.size();
+  if (total > s.stream_token_offset) {
+    if (!run_one_chunk(total, /*finalize=*/true)) return false;
+  } else if (s.hift_stream.primed) {
+    // No new tokens but a cached tail still owes the user audio. Emit
+    // the cached speech tail directly.
+    emit(s.hift_stream.speech.data(), s.hift_stream.speech.size());
+    s.hift_stream = CosyVoice3State::HiFTStreamCache{};
+  }
+  auto t_done = clk::now();
+  RS_LOG_INFO("CosyVoice3-stream timings: PrepareVoice=%.1fms LM=%.1fms "
+              "Flow=%.1fms HiFT=%.1fms chunks=%d (%zu tok) total=%.1fms",
+              ms(t_prep0, t_lm0), ms(t_lm0, t_lm1),
+              total_flow_ms, total_hift_ms, chunks_emitted,
+              s.speech_token_ids.size(), ms(t_prep0, t_done));
+  return true;
 }
 
 // =====================================================================

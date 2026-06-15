@@ -11,12 +11,80 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <vector>
 
 // =====================================================================
 // File-local helpers — patterns from cosyvoice.cpp/src/cosyvoice-graph.cpp.
 // =====================================================================
 
 namespace {
+
+ggml_backend_t pick_flow_backend(ggml_backend_sched_t sched) {
+  const int n_backends = ggml_backend_sched_get_n_backends(sched);
+  for (int i = 0; i < n_backends; ++i) {
+    ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+    ggml_backend_dev_t dev = ggml_backend_get_device(b);
+    if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+      return b;
+    }
+  }
+  return ggml_backend_sched_get_backend(sched, n_backends - 1);
+}
+
+ggml_tensor *flow_view_root(ggml_tensor *tensor) {
+  while (tensor && tensor->view_src) {
+    tensor = tensor->view_src;
+  }
+  return tensor;
+}
+
+void assign_flow_persistent_backend(ggml_backend_sched_t sched,
+                                    ggml_backend_t backend,
+                                    ggml_cgraph *gf,
+                                    const std::vector<ggml_tensor *> &tensors) {
+  if (!sched || !backend) {
+    return;
+  }
+
+  for (ggml_tensor *tensor : tensors) {
+    if (tensor) {
+      ggml_backend_sched_set_tensor_backend(sched, tensor, backend);
+    }
+  }
+
+  if (!gf) {
+    return;
+  }
+  const int n_nodes = ggml_graph_n_nodes(gf);
+  for (int i = 0; i < n_nodes; ++i) {
+    ggml_tensor *node = ggml_graph_node(gf, i);
+    if (!node) {
+      continue;
+    }
+    if (node->op != GGML_OP_CPY && node->op != GGML_OP_SET &&
+        node->op != GGML_OP_SET_ROWS) {
+      continue;
+    }
+
+    ggml_tensor *view_src = flow_view_root(node->view_src);
+    if (!view_src && node->src[1]) {
+      view_src = flow_view_root(node->src[1]);
+    }
+    if (!view_src && node->src[2]) {
+      view_src = flow_view_root(node->src[2]);
+    }
+    if (!view_src) {
+      continue;
+    }
+
+    for (ggml_tensor *tensor : tensors) {
+      if (view_src == tensor) {
+        ggml_backend_sched_set_tensor_backend(sched, node, backend);
+        break;
+      }
+    }
+  }
+}
 
 // concat([a, b], dim=0) for F32 tensors (matches ref1 ggml_concat call).
 ggml_tensor *concat_f32(ggml_context *ctx, ggml_tensor *a, ggml_tensor *b,
@@ -721,9 +789,23 @@ ggml_tensor *CosyVoice3FlowModel::BuildCFMStepGraph(
 
 bool CosyVoice3FlowModel::RunFlow(CosyVoice3State &state,
                                   ggml_backend_sched_t sched) {
-  if (state.flow_done) return true;
-  if (state.speech_token_ids.empty()) {
-    RS_LOG_ERR("Flow: no speech tokens to synthesize");
+  return RunFlowStreaming(state, sched,
+                          (int)state.speech_token_ids.size(),
+                          /*finalize=*/true);
+}
+
+bool CosyVoice3FlowModel::RunFlowStreaming(CosyVoice3State &state,
+                                           ggml_backend_sched_t sched,
+                                           int n_tokens_in,
+                                           bool finalize,
+                                           int n_steps_override) {
+  // Offline-path skip: `state.flow_done` is only flipped by the finalize=true
+  // exit, so this short-circuit never triggers during streaming.
+  if (finalize && state.flow_done) return true;
+  if (n_tokens_in <= 0 ||
+      n_tokens_in > (int)state.speech_token_ids.size()) {
+    RS_LOG_ERR("Flow: invalid n_tokens_in=%d (have %zu)",
+               n_tokens_in, state.speech_token_ids.size());
     return false;
   }
   if (state.embedding.size() != (size_t)spk_dim_in_) {
@@ -732,7 +814,23 @@ bool CosyVoice3FlowModel::RunFlow(CosyVoice3State &state,
     return false;
   }
 
-  const int T_gen     = (int)state.speech_token_ids.size();
+  // Resolve Euler step count + cosine schedule. The default path reuses the
+  // pre-baked `t_span_`; a positive override rebuilds the schedule locally so
+  // streaming chunks can run fewer steps without disturbing offline state.
+  const int local_steps = (n_steps_override > 0) ? n_steps_override
+                                                 : euler_steps_;
+  std::vector<float> local_t_span;
+  const std::vector<float> *t_span_ptr = &t_span_;
+  if (local_steps != euler_steps_) {
+    local_t_span.resize((size_t)local_steps + 1);
+    const float c = 1.0f / (float)local_steps;
+    for (int i = 0; i <= local_steps; ++i)
+      local_t_span[i] = 1.0f - std::cos(c * 0.5f * (float)M_PI * (float)i);
+    t_span_ptr = &local_t_span;
+  }
+  const std::vector<float> &t_span_use = *t_span_ptr;
+
+  const int T_gen     = n_tokens_in;
   const int T_pt      = (int)state.prompt_token.size();
   const int T_pt_mel  = (int)(state.prompt_feat.size() / mel_dim_);
   const int T_gen_mel = T_gen * token_mel_ratio_;
@@ -752,12 +850,57 @@ bool CosyVoice3FlowModel::RunFlow(CosyVoice3State &state,
   constexpr size_t FLOW_CTX_BYTES =
       FLOW_MAX_NODES * (sizeof(ggml_tensor) + 256);
 
+  ggml_backend_t flow_backend = pick_flow_backend(sched);
+  ggml_backend_buffer_t persistent_buf = nullptr;
+  ggml_context *ctx_persist = nullptr;
+  ggml_tensor *mu_dev = nullptr;
+  ggml_tensor *cond_dev = nullptr;
+  ggml_tensor *spks_dev = nullptr;
+  ggml_tensor *x_dev[2] = {nullptr, nullptr};
+  auto free_persistent = [&]() {
+    if (persistent_buf) {
+      ggml_backend_buffer_free(persistent_buf);
+      persistent_buf = nullptr;
+    }
+    if (ctx_persist) {
+      ggml_free(ctx_persist);
+      ctx_persist = nullptr;
+    }
+  };
+
+  {
+    ggml_init_params ip = {
+        (size_t)6 * ggml_tensor_overhead() + (1 << 16), nullptr, true};
+    ctx_persist = ggml_init(ip);
+    mu_dev = ggml_new_tensor_3d(ctx_persist, GGML_TYPE_F32,
+                                mel_dim_, T_mel, 1);
+    cond_dev = ggml_new_tensor_3d(ctx_persist, GGML_TYPE_F32,
+                                  mel_dim_, T_mel, 1);
+    spks_dev = ggml_new_tensor_3d(ctx_persist, GGML_TYPE_F32,
+                                  mel_dim_, 1, 1);
+    x_dev[0] = ggml_new_tensor_3d(ctx_persist, GGML_TYPE_F32,
+                                  mel_dim_, T_mel, 1);
+    x_dev[1] = ggml_new_tensor_3d(ctx_persist, GGML_TYPE_F32,
+                                  mel_dim_, T_mel, 1);
+    ggml_set_name(mu_dev, "flow.mu.persistent");
+    ggml_set_name(cond_dev, "flow.cond.persistent");
+    ggml_set_name(spks_dev, "flow.spks.persistent");
+    ggml_set_name(x_dev[0], "flow.x0.persistent");
+    ggml_set_name(x_dev[1], "flow.x1.persistent");
+
+    persistent_buf = ggml_backend_alloc_ctx_tensors(ctx_persist, flow_backend);
+    if (!persistent_buf) {
+      RS_LOG_ERR("Flow: failed to allocate persistent device tensors");
+      ggml_free(ctx_persist);
+      return false;
+    }
+  }
+
   // -----------------------------------------------------------------------
   // Encode pass: build a graph that produces (mu, spks, cond) into outputs,
-  // then read them back to host so they can be re-fed each Euler step as
-  // input tensors (avoids replicating the whole encode graph 10×).
+  // then copy them into persistent backend tensors that are re-used by every
+  // Euler step without a host round-trip.
   // -----------------------------------------------------------------------
-  std::vector<float> h_mu, h_spks, h_cond;
   {
     ggml_init_params ip = { FLOW_CTX_BYTES, nullptr, true };
     ggml_context *ctx = ggml_init(ip);
@@ -775,7 +918,7 @@ bool CosyVoice3FlowModel::RunFlow(CosyVoice3State &state,
     }
     tokens_host.insert(tokens_host.end(),
                        state.speech_token_ids.begin(),
-                       state.speech_token_ids.end());
+                       state.speech_token_ids.begin() + n_tokens_in);
     ggml_tensor *t_gen = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T_tok);
     ggml_set_input(t_gen); ggml_set_name(t_gen, "tokens");
     ggml_tensor *t_prompt = nullptr;  // unused now; encode picks T_pt up from prompt_feat
@@ -789,19 +932,22 @@ bool CosyVoice3FlowModel::RunFlow(CosyVoice3State &state,
     ggml_set_input(t_emb); ggml_set_name(t_emb, "spk_embedding");
 
     auto enc = BuildEncodeGraph(ctx, t_prompt, t_gen, t_pf, t_emb);
-    ggml_set_output(enc.mu);
-    ggml_set_output(enc.spks);
-    ggml_set_output(enc.cond);
-    ggml_build_forward_expand(gf, enc.mu);
-    ggml_build_forward_expand(gf, enc.spks);
-    ggml_build_forward_expand(gf, enc.cond);
+    ggml_tensor *mu_copy = ggml_cpy(ctx, enc.mu, mu_dev);
+    ggml_tensor *cond_copy = ggml_cpy(ctx, enc.cond, cond_dev);
+    ggml_tensor *spks_copy = ggml_cpy(ctx, enc.spks, spks_dev);
+    ggml_build_forward_expand(gf, mu_copy);
+    ggml_build_forward_expand(gf, cond_copy);
+    ggml_build_forward_expand(gf, spks_copy);
 
     // Reset the scheduler in case a previous sub-model (V3 tokenizer /
     // CAMPPlus) left tensor backend assignments in flight.
     ggml_backend_sched_reset(sched);
+    assign_flow_persistent_backend(
+        sched, flow_backend, gf, {mu_dev, cond_dev, spks_dev});
     if (!ggml_backend_sched_alloc_graph(sched, gf)) {
       RS_LOG_ERR("Flow: failed to allocate encode graph");
       ggml_free(ctx);
+      free_persistent();
       return false;
     }
     ggml_backend_tensor_set(t_gen, tokens_host.data(), 0,
@@ -816,23 +962,24 @@ bool CosyVoice3FlowModel::RunFlow(CosyVoice3State &state,
     if (cv3_sched_compute(sched, gf, &imatrix_cb_) != GGML_STATUS_SUCCESS) {
       RS_LOG_ERR("Flow: encode compute failed");
       ggml_free(ctx);
+      free_persistent();
       return false;
     }
 
-    h_mu.resize((size_t)mel_dim_ * T_mel);
-    h_cond.resize((size_t)mel_dim_ * T_mel);
-    h_spks.resize((size_t)mel_dim_);  // shape [mel_dim, 1, 1]
-    ggml_backend_tensor_get(enc.mu,   h_mu.data(),   0,
-                            h_mu.size() * sizeof(float));
-    ggml_backend_tensor_get(enc.cond, h_cond.data(), 0,
-                            h_cond.size() * sizeof(float));
-    ggml_backend_tensor_get(enc.spks, h_spks.data(), 0,
-                            h_spks.size() * sizeof(float));
     // Debug: dump (mu, cond, spks) tensors for PT cross-check.
     // Format: int32 T_mel, int32 mel_dim, then f32 mu[mel_dim*T_mel],
     //         f32 cond[mel_dim*T_mel], f32 spks[mel_dim].
     if (const char *p = std::getenv("RS_CV3_DUMP_FLOW_ENC")) {
       if (FILE *f = std::fopen(p, "wb")) {
+        std::vector<float> h_mu((size_t)mel_dim_ * T_mel);
+        std::vector<float> h_cond((size_t)mel_dim_ * T_mel);
+        std::vector<float> h_spks((size_t)mel_dim_);
+        ggml_backend_tensor_get(mu_dev, h_mu.data(), 0,
+                                h_mu.size() * sizeof(float));
+        ggml_backend_tensor_get(cond_dev, h_cond.data(), 0,
+                                h_cond.size() * sizeof(float));
+        ggml_backend_tensor_get(spks_dev, h_spks.data(), 0,
+                                h_spks.size() * sizeof(float));
         int32_t hdr[2] = {T_mel, mel_dim_};
         std::fwrite(hdr, sizeof(int32_t), 2, f);
         std::fwrite(h_mu.data(),   sizeof(float), h_mu.size(),   f);
@@ -857,63 +1004,62 @@ bool CosyVoice3FlowModel::RunFlow(CosyVoice3State &state,
     std::normal_distribution<float> nd(0.f, 1.f);
     for (auto &v : h_x) v = nd(rng);
   }
+  ggml_backend_tensor_set(x_dev[0], h_x.data(), 0,
+                          h_x.size() * sizeof(float));
 
   // -----------------------------------------------------------------------
-  // Euler loop. Steps 1..N (N = euler_steps_), last step applies cut_len.
+  // Euler loop. Steps 1..N (N = local_steps), last step applies cut_len.
   // -----------------------------------------------------------------------
   // Precompute t[i] and dt[i] from the cosine schedule. ref1's get_t_and_dt
   // accumulates from index 0:  t[step] = sum_{k=1..step}(t_span[k]-t_span[k-1])
   //                                    = t_span[step] - t_span[0]
   //                                    + t_span[0]    (start value)
   // Simpler: t[step] = t_span[step-1]; dt[step] = t_span[step]-t_span[step-1].
-  std::vector<float> ts(euler_steps_ + 1), dts(euler_steps_ + 1);
-  for (int step = 1; step <= euler_steps_; ++step) {
-    ts[step]  = t_span_[step - 1];
-    dts[step] = t_span_[step] - t_span_[step - 1];
+  std::vector<float> ts(local_steps + 1), dts(local_steps + 1);
+  for (int step = 1; step <= local_steps; ++step) {
+    ts[step]  = t_span_use[step - 1];
+    dts[step] = t_span_use[step] - t_span_use[step - 1];
   }
 
-  for (int step = 1; step <= euler_steps_; ++step) {
-    const bool last = (step == euler_steps_);
-    const int64_t cut_len = last ? (int64_t)T_pt_mel : 0;
-    const int64_t T_out   = last ? (int64_t)T_gen_mel : (int64_t)T_mel;
+  for (int step = 1; step <= local_steps; ++step) {
+    const bool last = (step == local_steps);
+    // Streaming non-finalize chunks keep the prompt mel in-place so the
+    // next chunk's encode gets a stable initial condition (matches upstream
+    // `token2wav(stream=True, finalize=False)`).
+    const int64_t cut_len = (last && finalize) ? (int64_t)T_pt_mel : 0;
+    const int src_x = (step - 1) & 1;
+    const int dst_x = step & 1;
 
     ggml_init_params ip = { FLOW_CTX_BYTES, nullptr, true };
     ggml_context *ctx = ggml_init(ip);
     ggml_cgraph *gf = ggml_new_graph_custom(ctx, FLOW_MAX_NODES, false);
 
-    ggml_tensor *x_in  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
-                                            mel_dim_, T_mel, 1);
-    ggml_set_input(x_in);
-    ggml_tensor *mu_in   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
-                                              mel_dim_, T_mel, 1);
-    ggml_set_input(mu_in);
-    ggml_tensor *cond_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
-                                              mel_dim_, T_mel, 1);
-    ggml_set_input(cond_in);
-    ggml_tensor *spk_in  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
-                                              mel_dim_, 1, 1);
-    ggml_set_input(spk_in);
-
     ggml_tensor *pos_ids = nullptr;
     ggml_tensor *x_next = BuildCFMStepGraph(
-        ctx, x_in, mu_in, spk_in, cond_in, cut_len,
+        ctx, x_dev[src_x], mu_dev, spks_dev, cond_dev, cut_len,
         ts[step], dts[step], pos_ids);
-    ggml_set_output(x_next);
-    ggml_build_forward_expand(gf, x_next);
+    ggml_tensor *x_store = nullptr;
+    if (last && finalize) {
+      // Trimmed output: x_next is [mel_dim, T_gen_mel]; write into the
+      // prefix of dst so the post-loop tensor_get reads contiguous rows.
+      x_store = ggml_cpy(ctx, x_next, ggml_view_3d(
+                                     ctx, x_dev[dst_x], mel_dim_, T_gen_mel, 1,
+                                     x_dev[dst_x]->nb[1],
+                                     x_dev[dst_x]->nb[2], 0));
+    } else {
+      x_store = ggml_cpy(ctx, x_next, x_dev[dst_x]);
+    }
+    ggml_build_forward_expand(gf, x_store);
 
+    assign_flow_persistent_backend(
+        sched, flow_backend, gf,
+        {mu_dev, cond_dev, spks_dev, x_dev[0], x_dev[1]});
     if (!ggml_backend_sched_alloc_graph(sched, gf)) {
       RS_LOG_ERR("Flow: failed to allocate step graph (step=%d)", step);
       ggml_free(ctx);
+      free_persistent();
       return false;
     }
-    ggml_backend_tensor_set(x_in,  h_x.data(), 0,
-                            h_x.size() * sizeof(float));
-    ggml_backend_tensor_set(mu_in,   h_mu.data(),   0,
-                            h_mu.size()   * sizeof(float));
-    ggml_backend_tensor_set(cond_in, h_cond.data(), 0,
-                            h_cond.size() * sizeof(float));
-    ggml_backend_tensor_set(spk_in,  h_spks.data(), 0,
-                            h_spks.size() * sizeof(float));
 
     // Build position_ids on the host: [T_mel, 2] with each batch slot
     // identical = 0..T_mel-1.
@@ -929,44 +1075,49 @@ bool CosyVoice3FlowModel::RunFlow(CosyVoice3State &state,
     if (cv3_sched_compute(sched, gf, &imatrix_cb_) != GGML_STATUS_SUCCESS) {
       RS_LOG_ERR("Flow: step compute failed (step=%d)", step);
       ggml_free(ctx);
+      free_persistent();
       return false;
     }
 
-    std::vector<float> h_next((size_t)mel_dim_ * T_out);
-    ggml_backend_tensor_get(x_next, h_next.data(), 0,
-                            h_next.size() * sizeof(float));
-    if (last) {
-      // After the last step we already dropped the prompt prefix.
-      h_x = std::move(h_next);
-    } else {
-      h_x = std::move(h_next);
-    }
     ggml_free(ctx);
     ggml_backend_sched_reset(sched);
   }
 
-  // h_x is now [mel_dim, T_gen_mel] = [80, T_gen_mel]; copy to state in
-  // row-major [T_gen_mel, 80] order for downstream consumption.
-  state.mel_output.assign((size_t)T_gen_mel * mel_dim_, 0.f);
-  for (int t = 0; t < T_gen_mel; ++t) {
+  // Streaming mode keeps the prompt mel attached so the caller can slice
+  // by stream_token_offset; offline mode (finalize=true) emits only the
+  // generated portion.
+  const int T_out = finalize ? T_gen_mel : T_mel;
+
+  // x_dev[local_steps & 1] is now [mel_dim, T_out] in its prefix.
+  // Fetch once at the end and copy to row-major [T_out, 80] for HiFT.
+  h_x.resize((size_t)mel_dim_ * T_out);
+  ggml_backend_tensor_get(x_dev[local_steps & 1], h_x.data(), 0,
+                          h_x.size() * sizeof(float));
+  free_persistent();
+
+  state.mel_output.assign((size_t)T_out * mel_dim_, 0.f);
+  for (int t = 0; t < T_out; ++t) {
     for (int m = 0; m < mel_dim_; ++m) {
       state.mel_output[(size_t)t * mel_dim_ + m] =
           h_x[(size_t)t * mel_dim_ + m];
     }
   }
-  state.flow_done = true;
-  RS_LOG_INFO("Flow: produced mel [%d, %d]", T_gen_mel, mel_dim_);
+  if (finalize) {
+    state.flow_done = true;
+  }
+  RS_LOG_INFO("Flow: produced mel [%d, %d]%s", T_out, mel_dim_,
+              finalize ? "" : " (streaming, prompt prefix kept)");
   // Debug: dump the Flow mel output for offline inspection / PT-HiFT cross-check.
   if (const char *p = std::getenv("RS_CV3_DUMP_FLOW_MEL")) {
     FILE *f = std::fopen(p, "wb");
     if (f) {
-      int32_t hdr[2] = {T_gen_mel, mel_dim_};
+      int32_t hdr[2] = {T_out, mel_dim_};
       std::fwrite(hdr, sizeof(int32_t), 2, f);
       std::fwrite(state.mel_output.data(), sizeof(float),
                   state.mel_output.size(), f);
       std::fclose(f);
       RS_LOG_INFO("Flow: dumped mel [%d, %d] f32 -> %s",
-                  T_gen_mel, mel_dim_, p);
+                  T_out, mel_dim_, p);
     }
   }
   return true;

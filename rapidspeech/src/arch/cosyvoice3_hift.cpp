@@ -661,6 +661,131 @@ bool CosyVoice3HiFTModel::RunHiFT(CosyVoice3State &state,
   const int T_mel = (int)(state.mel_output.size() / mel_dim);
   GGML_ASSERT(T_mel * mel_dim == (int)state.mel_output.size());
 
+  state.audio_output.clear();
+  if (!RunHiFTCore(state, sched,
+                   state.mel_output.data(), T_mel,
+                   /*cache_source=*/nullptr, /*cache_source_n=*/0,
+                   state.audio_output, /*out_source=*/nullptr)) {
+    return false;
+  }
+  state.hift_done = true;
+  RS_LOG_INFO("HiFT: produced %zu samples @ %d Hz", state.audio_output.size(),
+              sample_rate_);
+  return true;
+}
+
+bool CosyVoice3HiFTModel::RunHiFTStreaming(CosyVoice3State &state,
+                                           ggml_backend_sched_t sched,
+                                           const float *mel_chunk,
+                                           int mel_chunk_T,
+                                           bool finalize,
+                                           std::vector<float> &out_pcm) {
+  if (!mel_chunk || mel_chunk_T <= 0) {
+    RS_LOG_ERR("HiFT-stream: empty mel chunk");
+    return false;
+  }
+  const int mel_dim = 80;
+  const int src_cache = source_cache_len();
+  auto &cache = state.hift_stream;
+
+  // Build the mel buffer fed to the HiFT graph: cached 8 frames (if primed)
+  // followed by the new chunk.
+  std::vector<float> mel_full;
+  if (cache.primed) {
+    if ((int)cache.mel.size() != kMelCacheLen * mel_dim) {
+      RS_LOG_ERR("HiFT-stream: cache.mel size %zu != %d",
+                 cache.mel.size(), kMelCacheLen * mel_dim);
+      return false;
+    }
+    mel_full.resize((kMelCacheLen + mel_chunk_T) * (size_t)mel_dim);
+    std::memcpy(mel_full.data(), cache.mel.data(),
+                cache.mel.size() * sizeof(float));
+    std::memcpy(mel_full.data() + cache.mel.size(),
+                mel_chunk,
+                (size_t)mel_chunk_T * mel_dim * sizeof(float));
+  } else {
+    mel_full.assign(mel_chunk,
+                    mel_chunk + (size_t)mel_chunk_T * mel_dim);
+  }
+  const int T_full = (int)(mel_full.size() / mel_dim);
+
+  std::vector<float> pcm;
+  std::vector<float> source;
+  if (!RunHiFTCore(state, sched, mel_full.data(), T_full,
+                   cache.primed ? cache.source.data() : nullptr,
+                   cache.primed ? src_cache : 0,
+                   pcm, &source)) {
+    return false;
+  }
+
+  // Hamming crossfade between the regenerated head of this chunk and the
+  // deferred speech tail from the previous chunk (upstream fade_in_out).
+  if (cache.primed) {
+    if ((int)cache.speech.size() != src_cache) {
+      RS_LOG_ERR("HiFT-stream: cache.speech size %zu != %d",
+                 cache.speech.size(), src_cache);
+      return false;
+    }
+    if ((int)pcm.size() < src_cache) {
+      RS_LOG_ERR("HiFT-stream: pcm size %zu < src_cache=%d",
+                 pcm.size(), src_cache);
+      return false;
+    }
+    const auto &win = HammingWindow(2 * src_cache);
+    for (int i = 0; i < src_cache; ++i) {
+      pcm[i] = pcm[i] * win[i] + cache.speech[i] * win[src_cache + i];
+    }
+  }
+
+  if (!finalize) {
+    if ((int)pcm.size() < src_cache) {
+      RS_LOG_ERR("HiFT-stream: pcm shorter than src_cache");
+      return false;
+    }
+    // Save tails for the next chunk.
+    cache.mel.assign(
+        mel_full.end() - (size_t)kMelCacheLen * mel_dim, mel_full.end());
+    cache.source.assign(source.end() - src_cache, source.end());
+    cache.speech.assign(pcm.end() - src_cache, pcm.end());
+    cache.primed = true;
+    out_pcm.assign(pcm.begin(), pcm.end() - src_cache);
+  } else {
+    out_pcm = std::move(pcm);
+    cache = {};
+  }
+  return true;
+}
+
+const std::vector<float> &CosyVoice3HiFTModel::HammingWindow(int N) const {
+  if ((int)hamming_window_cached_.size() != N) {
+    hamming_window_cached_.assign((size_t)N, 0.f);
+    // np.hamming: w[n] = 0.54 - 0.46 * cos(2π n / (N-1))
+    const double denom = (N > 1) ? (double)(N - 1) : 1.0;
+    for (int n = 0; n < N; ++n) {
+      hamming_window_cached_[n] =
+          (float)(0.54 - 0.46 * std::cos(2.0 * M_PI * n / denom));
+    }
+  }
+  return hamming_window_cached_;
+}
+
+// =====================================================================
+// RunHiFTCore — shared mel → 24 kHz PCM pipeline used by both offline
+// `RunHiFT` and the streaming `RunHiFTStreaming`.
+// =====================================================================
+bool CosyVoice3HiFTModel::RunHiFTCore(CosyVoice3State &state,
+                                     ggml_backend_sched_t sched,
+                                     const float *mel_ptr, int T_mel,
+                                     const float *cache_source,
+                                     int cache_source_n,
+                                     std::vector<float> &out_pcm,
+                                     std::vector<float> *out_source) {
+  if (!mel_ptr || T_mel <= 0) {
+    RS_LOG_ERR("HiFT-core: empty mel input");
+    return false;
+  }
+  const int mel_dim = 80;
+
   constexpr int HIFT_MAX_NODES = 8192;
   constexpr size_t HIFT_CTX_BYTES =
       HIFT_MAX_NODES * (sizeof(ggml_tensor) + 256);
@@ -690,8 +815,8 @@ bool CosyVoice3HiFTModel::RunHiFT(CosyVoice3State &state,
       ggml_free(ctx);
       return false;
     }
-    ggml_backend_tensor_set(sf, state.mel_output.data(), 0,
-                            state.mel_output.size() * sizeof(float));
+    ggml_backend_tensor_set(sf, mel_ptr, 0,
+                            (size_t)T_mel * mel_dim * sizeof(float));
     if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
       RS_LOG_ERR("HiFT: F0 compute failed");
       ggml_free(ctx);
@@ -723,6 +848,18 @@ bool CosyVoice3HiFTModel::RunHiFT(CosyVoice3State &state,
   std::vector<float> sine_merge;
   RunSourceCpu(h_f0.data(), T_mel, sine_merge, state.rng);
   const int T_audio = (int)sine_merge.size();
+
+  // Streaming continuity: splice the cached NSF source over the front of
+  // the freshly generated sine_merge so the noise / phase don't jump at
+  // the chunk boundary (the hamming crossfade in the caller smooths the
+  // residual splice).
+  if (cache_source && cache_source_n > 0) {
+    const int n = std::min(cache_source_n, T_audio);
+    std::memcpy(sine_merge.data(), cache_source, (size_t)n * sizeof(float));
+  }
+  if (out_source) {
+    *out_source = sine_merge;  // caller-side cache of the post-splice source.
+  }
 
   // (3) CPU STFT of sine_merge.
   std::vector<float> s_real, s_imag;
@@ -789,8 +926,8 @@ bool CosyVoice3HiFTModel::RunHiFT(CosyVoice3State &state,
       ggml_free(ctx);
       return false;
     }
-    ggml_backend_tensor_set(sf, state.mel_output.data(), 0,
-                            state.mel_output.size() * sizeof(float));
+    ggml_backend_tensor_set(sf, mel_ptr, 0,
+                            (size_t)T_mel * mel_dim * sizeof(float));
     ggml_backend_tensor_set(st, s_stft_host.data(), 0,
                             s_stft_host.size() * sizeof(float));
     if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
@@ -857,9 +994,6 @@ bool CosyVoice3HiFTModel::RunHiFT(CosyVoice3State &state,
     v = std::max(-audio_limit_, std::min(audio_limit_, v));
   }
 
-  state.audio_output = std::move(pcm);
-  state.hift_done = true;
-  RS_LOG_INFO("HiFT: produced %zu samples @ %d Hz", state.audio_output.size(),
-              sample_rate_);
+  out_pcm = std::move(pcm);
   return true;
 }

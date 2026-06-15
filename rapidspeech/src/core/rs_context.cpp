@@ -23,8 +23,10 @@
 #endif
 
 #include <functional>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -42,6 +44,62 @@ static std::unordered_map<std::string, ModelCreator> &get_model_registry() {
 
 void rs_register_model_arch(const std::string &arch, ModelCreator creator) {
   get_model_registry()[arch] = creator;
+}
+
+static bool rs_backend_name_contains(ggml_backend_t backend,
+                                     const char *needle) {
+  if (!backend || !needle)
+    return false;
+  const char *name = ggml_backend_name(backend);
+  return name && std::string(name).find(needle) != std::string::npos;
+}
+
+static bool rs_cann_unsupported_quant_type(enum ggml_type type) {
+  switch (type) {
+  case GGML_TYPE_Q4_1:
+  case GGML_TYPE_Q5_0:
+  case GGML_TYPE_Q5_1:
+  case GGML_TYPE_Q8_1:
+  case GGML_TYPE_Q2_K:
+  case GGML_TYPE_Q3_K:
+  case GGML_TYPE_Q4_K:
+  case GGML_TYPE_Q5_K:
+  case GGML_TYPE_Q6_K:
+  case GGML_TYPE_Q8_K:
+  case GGML_TYPE_IQ1_S:
+  case GGML_TYPE_IQ1_M:
+  case GGML_TYPE_IQ2_XXS:
+  case GGML_TYPE_IQ2_XS:
+  case GGML_TYPE_IQ2_S:
+  case GGML_TYPE_IQ3_XXS:
+  case GGML_TYPE_IQ3_S:
+  case GGML_TYPE_IQ4_NL:
+  case GGML_TYPE_IQ4_XS:
+  case GGML_TYPE_TQ1_0:
+  case GGML_TYPE_TQ2_0:
+  case GGML_TYPE_MXFP4:
+  case GGML_TYPE_NVFP4:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool rs_gguf_has_cann_unsupported_quant(const gguf_context *ctx,
+                                               const char **bad_name,
+                                               enum ggml_type *bad_type) {
+  const int64_t n_tensors = gguf_get_n_tensors(ctx);
+  for (int64_t i = 0; i < n_tensors; ++i) {
+    enum ggml_type type = gguf_get_tensor_type(ctx, i);
+    if (rs_cann_unsupported_quant_type(type)) {
+      if (bad_name)
+        *bad_name = gguf_get_tensor_name(ctx, i);
+      if (bad_type)
+        *bad_type = type;
+      return true;
+    }
+  }
+  return false;
 }
 
 rs_context_t::rs_context_t()
@@ -84,8 +142,7 @@ rs_context_t::~rs_context_t() {
 bool rs_context_t::init_backend(bool prefer_cpu) {
   bool gpu_initialized = false;
 
-  // Skip GPU for small models with many fine-grained ops (OpenVoice2)
-  // that trigger Metal command-buffer errors on GPU.
+  // Skip GPU for models that explicitly prefer CPU.
   if (prefer_cpu) {
     RS_LOG_INFO("Model prefers CPU — skipping GPU backend init");
   }
@@ -202,8 +259,6 @@ rs_context_t *rs_context_init_internal(rs_init_params_t params) {
   ctx->params = params;
 
   // 1. Load GGUF handle early to detect architecture before backend init.
-  //    Small TTS models (OpenVoice2) have many fine-grained ops that cause
-  //    Metal GPU command-buffer failures; they need CPU-only backends.
   struct gguf_init_params g_params = {/*.no_alloc =*/true,
                                       /*.ctx      =*/&ctx->gguf_data};
 
@@ -222,14 +277,44 @@ rs_context_t *rs_context_init_internal(rs_init_params_t params) {
   std::string arch = gguf_get_val_str(ctx->ctx_gguf, arch_key);
   RS_LOG_INFO("Architecture detected: %s", arch.c_str());
 
-  // Models with many fine-grained GPU-hostile ops (HiFi-GAN vocoder, etc.)
-  // run faster on CPU and trigger Metal command-buffer errors on GPU.
-  bool prefer_cpu = (arch == "openvoice2");
+  // Kokoro defaults to GPU now — the engine itself pins the stride-10
+  // ConvTranspose1d inside the iSTFTNet generator to CPU (per-op split on
+  // gen_sched), so pLBERT/text_enc/predictor run on Metal while only the
+  // problematic generator op stays on CPU. Set RS_KOKORO_BACKEND=cpu to
+  // force the entire pipeline back to CPU if needed.
+  //
+  // OpenVoice2 defaults to GPU when params.use_gpu=true; set
+  // RS_OPENVOICE2_BACKEND=cpu to force CPU.
+  const char *ov2_backend = std::getenv("RS_OPENVOICE2_BACKEND");
+  bool openvoice2_force_cpu =
+      arch == "openvoice2" && ov2_backend &&
+      (std::string(ov2_backend) == "cpu" || std::string(ov2_backend) == "CPU");
+  const char *kokoro_backend = std::getenv("RS_KOKORO_BACKEND");
+  bool kokoro_force_cpu =
+      arch == "kokoro" && kokoro_backend &&
+      (std::string(kokoro_backend) == "cpu" || std::string(kokoro_backend) == "CPU");
+  bool prefer_cpu = openvoice2_force_cpu || kokoro_force_cpu;
 
   // 3. Hardware detection and backend initialization
   if (!ctx->init_backend(prefer_cpu)) {
     RS_LOG_ERR("Failed to initialize backend scheduler.");
     return nullptr;
+  }
+
+  if (!prefer_cpu && arch == "kokoro" && !ctx->backends.empty() &&
+      rs_backend_name_contains(ctx->backends.front(), "CANN")) {
+    const char *bad_name = nullptr;
+    enum ggml_type bad_type = GGML_TYPE_COUNT;
+    if (rs_gguf_has_cann_unsupported_quant(ctx->ctx_gguf, &bad_name,
+                                           &bad_type)) {
+      RS_LOG_WARN(
+          "Kokoro: CANN backend does not support %s weights for matmul "
+          "(first tensor: %s). Loading Kokoro weights on CPU to avoid "
+          "ggml_backend_sched_split_graph abort. Use q4_0/q8_0/f16/f32/bf16 "
+          "Kokoro models for CANN acceleration.",
+          ggml_type_name(bad_type), bad_name ? bad_name : "<unknown>");
+      prefer_cpu = true;
+    }
   }
 
   // 4. Allocate physical memory buffers on the appropriate backend.

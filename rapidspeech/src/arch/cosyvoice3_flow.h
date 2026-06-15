@@ -70,8 +70,40 @@ public:
    */
   bool RunFlow(CosyVoice3State &state, ggml_backend_sched_t sched);
 
+  /**
+   * Streaming variant used by `CosyVoice3LMModel::DecodeStream`. Differs from
+   * the offline `RunFlow` in two ways:
+   *
+   *   1. Only the first `n_tokens_in` entries of `state.speech_token_ids`
+   *      participate in encode / CFM — letting the orchestrator hand off
+   *      partial chunks plus a 3-token lookahead.
+   *
+   *   2. When `finalize` is false, the final Euler step does NOT apply the
+   *      `cut_len = T_pt_mel` trim, so `state.mel_output` comes out as the
+   *      *full* `[T_pt_mel + n_tokens_in * 2, mel_dim]` mel and the caller
+   *      can slice the new portion off by `stream_token_offset * 2`. When
+   *      `finalize` is true the prompt is trimmed exactly as in `RunFlow`
+   *      (i.e. output is `[n_tokens_in * 2, mel_dim]`).
+   *
+   * `state.flow_done` is *not* set in streaming mode — the streaming caller
+   * runs Flow many times per utterance.
+   *
+   * `n_steps_override` (>0) lets the caller use a lower Euler-step count for
+   * non-finalize chunks (the head and middle of the stream); the cosine
+   * schedule is rebuilt locally so quality stays comparable. -1 means "use
+   * the member `euler_steps_`" (the global default / CLI value).
+   */
+  bool RunFlowStreaming(CosyVoice3State &state, ggml_backend_sched_t sched,
+                        int n_tokens_in, bool finalize,
+                        int n_steps_override = -1);
+
   /** Override the default 10 Euler steps (e.g. from a CLI flag). */
   void SetEulerSteps(int n);
+
+  // Accessors used by the streaming orchestrator (CosyVoice3LMModel::DecodeStream).
+  int pre_lookahead_len() const { return pre_lookahead_len_; }
+  int token_mel_ratio()   const { return token_mel_ratio_; }
+  int mel_dim()           const { return mel_dim_; }
 
   // Activation-aware quantization hook. The Flow DiT is the most
   // quantization-sensitive part of CV3 (10-step CFM trajectory accumulates

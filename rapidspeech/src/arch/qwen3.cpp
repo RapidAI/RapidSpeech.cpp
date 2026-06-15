@@ -142,6 +142,10 @@ llm_graph_result_ptr llm_build_qwen3::build_graph(const int32_t *tokens,
   if (current_opts_.causal_mask) {
     uint32_t n_kv_cache =
         kv_cache ? kv_cache->size() : current_opts_.n_kv_cache;
+    if (current_opts_.is_decode_step && current_opts_.fixed_kv_cache_shape &&
+        current_opts_.n_kv_max > n_tokens) {
+      n_kv_cache = current_opts_.n_kv_max - n_tokens;
+    }
     causal_mask = build_causal_mask_tensor(ctx_, n_tokens, n_kv_cache);
   }
 
@@ -225,6 +229,10 @@ llm_graph_result_ptr llm_build_qwen3::build_graph_from_embeds(
   if (current_opts_.causal_mask) {
     uint32_t n_kv_cache =
         kv_cache ? kv_cache->size() : current_opts_.n_kv_cache;
+    if (current_opts_.is_decode_step && current_opts_.fixed_kv_cache_shape &&
+        current_opts_.n_kv_max > n_tokens) {
+      n_kv_cache = current_opts_.n_kv_max - n_tokens;
+    }
     causal_mask = build_causal_mask_tensor(ctx_, n_tokens, n_kv_cache);
   }
 

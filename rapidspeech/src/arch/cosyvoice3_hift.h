@@ -61,6 +61,38 @@ public:
    */
   bool RunHiFT(CosyVoice3State &state, ggml_backend_sched_t sched);
 
+  /**
+   * Streaming variant used by `CosyVoice3LMModel::DecodeStream`. Synthesizes
+   * PCM for `mel_chunk` (row-major `[mel_chunk_T, mel_dim_=80]`), carrying
+   * over `state.hift_stream` between calls so chunk boundaries crossfade
+   * smoothly via the upstream hamming-window scheme (`source_cache_len=8`
+   * mel frames = `8 * scale_factor_ = 3840` PCM samples).
+   *
+   * Behavior:
+   *   - First call (`hift_stream.primed == false`): runs HiFT on `mel_chunk`
+   *     directly, caches the trailing `mel_cache_len=8` mel frames, the last
+   *     `source_cache_len=3840` source samples, and the last 3840 PCM
+   *     samples. Emits `pcm[:-3840]` (deferring the cached tail).
+   *
+   *   - Subsequent non-finalize calls: prepends the cached 8 mel frames,
+   *     reuses the cached source for the first 3840 samples (NSF continuity),
+   *     crossfades the first 3840 emitted samples with the cached speech
+   *     using `hamming(7680)`, then defers the new tail.
+   *
+   *   - `finalize == true`: same crossfade if primed, but emits the full
+   *     tail and clears the cache.
+   *
+   * `state.hift_done` is *not* flipped in streaming mode.
+   */
+  bool RunHiFTStreaming(CosyVoice3State &state, ggml_backend_sched_t sched,
+                        const float *mel_chunk, int mel_chunk_T,
+                        bool finalize, std::vector<float> &out_pcm);
+
+  // Constants used by the streaming orchestrator.
+  static constexpr int kMelCacheLen   = 8;     // mel frames
+  int source_cache_len() const { return kMelCacheLen * scale_factor_; }
+  int sample_rate()      const { return sample_rate_; }
+
 private:
   // -------------------------------------------------------------------------
   // Hparams (read from `cosyvoice3.hift.*` KVs).
@@ -159,4 +191,21 @@ private:
                std::vector<float> &out_imag, int &T_stft) const;
   void IstftCpu(const float *mag, const float *phase, int T_stft,
                 std::vector<float> &out_pcm) const;
+
+  // Shared core used by both the offline `RunHiFT` and the streaming
+  // `RunHiFTStreaming`. Synthesizes 24 kHz PCM from `mel_ptr` (row-major
+  // `[T_mel, mel_dim=80]`). When `cache_source` is non-null, its first
+  // `cache_source_n` samples replace the front of the generated NSF source
+  // to preserve phase / noise continuity across chunk boundaries (the
+  // hamming crossfade in the caller masks any residual splice artifact).
+  // `out_source` (when non-null) receives the post-splice source samples.
+  bool RunHiFTCore(CosyVoice3State &state, ggml_backend_sched_t sched,
+                   const float *mel_ptr, int T_mel,
+                   const float *cache_source, int cache_source_n,
+                   std::vector<float> &out_pcm,
+                   std::vector<float> *out_source);
+
+  // Cached np.hamming(N) window — lazily filled, reused across chunks.
+  mutable std::vector<float> hamming_window_cached_;
+  const std::vector<float> &HammingWindow(int N) const;
 };

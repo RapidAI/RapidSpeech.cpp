@@ -117,8 +117,8 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
   const int kv_dim = head_dim * n_head_kv;
 
   s.speech_token_ids.clear();
-  s.host_kv_k.assign(n_layer, std::vector<float>());
-  s.host_kv_v.assign(n_layer, std::vector<float>());
+  s.host_kv_k.clear();
+  s.host_kv_v.clear();
   s.n_cached = 0;
 
   // CosyVoice3 LLM input format (matches upstream `CosyVoice3LM.inference`):
@@ -134,22 +134,34 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
   //   prompt_text = "You are a helpful assistant.<|endofprompt|>" + ref_text
   // i.e. the system prefix and 151646 sit BEFORE the ref transcript, and the
   // whole bundle is concatenated with tts_text before the LM forward.
+  //
+  // Instruct2 mode (`s.instruct_text_token_ids` non-empty): upstream
+  // `frontend_instruct2` replaces `prompt_text` with `instruct_text` and
+  // deletes `llm_prompt_speech_token`. We mirror that here: instruct ids
+  // take the ref-transcript slot AND `n_pt` is forced to 0 for the LM prefix.
+  // The Flow path still uses `s.prompt_token` / `s.prompt_feat` / `s.embedding`
+  // so timbre cloning continues to work — only LM-side prosody is steered by
+  // instruct text.
   const int32_t sos_id      = speech_codebook_;      // 6561
   const int32_t task_id     = speech_codebook_ + 2;  // 6563
   const int32_t eop_id      = 151646;                // <|endofprompt|>
+
+  const bool instruct_mode = !s.instruct_text_token_ids.empty();
+  const std::vector<int32_t> &lm_prompt_text_ids =
+      instruct_mode ? s.instruct_text_token_ids : s.prompt_text_token_ids;
 
   std::vector<int32_t> sys_prefix_ids = llm_model_->vocab().tokenize(
       std::string("You are a helpful assistant."), false);
 
   std::vector<int32_t> prompt_text_with_eop;
   prompt_text_with_eop.reserve(sys_prefix_ids.size() + 1 +
-                               s.prompt_text_token_ids.size());
+                               lm_prompt_text_ids.size());
   prompt_text_with_eop.insert(prompt_text_with_eop.end(),
                               sys_prefix_ids.begin(), sys_prefix_ids.end());
   prompt_text_with_eop.push_back(eop_id);
   prompt_text_with_eop.insert(prompt_text_with_eop.end(),
-                              s.prompt_text_token_ids.begin(),
-                              s.prompt_text_token_ids.end());
+                              lm_prompt_text_ids.begin(),
+                              lm_prompt_text_ids.end());
 
   std::vector<int32_t> combined_text;
   combined_text.reserve(prompt_text_with_eop.size() +
@@ -161,7 +173,7 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
                        s.text_token_ids.begin(),
                        s.text_token_ids.end());
   const int n_text  = (int)combined_text.size();
-  const int n_pt    = (int)s.prompt_token.size();
+  const int n_pt    = instruct_mode ? 0 : (int)s.prompt_token.size();
   const int total_T = 1 + n_text + 1 + n_pt;  // sos + text + task + prompt_speech
 
   // RS_CV3_DUMP_PROMPT_IDS=/tmp/ids -> dump bpe text ids, prompt speech tokens
@@ -273,6 +285,48 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
 
   auto builder = std::make_unique<llm_build_qwen2>(*llm_model_, cparams, sched);
 
+  const int32_t n_kv_max = (int32_t)total_T + s.max_speech_tokens + 4;
+  std::vector<ggml_tensor *> gpu_kv_k(n_layer, nullptr);
+  std::vector<ggml_tensor *> gpu_kv_v(n_layer, nullptr);
+  ggml_backend_buffer_t kv_buf = nullptr;
+  ggml_context *ctx_kv = nullptr;
+  auto free_kv_cache = [&]() {
+    if (kv_buf) {
+      ggml_backend_buffer_free(kv_buf);
+      kv_buf = nullptr;
+    }
+    if (ctx_kv) {
+      ggml_free(ctx_kv);
+      ctx_kv = nullptr;
+    }
+  };
+
+  ggml_init_params kv_params = {
+      (size_t)(n_layer * 2 + 4) * ggml_tensor_overhead() + (1 << 16), nullptr,
+      true};
+  ctx_kv = ggml_init(kv_params);
+  for (int il = 0; il < n_layer; ++il) {
+    gpu_kv_k[il] = ggml_new_tensor_2d(ctx_kv, GGML_TYPE_F32, kv_dim, n_kv_max);
+    gpu_kv_v[il] = ggml_new_tensor_2d(ctx_kv, GGML_TYPE_F32, kv_dim, n_kv_max);
+    ggml_set_name(gpu_kv_k[il], ("cv3_kv_k_" + std::to_string(il)).c_str());
+    ggml_set_name(gpu_kv_v[il], ("cv3_kv_v_" + std::to_string(il)).c_str());
+  }
+  ggml_backend_t gpu_b = pick_gpu_backend(sched, backend_);
+  kv_buf = ggml_backend_alloc_ctx_tensors(ctx_kv, gpu_b);
+  if (!kv_buf) {
+    RS_LOG_ERR("CosyVoice3-LLM: failed to alloc GPU KV cache");
+    ggml_free(ctx_kv);
+    return false;
+  }
+
+  std::vector<float> zero_kv((size_t)kv_dim * n_kv_max, 0.0f);
+  for (int il = 0; il < n_layer; ++il) {
+    ggml_backend_tensor_set(gpu_kv_k[il], zero_kv.data(), 0,
+                            zero_kv.size() * sizeof(float));
+    ggml_backend_tensor_set(gpu_kv_v[il], zero_kv.data(), 0,
+                            zero_kv.size() * sizeof(float));
+  }
+
   // ----- Prefill positions: 0..total_T-1.
   std::vector<llm_pos> positions(total_T);
   for (int i = 0; i < total_T; ++i) positions[i] = i;
@@ -291,6 +345,9 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
   pf_opts.skip_lm_head = true;
   pf_opts.use_kv_cache = true;
   pf_opts.update_kv_cache = true;
+  pf_opts.n_kv_max = (uint32_t)n_kv_max;
+  pf_opts.gpu_kv_k = gpu_kv_k.data();
+  pf_opts.gpu_kv_v = gpu_kv_v.data();
   pf_opts.causal_mask = true;
 
   // RS_CV3_DUMP_LAYER_HIDDEN=/tmp/layer -> dump per-layer last-row hidden
@@ -307,12 +364,15 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
   if (!pf) {
     RS_LOG_ERR("CosyVoice3-LLM: prefill graph build failed");
     ggml_free(ctx_emb);
+    free_kv_cache();
     return false;
   }
 
+  pf->assign_kv_backend(sched, gpu_b, n_layer);
   if (!ggml_backend_sched_alloc_graph(sched, pf->get_graph())) {
     RS_LOG_ERR("CosyVoice3-LLM: prefill alloc failed");
     ggml_free(ctx_emb);
+    free_kv_cache();
     return false;
   }
 
@@ -329,6 +389,7 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
       GGML_STATUS_SUCCESS) {
     RS_LOG_ERR("CosyVoice3-LLM: prefill compute failed");
     ggml_free(ctx_emb);
+    free_kv_cache();
     return false;
   }
 
@@ -337,6 +398,7 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
   if (!embd) {
     RS_LOG_ERR("CosyVoice3-LLM: prefill produced no embeddings");
     ggml_free(ctx_emb);
+    free_kv_cache();
     return false;
   }
   std::vector<float> last_hidden((size_t)d_model);
@@ -374,22 +436,7 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
     }
   }
 
-  // Extract per-layer KV for the prefill into host buffers.
   s.n_cached = (uint32_t)total_T;
-  for (int il = 0; il < n_layer; ++il) {
-    ggml_tensor *k_out = pf->get_kv_output_k(il);
-    ggml_tensor *v_out = pf->get_kv_output_v(il);
-    if (!k_out || !v_out) {
-      RS_LOG_ERR("CosyVoice3-LLM: prefill KV missing for layer %d", il);
-      ggml_free(ctx_emb);
-      return false;
-    }
-    const size_t bytes = ggml_nbytes(k_out);
-    s.host_kv_k[il].resize(bytes / sizeof(float));
-    s.host_kv_v[il].resize(bytes / sizeof(float));
-    ggml_backend_tensor_get(k_out, s.host_kv_k[il].data(), 0, bytes);
-    ggml_backend_tensor_get(v_out, s.host_kv_v[il].data(), 0, bytes);
-  }
 
   ggml_free(ctx_emb);
   ggml_backend_sched_reset(sched);
@@ -401,6 +448,7 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
       &imatrix_cb_);
   if ((int)logits.size() != speech_vocab_) {
     RS_LOG_ERR("CosyVoice3-LLM: empty step-0 logits");
+    free_kv_cache();
     return false;
   }
   if (s.dump_step0_logits) {
@@ -442,47 +490,17 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
                                       s.speech_token_ids, s.sampler, s.rng);
   if (tok >= speech_codebook_) {
     RS_LOG_INFO("CosyVoice3-LLM: stop on first sample (id=%d)", tok);
+    free_kv_cache();
     return true;
   }
   s.speech_token_ids.push_back(tok);
 
   // ============================================================
   // AR loop: feed speech_embd[tok] back through the LLM each step.
-  // We use the GPU-persistent KV path identical to funasr-nano so
-  // gallocr doesn't reallocate the GPU compute buffer per step.
+  // KV stays device-resident: each graph scatters the new column with
+  // ggml_set_rows and attends over a fixed n_kv_max view.
   // ============================================================
-  const int32_t n_kv_max = (int32_t)s.n_cached + s.max_speech_tokens + 4;
-  std::vector<ggml_tensor *> gpu_kv_k(n_layer, nullptr);
-  std::vector<ggml_tensor *> gpu_kv_v(n_layer, nullptr);
 
-  ggml_init_params kv_params = {
-      (size_t)(n_layer * 2 + 4) * ggml_tensor_overhead() + (1 << 16), nullptr,
-      true};
-  ggml_context *ctx_kv = ggml_init(kv_params);
-  for (int il = 0; il < n_layer; ++il) {
-    gpu_kv_k[il] = ggml_new_tensor_2d(ctx_kv, GGML_TYPE_F32, kv_dim, n_kv_max);
-    gpu_kv_v[il] = ggml_new_tensor_2d(ctx_kv, GGML_TYPE_F32, kv_dim, n_kv_max);
-    ggml_set_name(gpu_kv_k[il], ("cv3_kv_k_" + std::to_string(il)).c_str());
-    ggml_set_name(gpu_kv_v[il], ("cv3_kv_v_" + std::to_string(il)).c_str());
-  }
-  ggml_backend_t gpu_b = pick_gpu_backend(sched, backend_);
-  ggml_backend_buffer_t kv_buf = ggml_backend_alloc_ctx_tensors(ctx_kv, gpu_b);
-  if (!kv_buf) {
-    RS_LOG_ERR("CosyVoice3-LLM: failed to alloc GPU KV cache");
-    ggml_free(ctx_kv);
-    return false;
-  }
-
-  for (int il = 0; il < n_layer; ++il) {
-    const size_t bytes = (size_t)kv_dim * s.n_cached * sizeof(float);
-    ggml_backend_tensor_set(gpu_kv_k[il], s.host_kv_k[il].data(), 0, bytes);
-    ggml_backend_tensor_set(gpu_kv_v[il], s.host_kv_v[il].data(), 0, bytes);
-  }
-
-  // Warmup: reserve the gallocr at the LARGEST decode shape so the GPU
-  // compute buffer is never reallocated mid-loop.
-  // DISABLED for debugging
-  /*
   {
     llm_build_opts wopts;
     wopts.output_mode = llm_output_mode::OUTPUT_EMBEDDINGS;
@@ -493,6 +511,7 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
     wopts.causal_mask = true;
     wopts.n_kv_cache = (uint32_t)(n_kv_max - 1);
     wopts.n_kv_max = (uint32_t)n_kv_max;
+    wopts.fixed_kv_cache_shape = true;
     wopts.gpu_kv_k = gpu_kv_k.data();
     wopts.gpu_kv_v = gpu_kv_v.data();
 
@@ -504,14 +523,14 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
     llm_pos wpos = (llm_pos)(n_kv_max - 1);
     auto warm = builder->build_graph_from_embeds(dummy, 1, nullptr, &wpos,
                                                  &wopts);
-    if (warm) ggml_backend_sched_reserve(sched, warm->get_graph());
+    if (warm) {
+      warm->assign_kv_backend(sched, gpu_b, n_layer);
+      ggml_backend_sched_reserve(sched, warm->get_graph());
+    }
     ggml_free(ctx_warm);
     ggml_backend_sched_reset(sched);
   }
-  */
 
-  std::vector<float> kv_stage_k((size_t)kv_dim);
-  std::vector<float> kv_stage_v((size_t)kv_dim);
   std::vector<float> step_hidden((size_t)d_model);
 
   // RS_CV3_DUMP_AR_DIR=/tmp/ar -> dump per-step AR hidden, logits, token,
@@ -526,17 +545,19 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
     if (ar_max_steps <= 0) ar_max_steps = 8;
     // Write prefill KV: one file per layer, [kv_dim, n_cached] F32.
     for (int il = 0; il < n_layer; ++il) {
+      std::vector<float> kv_dump((size_t)kv_dim * s.n_cached);
+      const size_t bytes = kv_dump.size() * sizeof(float);
       char path[512];
       snprintf(path, sizeof(path), "%s/prefill_kv_k_%02d.bin", ar_dir, il);
       if (FILE *fp = std::fopen(path, "wb")) {
-        std::fwrite(s.host_kv_k[il].data(), sizeof(float),
-                    s.host_kv_k[il].size(), fp);
+        ggml_backend_tensor_get(gpu_kv_k[il], kv_dump.data(), 0, bytes);
+        std::fwrite(kv_dump.data(), sizeof(float), kv_dump.size(), fp);
         std::fclose(fp);
       }
       snprintf(path, sizeof(path), "%s/prefill_kv_v_%02d.bin", ar_dir, il);
       if (FILE *fp = std::fopen(path, "wb")) {
-        std::fwrite(s.host_kv_v[il].data(), sizeof(float),
-                    s.host_kv_v[il].size(), fp);
+        ggml_backend_tensor_get(gpu_kv_v[il], kv_dump.data(), 0, bytes);
+        std::fwrite(kv_dump.data(), sizeof(float), kv_dump.size(), fp);
         std::fclose(fp);
       }
     }
@@ -600,6 +621,7 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
     dec_opts.causal_mask = true;
     dec_opts.n_kv_cache = s.n_cached;
     dec_opts.n_kv_max = (uint32_t)n_kv_max;
+    dec_opts.fixed_kv_cache_shape = true;
     dec_opts.gpu_kv_k = gpu_kv_k.data();
     dec_opts.gpu_kv_v = gpu_kv_v.data();
 
@@ -612,6 +634,7 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
       break;
     }
 
+    dec->assign_kv_backend(sched, gpu_b, n_layer);
     if (!ggml_backend_sched_alloc_graph(sched, dec->get_graph())) {
       RS_LOG_ERR("CosyVoice3-LLM: AR step %d alloc failed", step);
       ggml_free(ctx_step);
@@ -626,6 +649,7 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
     if (auto *m = dec->get_input_tensor("causal_mask")) {
       dec->set_causal_mask(m, 1, s.n_cached);
     }
+    dec->set_kv_write_indices(s.n_cached, n_layer);
 
     if (cv3_sched_compute(sched, dec->get_graph(), &imatrix_cb_) !=
         GGML_STATUS_SUCCESS) {
@@ -634,28 +658,10 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
       break;
     }
 
-    // Pull hidden state and append the new KV column.
+    // Pull hidden state. KV was appended device-side by ggml_set_rows.
     if (ggml_tensor *h = dec->get_embd()) {
       ggml_backend_tensor_get(h, step_hidden.data(), 0,
                               (size_t)d_model * sizeof(float));
-    }
-    for (int il = 0; il < n_layer; ++il) {
-      ggml_tensor *k_out = dec->get_kv_output_k(il);
-      ggml_tensor *v_out = dec->get_kv_output_v(il);
-      if (!k_out || !v_out) continue;
-
-      // k_out/v_out are the FULL concatenated cache [kv_dim, n_cached+1] from
-      // build_kv_cache_concat. Extract the NEW column (last column) and write
-      // it to the GPU buffer at position n_cached.
-      const size_t col_bytes = (size_t)kv_dim * sizeof(float);
-      const size_t read_off = (size_t)s.n_cached * kv_dim * sizeof(float);
-      const size_t write_off = (size_t)s.n_cached * kv_dim * sizeof(float);
-      ggml_backend_tensor_get(k_out, kv_stage_k.data(), read_off, col_bytes);
-      ggml_backend_tensor_get(v_out, kv_stage_v.data(), read_off, col_bytes);
-      ggml_backend_tensor_set(gpu_kv_k[il], kv_stage_k.data(), write_off,
-                              col_bytes);
-      ggml_backend_tensor_set(gpu_kv_v[il], kv_stage_v.data(), write_off,
-                              col_bytes);
     }
     s.n_cached++;
 
@@ -738,6 +744,16 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
     }
     s.speech_token_ids.push_back(next);
     tok = next;
+
+    // Streaming hook (rs-tts-online). Returning false from the callback
+    // means the orchestrator wants to stop early; we synthesize an EOS so
+    // the rest of the AR-loop cleanup runs normally.
+    if (lm_token_cb_ && !lm_token_cb_(next)) {
+      RS_LOG_INFO("CosyVoice3-LLM: stream callback requested abort at step %d",
+                  step + 1);
+      tok = speech_codebook_;
+      break;
+    }
   }
 
   ggml_backend_buffer_free(kv_buf);
