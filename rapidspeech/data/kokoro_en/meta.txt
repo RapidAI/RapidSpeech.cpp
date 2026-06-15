@@ -1,0 +1,7 @@
+source: /Users/cenglingfan/Code/python-project/miniconda3/lib/python3.9/site-packages/misaki/data/us_gold.json
+generated_at: 2026-06-15T19:09:38+0800
+records: 90201
+bytes: 2239615
+sha256: bd8fbf3cbaac47ed63cf93b8c099c310877c0f2d0f5107e86abed13c8ec8f436
+format_magic: 0x4E45474D
+format_version: 1
