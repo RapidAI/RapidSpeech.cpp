@@ -1,0 +1,270 @@
+name: Release Binaries
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to upload to when running manually"
+        required: false
+        default: ""
+      upload_to_release:
+        description: "Upload built archives to the release named by tag"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64-cpu
+            runner: ubuntu-22.04
+            backend: cpu
+            expected_uname: x86_64
+            archive_ext: tar.gz
+          - target: linux-arm64-cpu
+            runner: ubuntu-24.04-arm
+            backend: cpu
+            expected_uname: aarch64
+            archive_ext: tar.gz
+          - target: linux-x64-cuda
+            runner: ubuntu-22.04
+            backend: cuda
+            expected_uname: x86_64
+            cuda_archs: "70;75;80;86;89"
+            archive_ext: tar.gz
+          - target: windows-x64-cpu
+            runner: windows-2022
+            backend: cpu
+            cmake_arch: x64
+            archive_ext: zip
+          - target: windows-x64-cuda
+            runner: windows-2022
+            backend: cuda
+            cmake_arch: x64
+            cuda_archs: "70;75;80;86;89"
+            archive_ext: zip
+          - target: macos-x64-metal
+            runner: macos-13
+            backend: metal
+            expected_uname: x86_64
+            archive_ext: tar.gz
+          - target: macos-arm64-metal
+            runner: macos-latest
+            backend: metal
+            expected_uname: arm64
+            archive_ext: tar.gz
+
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+      RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag || github.ref_name }}
+      TARGET_NAME: ${{ matrix.target }}
+      BACKEND: ${{ matrix.backend }}
+      CMAKE_ARCH: ${{ matrix.cmake_arch || '' }}
+      CUDA_ARCHS: ${{ matrix.cuda_archs || '' }}
+      EXPECTED_UNAME: ${{ matrix.expected_uname || '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config
+
+      - name: Verify runner architecture
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(uname -m)"
+          if [ -n "$EXPECTED_UNAME" ] && [ "$actual" != "$EXPECTED_UNAME" ]; then
+            echo "Expected ${EXPECTED_UNAME}, got ${actual}"
+            exit 1
+          fi
+
+      - name: Install CUDA toolkit (Linux)
+        if: matrix.backend == 'cuda' && runner.os == 'Linux'
+        uses: Jimver/cuda-toolkit@v0.2.20
+        with:
+          cuda: '12.4.0'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart-dev"]'
+
+      - name: Install cuBLAS (Linux CUDA)
+        if: matrix.backend == 'cuda' && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcublas-12-4 libcublas-dev-12-4
+
+      - name: Install CUDA toolkit (Windows)
+        if: matrix.backend == 'cuda' && runner.os == 'Windows'
+        uses: Jimver/cuda-toolkit@v0.2.20
+        with:
+          cuda: '12.4.0'
+          method: 'network'
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          args=(
+            -S .
+            -B build
+            -DRS_BUILD_TESTS=OFF
+            -DRS_BUILD_CLI=ON
+            -DRS_ENABLE_PYTHON=OFF
+            -DGGML_NATIVE=OFF
+            -DBUILD_SHARED_LIBS=OFF
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+          )
+
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            args+=(-DCMAKE_BUILD_TYPE=Release)
+          fi
+
+          if [ -n "$CMAKE_ARCH" ]; then
+            args+=(-A "$CMAKE_ARCH")
+          fi
+
+          case "$BACKEND" in
+            cpu)
+              args+=(-DRS_METAL=OFF)
+              ;;
+            cuda)
+              args+=(-DRS_CUDA=ON)
+              if [ -n "$CUDA_ARCHS" ]; then
+                args+=("-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS}")
+              fi
+              ;;
+            metal)
+              args+=(-DRS_METAL=ON)
+              ;;
+            *)
+              echo "Unknown backend: $BACKEND"
+              exit 1
+              ;;
+          esac
+
+          cmake "${args[@]}"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Install package tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          safe_tag="${RELEASE_TAG//\//-}"
+          package_name="rapidspeech-${safe_tag}-${TARGET_NAME}"
+          package_root="package/${package_name}"
+
+          cmake --install build --config Release --prefix "$package_root"
+
+          {
+            echo "RapidSpeech.cpp ${RELEASE_TAG}"
+            echo
+            echo "Target: ${TARGET_NAME}"
+            echo "Backend: ${BACKEND}"
+            echo
+            echo "Layout:"
+            echo "  bin/                       — CLI binaries"
+            echo "  share/rapidspeech/         — G2P / WeText / cppjieba data"
+            echo "    kokoro_zh/  kokoro_en/  wetext/  cppjieba/dict/"
+            echo
+            echo "The binaries auto-discover the share/ data via their own"
+            echo "install location, so just keep the bin/ and share/ trees"
+            echo "next to each other. Override with RS_KOKORO_ZH_DATA_DIR,"
+            echo "RS_KOKORO_EN_DATA_DIR, RS_WETEXT_DATA_DIR,"
+            echo "RS_KOKORO_JIEBA_DICT_DIR if you relocate the data."
+            echo
+            echo "Model files are not bundled. Download the matching .gguf"
+            echo "models separately."
+            if [ "$BACKEND" = "cuda" ]; then
+              echo "CUDA builds require a compatible NVIDIA driver and CUDA 12 runtime libraries on the target machine."
+            fi
+          } > "$package_root/README.txt"
+
+      - name: Smoke-test installed CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          safe_tag="${RELEASE_TAG//\//-}"
+          package_name="rapidspeech-${safe_tag}-${TARGET_NAME}"
+          bin_dir="package/${package_name}/bin"
+          exe=""
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            exe=".exe"
+          fi
+
+          targets=(
+            rs-asr-offline
+            rs-asr-vad-online
+            rs-speaker-id
+            rs-tts-offline
+            rs-tts-online
+            rs-tts-split
+            rs-imatrix
+            rs-quantize
+            rs-kws
+          )
+
+          for target in "${targets[@]}"; do
+            bin="${bin_dir}/${target}${exe}"
+            if [ ! -f "$bin" ]; then
+              echo "Missing binary: $bin"
+              exit 1
+            fi
+            echo "Smoke test: ${target}"
+            set +e
+            "$bin" --help >/dev/null 2>&1
+            rc=$?
+            set -e
+            if [ "$rc" -ge 128 ]; then
+              echo "${target} crashed with exit code ${rc}"
+              exit 1
+            fi
+          done
+
+      - name: Create archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          safe_tag="${RELEASE_TAG//\//-}"
+          package_name="rapidspeech-${safe_tag}-${TARGET_NAME}"
+          mkdir -p dist
+
+          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
+            powershell -NoProfile -Command "Compress-Archive -Path 'package/${package_name}' -DestinationPath 'dist/${package_name}.zip' -Force"
+          else
+            tar -czf "dist/${package_name}.tar.gz" -C package "$package_name"
+          fi
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+      - name: Upload release asset
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.upload_to_release && inputs.tag != '')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+        run: gh release upload "$TAG_NAME" dist/* --clobber
