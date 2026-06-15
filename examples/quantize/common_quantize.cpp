@@ -252,7 +252,9 @@ static tensor_category categorize_tensor(const std::string &name) {
       // llama.cpp / GGUF-converted naming.
       name == "token_embd.weight" ||
       // CosyVoice3 speech codebook embedding (6761 → 896).
-      name == "cosyvoice3.speech_embd.weight") {
+      name == "cosyvoice3.speech_embd.weight" ||
+      // Kokoro PLBert custom_albert naming.
+      name == "bert.embd.tok.weight") {
     return tensor_category::TOKEN_EMBD;
   }
   // Output projection
@@ -293,7 +295,9 @@ static tensor_category categorize_tensor(const std::string &name) {
       name.find("out_proj.weight") != std::string::npos ||
       name.find("linear_out.weight") != std::string::npos ||
       name.find("attn.to_out.0.weight") != std::string::npos ||
-      name.find("attn_output.weight") != std::string::npos) {
+      name.find("attn_output.weight") != std::string::npos ||
+      // Kokoro PLBert attention output.
+      name.find("attn_o.weight") != std::string::npos) {
     return tensor_category::ATTENTION_OUTPUT;
   }
   // FFN Up / Gate
@@ -388,6 +392,12 @@ rs_get_qtype_for_tensor(const rs_quantize_options &opts, const std::string &name
 
   // Check if this tensor should be quantized at all
   bool quantize = name.rfind("weight") == name.size() - 6;
+  // Also accept PyTorch LSTM packed weight names: weight_ih_l0, weight_hh_l0,
+  // weight_ih_l0_reverse, weight_hh_l0_reverse (and l1, l2, ...).
+  if (!quantize) {
+    static const std::regex lstm_w(R"(weight_(ih|hh)_l\d+(_reverse)?$)");
+    quantize = std::regex_search(name, lstm_w);
+  }
   for (const auto &s : to_skip) {
     if (std::regex_match(name, std::regex(s))) {
       quantize = false;
@@ -461,6 +471,15 @@ rs_get_qtype_for_tensor(const rs_quantize_options &opts, const std::string &name
     if (cat == tensor_category::FFN_DOWN) {
       return pick(is_first_last_8th(layer, n_total) ? GGML_TYPE_Q3_K : GGML_TYPE_Q2_K);
     }
+    // LSTM packed gates: weight_ih_l* / weight_hh_l* — bump one notch.
+    // In Kokoro the prosody-predictor LSTMs are tone/duration-critical and
+    // gate errors get amplified through sigmoid.
+    {
+      static const std::regex lstm_w(R"(weight_(ih|hh)_l\d+(_reverse)?$)");
+      if (std::regex_search(name, lstm_w)) {
+        return pick(GGML_TYPE_Q3_K);
+      }
+    }
     return pick(GGML_TYPE_Q2_K);
   }
 
@@ -490,6 +509,15 @@ rs_get_qtype_for_tensor(const rs_quantize_options &opts, const std::string &name
     }
     if (cat == tensor_category::FFN_DOWN) {
       return pick(is_first_last_8th(layer, n_total) ? GGML_TYPE_Q4_K : GGML_TYPE_Q3_K);
+    }
+    // LSTM packed gates: weight_ih_l* / weight_hh_l* — bump one notch.
+    // In Kokoro the prosody-predictor LSTMs are tone/duration-critical and
+    // gate errors get amplified through sigmoid.
+    {
+      static const std::regex lstm_w(R"(weight_(ih|hh)_l\d+(_reverse)?$)");
+      if (std::regex_search(name, lstm_w)) {
+        return pick(GGML_TYPE_Q4_K);
+      }
     }
     return pick(GGML_TYPE_Q3_K);
   }

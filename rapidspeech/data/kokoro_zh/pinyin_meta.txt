@@ -1,0 +1,8 @@
+pypinyin_dump version=1
+single_entries=41923
+phrase_entries=411967
+max_phrase_chars=19
+single_bytes=480377
+phrase_bytes=9565293
+misaki_phrase_overrides=16
+misaki_single_overrides=1

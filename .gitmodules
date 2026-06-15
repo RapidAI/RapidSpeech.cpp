@@ -1,3 +1,6 @@
 [submodule "ggml"]
 	path = ggml
 	url = https://github.com/ggml-org/ggml.git
+[submodule "third_party/cppjieba"]
+	path = third_party/cppjieba
+	url = https://github.com/yanyiwu/cppjieba.git

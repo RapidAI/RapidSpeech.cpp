@@ -1,7 +1,7 @@
 /**
  * rs-imatrix — Importance Matrix collection tool for activation-aware quantization.
  *
- * Supports three modes:
+ * Supports four modes:
  *   TTS calibration (OmniVoice): runs built-in calibration sentences through
  *     the model's diffusion + LLM forward and collects activation stats.
  *   ASR calibration (FunASRNano): pushes a list of wav files through the
@@ -10,6 +10,9 @@
  *     seeds (default 8) through LM + Flow DiT, collecting stats on both.
  *     Uses the GGUF's baked cv3.default_voice.* tuple by default;
  *     --voice <baked-voice.gguf> overrides it with an external bake.
+ *   Kokoro calibration (Kokoro v1.1-zh): runs a ZH+EN calibration corpus
+ *     through the text encoder, PLBert, prosody predictor, decoder, and
+ *     iSTFTNet generator. Requires --voice to point at a voice pack GGUF.
  *
  * Mode is auto-detected from the model architecture; --audio-list selects
  * ASR mode explicitly.
@@ -357,6 +360,47 @@ static int run_cv3(rs_context_t *ctx, const ImatrixArgs &args,
     return n_success;
 }
 
+// Kokoro calibration: same multi-language corpus as CV3 — except Kokoro's
+// PushText only routes through the ZH G2P (the EN G2P is invoked internally
+// for Latin-script segments embedded inside Chinese strings). English-only
+// sentences are rewritten to lang="Chinese" so the ZH G2P fans them out via
+// its EN fallback. Single deterministic forward per sentence (no --n-seeds).
+static int run_kokoro(rs_context_t *ctx, const ImatrixArgs &args,
+                      const std::vector<std::pair<std::string, std::string>> &sentences) {
+    (void)args;
+    LOG_INFO("Kokoro calibration: %zu sentences (deterministic, 1 pass each)",
+             sentences.size());
+
+    int n_success = 0;
+    for (size_t i = 0; i < sentences.size(); ++i) {
+        const auto &orig = sentences[i];
+        // Kokoro only ships a ZH G2P; route everything through it. The EN
+        // fallback inside ZHG2P handles Latin-script segments.
+        const std::string lang = "Chinese";
+        const std::string &text = orig.second;
+        LOG_INFO("[%3zu/%zu] orig_lang=%s text=\"%s\"",
+                 i + 1, sentences.size(), orig.first.c_str(), text.c_str());
+        rs_set_tts_params(ctx, "male", lang.c_str(), 42);
+        rs_reset(ctx);
+        if (rs_push_text(ctx, text.c_str()) != RS_OK) {
+            LOG_ERROR("PushText failed at %zu", i + 1);
+            continue;
+        }
+        bool ok = true;
+        while (true) {
+            int ret = rs_process(ctx);
+            if (ret < 0) { ok = false; break; }
+            if (ret == 0) break;
+            float *chunk = nullptr;
+            while (rs_get_audio_output(ctx, &chunk) > 0) {}
+        }
+        if (ok) n_success++;
+    }
+    LOG_INFO("Kokoro calibration done: %d/%zu sentences succeeded",
+             n_success, sentences.size());
+    return n_success;
+}
+
 static std::vector<std::pair<std::string, std::string>>
 load_cv3_sentences(const ImatrixArgs &args) {
     std::vector<std::pair<std::string, std::string>> out;
@@ -396,19 +440,21 @@ int main(int argc, char **argv) {
     const bool asr_mode = args.audio_list != nullptr;
 
     // CV3 expects its baked voice via env var, which must be set BEFORE
-    // rs_init_from_file (Load reads it). Harmless for non-CV3 archs.
+    // rs_init_from_file (Load reads it). Kokoro uses RS_KOKORO_VOICE_PATH for
+    // the same purpose. Harmless for archs that don't read these.
     if (args.voice_path) {
         setenv("RS_CV3_VOICE_PATH", args.voice_path, 1);
+        setenv("RS_KOKORO_VOICE_PATH", args.voice_path, 1);
     }
 
     LOG_INFO("Importance Matrix Collection Tool");
-    LOG_INFO("Mode: %s", asr_mode ? "ASR" : "TTS/CV3");
+    LOG_INFO("Mode: %s", asr_mode ? "ASR" : "TTS/CV3/Kokoro");
     LOG_INFO("Model: %s", args.model_path);
     LOG_INFO("Output: %s", args.output_path);
     LOG_INFO("Threads: %d  GPU: %s",
              args.n_threads, args.use_gpu ? "ON" : "OFF");
     if (args.voice_path) {
-        LOG_INFO("Voice (CV3): %s", args.voice_path);
+        LOG_INFO("Voice: %s", args.voice_path);
     }
 
     // ---- Init via C API ----
@@ -431,8 +477,15 @@ int main(int argc, char **argv) {
 
     const bool cv3_mode = !asr_mode &&
         std::string(meta.arch_name).rfind("cosyvoice3", 0) == 0;
+    const bool kokoro_mode = !asr_mode &&
+        std::string(meta.arch_name) == "kokoro";
     if (cv3_mode && !args.voice_path) {
         LOG_INFO("CV3: using GGUF baked default_voice (no --voice override)");
+    }
+    if (kokoro_mode && !args.voice_path) {
+        LOG_ERROR("Kokoro: --voice <voice_pack.gguf> is required for calibration");
+        rs_free(ctx);
+        return 1;
     }
 
     // ---- Setup collector and hook ----
@@ -447,6 +500,8 @@ int main(int argc, char **argv) {
         n_success = run_asr(ctx, args);
     } else if (cv3_mode) {
         n_success = run_cv3(ctx, args, load_cv3_sentences(args));
+    } else if (kokoro_mode) {
+        n_success = run_kokoro(ctx, args, load_cv3_sentences(args));
     } else {
         n_success = run_tts(ctx, args);
     }
@@ -462,6 +517,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    collector.print_skip_stats();
     collector.save(args.output_path);
     LOG_INFO("Importance matrix saved to %s", args.output_path);
 

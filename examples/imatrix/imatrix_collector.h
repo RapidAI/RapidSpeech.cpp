@@ -29,6 +29,20 @@ struct IMatrixCollector {
     };
     std::unordered_map<std::string, Entry> stats;
 
+    // Per-reason skip counters (cleared at construction). Dumped by
+    // print_skip_stats() to help diagnose why entries are missing.
+    struct SkipStats {
+        int64_t op_not_mulmat = 0;
+        int64_t unnamed_weight = 0;
+        int64_t act_dtype = 0;
+        int64_t small_batch = 0;
+        int64_t non_contig = 0;
+        int64_t view_src = 0;
+        int64_t weight_op = 0;
+        int64_t no_buffer = 0;
+        int64_t accepted = 0;
+    } skips;
+
     // Collect activation statistics for a single MUL_MAT node.
     //
     // MUST be called from a per-node sched eval callback (see
@@ -40,35 +54,41 @@ struct IMatrixCollector {
     // happens right after the node's matmul, while src1 is still the data
     // the matmul actually consumed.
     void collect_node(struct ggml_tensor *node) {
-        if (!node || node->op != GGML_OP_MUL_MAT) return;
+        if (!node || node->op != GGML_OP_MUL_MAT) { skips.op_not_mulmat++; return; }
 
         struct ggml_tensor *weight = node->src[0];
         struct ggml_tensor *act = node->src[1];
 
         // Only collect for named weight tensors (loaded from GGUF)
-        if (!weight->name[0]) return;
-        // Only F32 activations (full precision)
-        if (act->type != GGML_TYPE_F32) return;
-        // Skip trivially small batches
-        if (act->ne[1] < 4) return;
+        if (!weight->name[0]) { skips.unnamed_weight++; return; }
+        // Accept F32 or F16 activations. F16 is dequantized to F32 below
+        // before accumulating squared values. (Some archs — Kokoro's PLBert,
+        // ProsodyPredictor, and per-timestep LSTM — feed F16 acts.)
+        if (act->type != GGML_TYPE_F32 && act->type != GGML_TYPE_F16) {
+            skips.act_dtype++; return;
+        }
+        // Skip empty tensors but keep ne[1]==1 (per-timestep recurrent matmuls
+        // accumulate over many calls during a single Encode pass).
+        if (act->ne[1] < 1) { skips.small_batch++; return; }
         // Skip non-contiguous activations (permuted/reshaped views).
         // Their nb[1] stride and ggml_nbytes do not describe a flat row-major
         // layout, so both host indexing and ggml_backend_tensor_get would
         // over-read; on GPU backends the underlying device memory is also
         // owned by view_src, not act->buffer.
-        if (!ggml_is_contiguous(act)) return;
-        // Skip view tensors entirely. View tensors have act->buffer == NULL
-        // (the real buffer lives on view_src), so ggml_backend_tensor_get
-        // would null-deref the backend's get_tensor vtable on GPU. The
-        // underlying activation is almost always also fed as src1 of some
-        // other named MUL_MAT, so dropping the view does not lose stats.
-        if (act->view_src) return;
+        if (!ggml_is_contiguous(act)) { skips.non_contig++; return; }
+        // For view tensors, the real backing buffer lives on view_src.
+        // ggml_backend_tensor_get walks view_src for us, but we still need a
+        // backing buffer reachable from the tensor — drop only orphan views
+        // with no resolvable backend buffer at all.
+        if (act->view_src && !act->view_src->buffer && !act->view_src->data) {
+            skips.view_src++; return;
+        }
         // Genuine GGUF weights have op == GGML_OP_NONE; CONT-of-weight and
         // similar would carry uninitialised name bytes in some ggml versions.
-        if (weight->op != GGML_OP_NONE) return;
+        if (weight->op != GGML_OP_NONE) { skips.weight_op++; return; }
 
         // Skip uninitialized activations (e.g. not yet after compute)
-        if (!act->buffer && !act->data) return;
+        if (!act->buffer && !act->data) { skips.no_buffer++; return; }
 
         int64_t ncol = act->ne[0];
         int64_t nrows = act->ne[1] * act->ne[2] * act->ne[3];
@@ -86,12 +106,30 @@ struct IMatrixCollector {
             return;
         }
 
-        // Read activation data (may need GPU→CPU copy)
+        // Read activation data (may need GPU→CPU copy, and may need
+        // F16→F32 dequantization). For view tensors the backing buffer lives
+        // on view_src; resolve through it to decide host vs device.
         std::vector<float> act_data;
         const float *data;
-        bool is_host = !act->buffer || ggml_backend_buffer_is_host(act->buffer);
-        if (!is_host) {
-            size_t nbytes = ggml_nbytes(act);
+        const size_t n_elem = ggml_nelements(act);
+        ggml_backend_buffer_t backing = act->view_src ? act->view_src->buffer : act->buffer;
+        const bool is_host = !backing || ggml_backend_buffer_is_host(backing);
+        if (act->type == GGML_TYPE_F16) {
+            // Copy raw F16 bytes off-device (or just point at host), then
+            // dequantize to F32 in act_data. Note ggml_nbytes(act) accounts
+            // for the F16 element size.
+            std::vector<ggml_fp16_t> tmp(n_elem);
+            if (!is_host) {
+                ggml_backend_tensor_get(act, tmp.data(), 0, ggml_nbytes(act));
+            } else {
+                if (!act->data) return;
+                std::memcpy(tmp.data(), act->data, ggml_nbytes(act));
+            }
+            act_data.resize(n_elem);
+            ggml_fp16_to_fp32_row(tmp.data(), act_data.data(), (int)n_elem);
+            data = act_data.data();
+        } else if (!is_host) {
+            const size_t nbytes = ggml_nbytes(act);
             act_data.resize(nbytes / sizeof(float));
             ggml_backend_tensor_get(act, act_data.data(), 0, nbytes);
             data = act_data.data();
@@ -100,11 +138,16 @@ struct IMatrixCollector {
             if (!data) return;
         }
 
+        // Row stride in F32 elements (after the optional F16→F32 dequant the
+        // dequantized buffer is contiguous, so the row stride is ncol).
+        const int64_t row_stride =
+            (act->type == GGML_TYPE_F16) ? ncol : (int64_t)(act->nb[1] / sizeof(float));
+
         // Skip if activation contains NaN/Inf (would poison the imatrix
         // and crash downstream IQ grid lookups).  This shouldn't happen
         // at per-node timing on a healthy model, but defend anyway.
         bool any_bad = false;
-        size_t span = (size_t)nrows * (size_t)(act->nb[1] / sizeof(float));
+        size_t span = (size_t)nrows * (size_t)row_stride;
         for (size_t k = 0; k < span && !any_bad; k += std::max<size_t>(1, span / 16)) {
             if (!std::isfinite(data[k])) any_bad = true;
         }
@@ -115,15 +158,32 @@ struct IMatrixCollector {
             return;
         }
 
-        // Accumulate squared activations per column (contiguous: nb[1] == ncol*4)
+        // Accumulate squared activations per column.
         for (int64_t r = 0; r < nrows; r++) {
-            const float *row = data + r * (act->nb[1] / sizeof(float));
+            const float *row = data + r * row_stride;
             for (int64_t j = 0; j < ncol; j++) {
                 double v = (double)row[j];
                 e.values[j] += v * v;
             }
         }
         e.count += nrows;
+        skips.accepted++;
+    }
+
+    void print_skip_stats() const {
+        fprintf(stderr,
+                "[imatrix] skip stats: accepted=%lld | op_not_mulmat=%lld "
+                "unnamed=%lld act_dtype=%lld small_batch=%lld non_contig=%lld "
+                "view=%lld weight_op=%lld no_buffer=%lld\n",
+                (long long)skips.accepted,
+                (long long)skips.op_not_mulmat,
+                (long long)skips.unnamed_weight,
+                (long long)skips.act_dtype,
+                (long long)skips.small_batch,
+                (long long)skips.non_contig,
+                (long long)skips.view_src,
+                (long long)skips.weight_op,
+                (long long)skips.no_buffer);
     }
 
     // Save as legacy .dat format (compatible with llama.cpp tools).

@@ -62,6 +62,8 @@ struct TtsArgs {
   int n_steps = 32;
   int n_threads = 4;
   bool use_gpu = true;
+  bool phonemes_input = false;                 // Kokoro: --phonemes (treat -t as IPA)
+  float length_scale = 1.0f;                   // Kokoro: --length-scale
 };
 
 static bool parse_bool(const std::string &v) {
@@ -87,6 +89,12 @@ static void print_usage(const char *prog) {
       << "                          CosyVoice3 prompt-tokens int32 LE blob (debug override)\n"
       << "      --voice <path>       CosyVoice3 pre-baked voice GGUF (replaces --ref, no tokenizer/CAM++ needed)\n"
       << "      --save-voice <path>  CosyVoice3: bake the resolved voice tuple to this GGUF for later reuse\n"
+      << "      --phonemes           Kokoro: treat -t as already-IPA phonemes (bypass G2P)\n"
+      << "      --length-scale <f>   Kokoro: duration multiplier (default 1.0; <1 faster, >1 slower)\n"
+      << "                          Kokoro ZH G2P env vars (optional):\n"
+      << "                            RS_KOKORO_JIEBA_DICT_DIR (default third_party/cppjieba/dict)\n"
+      << "                            RS_KOKORO_ZH_DATA_DIR    (default rapidspeech/data/kokoro_zh)\n"
+      << "                            RS_KOKORO_DUMP_G2P=1     log G2P bopomofo to stderr\n"
       << "      --instruct <text>    Voice description (default: male)\n"
       << "      --lang <lang>        Target language (default: English)\n"
       << "      --seed <n>           Random seed (default: 42)\n"
@@ -127,6 +135,10 @@ static bool parse_args(int argc, char **argv, TtsArgs &args) {
       args.voice_path = argv[++i];
     } else if (a == "--save-voice" && i + 1 < argc) {
       args.save_voice_path = argv[++i];
+    } else if (a == "--phonemes") {
+      args.phonemes_input = true;
+    } else if (a == "--length-scale" && i + 1 < argc) {
+      args.length_scale = std::stof(argv[++i]);
     } else if (a == "--instruct" && i + 1 < argc) {
       args.instruct = argv[++i];
     } else if (a == "--lang" && i + 1 < argc) {
@@ -244,7 +256,8 @@ int main(int argc, char **argv) {
   }
   if (args.voice_path && args.voice_path[0]) {
     set_env_var("RS_CV3_VOICE_PATH", args.voice_path);
-    LOG_INFO("CV3 voice (reuse): %s", args.voice_path);
+    set_env_var("RS_KOKORO_VOICE_PATH", args.voice_path);
+    LOG_INFO("Voice (reuse): %s", args.voice_path);
   }
   if (args.save_voice_path && args.save_voice_path[0]) {
     set_env_var("RS_CV3_SAVE_VOICE_PATH", args.save_voice_path);
@@ -260,7 +273,7 @@ int main(int argc, char **argv) {
   tts_params.model_path = args.model_path;
   tts_params.n_threads = args.n_threads;
   tts_params.use_gpu = args.use_gpu;
-  tts_params.task_type = RS_TASK_TTS_ONLINE;
+  tts_params.task_type = RS_TASK_TTS_OFFLINE;
 
   rs_context_t *tts_ctx = rs_init_from_file(tts_params);
   if (!tts_ctx) {
@@ -274,10 +287,27 @@ int main(int argc, char **argv) {
            meta.audio_sample_rate);
   LOG_INFO("Backend: %s", rs_get_backend_name(tts_ctx));
 
-  // Set TTS params
-  rs_set_tts_params(tts_ctx, args.instruct, args.language, args.seed);
+  // Set TTS params. For Kokoro with --phonemes, swap language to "ipa" so
+  // KokoroModel::PushText takes the bypass-G2P branch. Also propagate
+  // --length-scale via env var (read inside Kokoro engine).
+  const char *effective_lang = args.language;
+  if (args.phonemes_input) {
+    effective_lang = "ipa";
+    LOG_INFO("Phonemes mode: treating -t as already-IPA input");
+  }
+  if (args.length_scale != 1.0f) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.6f", args.length_scale);
+    set_env_var("RS_KOKORO_LENGTH_SCALE", buf);
+    LOG_INFO("Kokoro length_scale: %.3f", args.length_scale);
+  }
+  rs_set_tts_params(tts_ctx, args.instruct, effective_lang, args.seed);
   rs_set_tts_diffusion_steps(tts_ctx, args.n_steps);
-  LOG_INFO("Instruct: %s  Language: %s  Seed: %d  Steps: %d", args.instruct, args.language, args.seed, args.n_steps);
+  LOG_INFO("Instruct: %s  Language: %s  Seed: %d  Steps: %d", args.instruct, effective_lang, args.seed, args.n_steps);
+
+  // Request timing starts before any per-input work. This includes optional
+  // reference voice preparation, text ingestion, synthesis, and output fetch.
+  auto t0 = std::chrono::steady_clock::now();
 
   // Push reference audio for voice cloning (optional)
   if (args.ref_path && args.ref_path[0]) {
@@ -309,8 +339,6 @@ int main(int argc, char **argv) {
 
   // Push text
   LOG_INFO("Synthesizing: \"%s\"", args.text);
-
-  auto t0 = std::chrono::steady_clock::now();
 
   if (rs_push_text(tts_ctx, args.text) != RS_OK) {
     rs_error_info_t err = rs_get_last_error();

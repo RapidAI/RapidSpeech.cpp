@@ -31,6 +31,14 @@ else()
 endif()
 option(RS_METAL "Enable Metal acceleration (Apple only)" ${RS_METAL_DEFAULT})
 
+if (APPLE)
+    set(RS_LIBRARY_INSTALL_RPATH "@loader_path")
+    set(RS_EXECUTABLE_INSTALL_RPATH "@loader_path/../lib")
+else()
+    set(RS_LIBRARY_INSTALL_RPATH "\$ORIGIN")
+    set(RS_EXECUTABLE_INSTALL_RPATH "\$ORIGIN/../lib")
+endif()
+
 # --- Dependencies Configuration ---
 set(GGML_PATH "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
 set(THREADS_PREFER_PTHREAD_FLAG ON)
@@ -81,13 +89,8 @@ if (RS_ENABLE_PYTHON)
     set(GGML_VERSION "0.10.0" CACHE STRING "" FORCE)
     set(CMAKE_PLATFORM_NO_VERSIONED_SONAME ON)
 
-    # Platform-appropriate runtime library search path.
-    # macOS uses @loader_path, Linux uses $ORIGIN.
-    if (APPLE)
-        set(RS_RPATH "@loader_path")
-    else()
-        set(RS_RPATH "\$ORIGIN")
-    endif()
+    # Python wheels keep all shared libraries next to the extension module.
+    set(RS_RPATH "${RS_LIBRARY_INSTALL_RPATH}")
 endif()
 
 add_compile_definitions(GGML_MAX_NAME=128)
@@ -178,6 +181,12 @@ set(RS_SOURCES
         rapidspeech/src/frontend/cosyvoice3_mel.h
         rapidspeech/src/frontend/cosyvoice3_mel.cpp
 	    rapidspeech/src/arch/openvoice2.cpp
+        rapidspeech/src/arch/kokoro.cpp
+        rapidspeech/src/frontend/kokoro_pinyin.cpp
+        rapidspeech/src/frontend/kokoro_zh_tone_sandhi.cpp
+        rapidspeech/src/frontend/kokoro_g2p_zh.cpp
+        rapidspeech/src/frontend/kokoro_g2p_en.cpp
+        rapidspeech/src/frontend/wetext_normalizer.cpp
         rapidspeech/src/arch/omnivoice.cpp
         rapidspeech/src/arch/campplus.cpp
         rapidspeech/src/arch/bert.cpp
@@ -188,6 +197,7 @@ set(RS_SOURCES
         rapidspeech/src/arch/qwen3_asr.h
         rapidspeech/src/arch/qwen3_asr.cpp
         rapidspeech/src/utils/rs_wav.cpp
+        rapidspeech/src/utils/rs_data_paths.cpp
 #        rapidspeech/src/arch/mimo_tokenizer.cpp
 #        rapidspeech/src/arch/mimo_tokenizer.h
 #        rapidspeech/src/arch/mimo_asr.cpp
@@ -211,6 +221,10 @@ target_include_directories(rapidspeech-core PUBLIC
         ${GGML_PATH}/src
 )
 
+target_include_directories(rapidspeech-core PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cppjieba/include
+)
+
 # Define RAPIDSPEECH_BUILD for proper symbol export
 target_compile_definitions(rapidspeech-core PRIVATE RAPIDSPEECH_BUILD)
 
@@ -232,10 +246,20 @@ endif()
 
 # Set library version (skip SOVERSION for Python wheels to avoid auditwheel issues)
 if (NOT RS_ENABLE_PYTHON)
-    set_target_properties(rapidspeech-core PROPERTIES
-        VERSION ${PROJECT_VERSION}
-        SOVERSION 1
-    )
+    if (APPLE)
+        set_target_properties(rapidspeech-core PROPERTIES
+            VERSION ${PROJECT_VERSION}
+            SOVERSION 1
+            INSTALL_NAME_DIR "@rpath"
+            INSTALL_RPATH "${RS_LIBRARY_INSTALL_RPATH}"
+        )
+    else()
+        set_target_properties(rapidspeech-core PROPERTIES
+            VERSION ${PROJECT_VERSION}
+            SOVERSION 1
+            INSTALL_RPATH "${RS_LIBRARY_INSTALL_RPATH}"
+        )
+    endif()
 else()
     if (APPLE)
         set_target_properties(rapidspeech-core PROPERTIES
@@ -256,6 +280,23 @@ set_target_properties(rapidspeech-core PROPERTIES
 )
 
 target_link_libraries(rapidspeech-core PRIVATE ggml Threads::Threads)
+
+# --- WeTextProcessing (text normalization for ZH TTS) ---
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/openfst.cmake)
+
+add_library(wetext_processor STATIC
+    third_party/wetext/utils/wetext_string.cc
+    third_party/wetext/processor/wetext_token_parser.cc
+    third_party/wetext/processor/wetext_processor.cc)
+target_include_directories(wetext_processor PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/wetext)
+target_link_libraries(wetext_processor PUBLIC fst)
+set_target_properties(wetext_processor PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON)
+
+target_link_libraries(rapidspeech-core PRIVATE wetext_processor)
 
 # --- Hardware Acceleration Logic ---
 
@@ -279,6 +320,12 @@ if (APPLE)
     set_source_files_properties(rapidspeech/src/arch/dac_metal.mm PROPERTIES
         COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
     target_compile_definitions(rapidspeech-core PRIVATE RS_USE_METAL_DAC)
+
+    # Custom Metal kernel for Kokoro iSTFTNet ConvTranspose1d (simdgroup-over-IC).
+    target_sources(rapidspeech-core PRIVATE rapidspeech/src/arch/kokoro_metal.mm)
+    set_source_files_properties(rapidspeech/src/arch/kokoro_metal.mm PROPERTIES
+        COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
+    target_compile_definitions(rapidspeech-core PRIVATE RS_USE_METAL_KOKORO)
 endif()
 
 if (RS_METAL AND APPLE)
@@ -373,6 +420,14 @@ if (RS_ENABLE_PYTHON)
 
 endif()
 
+if (NOT RS_ENABLE_PYTHON)
+    install(TARGETS rapidspeech-core
+            RUNTIME DESTINATION bin
+            LIBRARY DESTINATION lib
+            ARCHIVE DESTINATION lib
+    )
+endif()
+
 # --- Example Executables ---
 if (RS_BUILD_CLI)
     # Download miniaudio.h if not present (3rd-party single-header library)
@@ -404,6 +459,10 @@ if (RS_BUILD_CLI)
             examples/tts/rs-tts-offline.cpp
     )
 
+    add_executable(rs-tts-online
+            examples/tts/rs-tts-online.cpp
+    )
+
     add_executable(rs-quantize
             examples/quantize/quantize.cpp
             examples/quantize/common_quantize.cpp
@@ -420,9 +479,30 @@ if (RS_BUILD_CLI)
     add_executable(rs-kws
             examples/kws/rs-kws.cpp
     )
+    set(RS_CLI_TARGETS
+            rs-asr-offline
+            rs-asr-vad-online
+            rs-tts-offline
+            rs-tts-online
+            rs-tts-split
+            rs-quantize
+            rs-imatrix
+            rs-speaker-id
+            rs-kws
+    )
+
+    if (NOT WIN32)
+        foreach(_rs_cli_target IN LISTS RS_CLI_TARGETS)
+            set_target_properties(${_rs_cli_target} PROPERTIES
+                    INSTALL_RPATH "${RS_EXECUTABLE_INSTALL_RPATH}"
+            )
+        endforeach()
+    endif()
+
     target_link_libraries(rs-asr-offline PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-asr-vad-online  PRIVATE rapidspeech-core ggml Threads::Threads)
     target_link_libraries(rs-tts-offline PRIVATE rapidspeech-core ggml)
+    target_link_libraries(rs-tts-online  PRIVATE rapidspeech-core ggml Threads::Threads)
     target_link_libraries(rs-tts-split   PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-quantize PRIVATE ggml)
     target_link_libraries(rs-imatrix PRIVATE rapidspeech-core ggml)
@@ -470,6 +550,13 @@ if (RS_BUILD_CLI)
         ${GGML_PATH}/include
         ${GGML_PATH}/src
     )
+    target_include_directories(rs-tts-online PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src/utils
+        ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
+        ${GGML_PATH}/include
+        ${GGML_PATH}/src
+    )
     target_include_directories(rs-tts-split PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/examples/tts
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -496,6 +583,7 @@ if (RS_BUILD_CLI)
     # miniaudio uses dlopen on Linux for ALSA/PulseAudio/JACK backend discovery
     if(UNIX AND NOT APPLE)
         target_link_libraries(rs-asr-vad-online PRIVATE ${CMAKE_DL_LIBS})
+        target_link_libraries(rs-tts-online PRIVATE ${CMAKE_DL_LIBS})
         target_link_libraries(rs-kws PRIVATE ${CMAKE_DL_LIBS})
     endif()
 
@@ -508,12 +596,42 @@ if (RS_BUILD_CLI)
     install(TARGETS rs-tts-offline
             RUNTIME DESTINATION bin
     )
+    install(TARGETS rs-tts-online
+            RUNTIME DESTINATION bin
+    )
     install(TARGETS rs-speaker-id
             RUNTIME DESTINATION bin
     )
     install(TARGETS rs-kws
             RUNTIME DESTINATION bin
     )
+    install(TARGETS rs-tts-split
+            RUNTIME DESTINATION bin
+    )
+    install(TARGETS rs-quantize
+            RUNTIME DESTINATION bin
+    )
+    install(TARGETS rs-imatrix
+            RUNTIME DESTINATION bin
+    )
+
+    # Runtime data (G2P dictionaries, WeText FSTs, cppjieba dict).
+    # Installed into share/rapidspeech/ to match the FHS layout the runtime
+    # discovery (rs::find_data_dir) checks first relative to <exe>/.
+    install(DIRECTORY rapidspeech/data/
+            DESTINATION share/rapidspeech
+            FILES_MATCHING
+            PATTERN "*"
+            PATTERN ".*" EXCLUDE
+    )
+    if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cppjieba/dict)
+        install(DIRECTORY third_party/cppjieba/dict/
+                DESTINATION share/rapidspeech/cppjieba/dict
+                FILES_MATCHING
+                PATTERN "*"
+                PATTERN ".*" EXCLUDE
+        )
+    endif()
 endif()
 # --- Tests ---
 if (RS_BUILD_TESTS)
@@ -523,6 +641,9 @@ if (RS_BUILD_TESTS)
     set(TEST_MODULES
             audio_frontend
             cosyvoice3_e2e
+            kokoro_metal_convt
+            kokoro_en_g2p
+            wetext_normalizer
     )
 
     foreach(module ${TEST_MODULES})
@@ -531,7 +652,37 @@ if (RS_BUILD_TESTS)
 
         if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${test_source}")
             add_executable(${test_target} ${test_source})
+            target_include_directories(${test_target} PRIVATE rapidspeech/src)
             target_link_libraries(${test_target} PRIVATE rapidspeech-core ggml)
+
+            # test_kokoro_metal_convt directly exercises the Metal kernel class
+            # whose symbols are hidden inside librapidspeech-core. Compile the
+            # .mm in directly so the linker can see them.
+            if (module STREQUAL "kokoro_metal_convt" AND APPLE)
+                target_sources(${test_target} PRIVATE rapidspeech/src/arch/kokoro_metal.mm)
+                set_source_files_properties(rapidspeech/src/arch/kokoro_metal.mm
+                    TARGET_DIRECTORY ${test_target}
+                    PROPERTIES COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
+                target_link_libraries(${test_target} PRIVATE "-framework Foundation" "-framework Metal")
+            endif()
+
+            # WeTextNormalizer symbols are hidden in librapidspeech-core
+            # (CXX_VISIBILITY_PRESET hidden). Compile the wrapper TU
+            # directly into the test binary and link the OpenFST-backed
+            # static lib so the wrapper resolves.
+            if (module STREQUAL "wetext_normalizer")
+                target_sources(${test_target} PRIVATE
+                    rapidspeech/src/frontend/wetext_normalizer.cpp)
+                target_link_libraries(${test_target} PRIVATE wetext_processor)
+            endif()
+
+            # EnG2P symbols are likewise hidden inside librapidspeech-core;
+            # compile the TU directly into the test so the linker sees them.
+            if (module STREQUAL "kokoro_en_g2p")
+                target_sources(${test_target} PRIVATE
+                    rapidspeech/src/frontend/kokoro_g2p_en.cpp)
+            endif()
+
             add_test(NAME ${test_target} COMMAND ${test_target})
         endif()
     endforeach()

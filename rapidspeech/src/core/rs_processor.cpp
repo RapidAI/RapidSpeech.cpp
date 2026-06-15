@@ -1,4 +1,5 @@
 #include "core/rs_processor.h"
+#include "arch/cosyvoice3.h"
 #include "ggml-backend.h"
 #include "utils/rs_log.h"
 #include <chrono>
@@ -25,6 +26,10 @@ RSProcessor::RSProcessor(std::shared_ptr<ISpeechModel> model,
   if (model_) {
     state_ = model_->CreateState();
   }
+}
+
+RSProcessor::~RSProcessor() {
+  StopTtsWorker();
 }
 
 void RSProcessor::PushAudio(const float *data, size_t size) {
@@ -152,6 +157,7 @@ std::string RSProcessor::GetTextResult() {
 }
 
 void RSProcessor::Reset() {
+  StopTtsWorker();
   audio_buffer_ = CircularBuffer();
   text_accumulator_.clear();
   last_token_id_ = -1;
@@ -230,6 +236,110 @@ int RSProcessor::ProcessTTS() {
   }
 
   return 0;  // offline: single call, done
+}
+
+// ---------------------------------------------------------------------------
+// TTS streaming (rs-tts-online).
+//
+// Worker thread runs CosyVoice3LMModel::DecodeStream. Each emitted PCM chunk
+// is pushed onto `tts_chunk_queue_` under `tts_queue_mu_`; the caller-side
+// `ProcessTTSStream` blocks on `tts_queue_cv_` until either a chunk arrives
+// or the worker finishes. Bounded queue (kTtsChunkQueueMax) gives natural
+// back-pressure when the consumer falls behind.
+// ---------------------------------------------------------------------------
+
+void RSProcessor::StopTtsWorker() {
+  if (tts_worker_.joinable()) {
+    // Drain any pending chunks so a blocked worker (in `emit`) can exit.
+    {
+      std::lock_guard<std::mutex> lk(tts_queue_mu_);
+      tts_chunk_queue_.clear();
+      tts_stream_done_.store(true);
+    }
+    tts_queue_cv_.notify_all();
+    tts_worker_.join();
+  }
+  tts_stream_started_ = false;
+  tts_stream_done_.store(false);
+  tts_stream_error_.store(false);
+  {
+    std::lock_guard<std::mutex> lk(tts_queue_mu_);
+    tts_chunk_queue_.clear();
+  }
+}
+
+int RSProcessor::ProcessTTSStream() {
+  if (!model_ || !state_ || !sched_) return -1;
+
+  auto *cv3 = dynamic_cast<CosyVoice3LMModel *>(model_.get());
+  if (!cv3) {
+    RS_LOG_ERR("ProcessTTSStream: only CosyVoice3 supports streaming");
+    return -1;
+  }
+
+  if (!tts_stream_started_) {
+    // Spawn worker. The lambda captures `this` and the state pointer; both
+    // outlive the worker because `StopTtsWorker` (called from dtor / Reset)
+    // joins before they go out of scope.
+    tts_stream_done_.store(false);
+    tts_stream_error_.store(false);
+    {
+      std::lock_guard<std::mutex> lk(tts_queue_mu_);
+      tts_chunk_queue_.clear();
+    }
+    tts_stream_started_ = true;
+
+    auto *state_raw = state_.get();
+    auto sched = sched_;
+    tts_worker_ = std::thread([this, cv3, state_raw, sched]() {
+      auto emit_cb = [this](const float *pcm, size_t n) {
+        if (!pcm || n == 0) return;
+        std::unique_lock<std::mutex> lk(tts_queue_mu_);
+        // Back-pressure: wait if the consumer is far behind. Bail out if
+        // a Stop request arrives while we're blocked.
+        tts_queue_cv_.wait(lk, [&] {
+          return tts_chunk_queue_.size() < kTtsChunkQueueMax ||
+                 tts_stream_done_.load();
+        });
+        if (tts_stream_done_.load()) return;
+        tts_chunk_queue_.emplace_back(pcm, pcm + n);
+        lk.unlock();
+        tts_queue_cv_.notify_all();
+      };
+      ggml_backend_sched_reset(sched);
+      bool ok = cv3->DecodeStream(*state_raw, sched, emit_cb);
+      {
+        std::lock_guard<std::mutex> lk(tts_queue_mu_);
+        if (!ok) tts_stream_error_.store(true);
+        tts_stream_done_.store(true);
+      }
+      tts_queue_cv_.notify_all();
+    });
+  }
+
+  // Wait for the next chunk OR the worker to finish.
+  std::unique_lock<std::mutex> lk(tts_queue_mu_);
+  tts_queue_cv_.wait(lk, [&] {
+    return !tts_chunk_queue_.empty() || tts_stream_done_.load();
+  });
+
+  if (!tts_chunk_queue_.empty()) {
+    tts_audio_buf_ = std::move(tts_chunk_queue_.front());
+    tts_chunk_queue_.pop_front();
+    tts_audio_read_pos_ = 0;
+    lk.unlock();
+    tts_queue_cv_.notify_all();   // unblock worker's back-pressure wait
+    return 1;
+  }
+
+  // Queue empty AND worker done.
+  const bool err = tts_stream_error_.load();
+  lk.unlock();
+  if (err) return -1;
+  // Final empty result: caller's GetAudioOutput returns 0; we report 0 = done.
+  tts_audio_buf_.clear();
+  tts_audio_read_pos_ = 0;
+  return 0;
 }
 
 int RSProcessor::GetAudioOutput(float **out_data) {

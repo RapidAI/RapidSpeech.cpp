@@ -3,9 +3,13 @@
 #include "frontend/audio_processor.h"
 #include "ggml-backend.h"
 #include "rs_model.h"
+#include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 #define SENSE_VOICE_MAX_GRAPH_SIZE 8196
 /**
@@ -36,6 +40,8 @@ public:
    * @param sched Backend scheduler used for inference
    */
   RSProcessor(std::shared_ptr<ISpeechModel> model, ggml_backend_sched_t sched);
+
+  ~RSProcessor();
 
   // --- ASR methods ---
 
@@ -112,6 +118,22 @@ public:
   int ProcessTTS();
 
   /**
+   * Run one TTS streaming step (CosyVoice3 chunk-level streaming).
+   *
+   * First call spawns a background worker that drives
+   * `CosyVoice3LMModel::DecodeStream`. Each PCM chunk emitted by the
+   * worker is pushed onto an internal queue. Each `ProcessTTSStream` call
+   * blocks until either the next chunk arrives or the worker finishes,
+   * then swaps the chunk into `tts_audio_buf_` so the regular
+   * `GetAudioOutput` C-API path returns it.
+   *
+   * @return 1: chunk available (read via GetAudioOutput)
+   *         0: done (worker finished, queue empty)
+   *        -1: error
+   */
+  int ProcessTTSStream();
+
+  /**
    * Get synthesized audio output.
    * @param out_data Pointer to internal buffer (do not free)
    * @return Number of samples available, 0 if none
@@ -162,4 +184,20 @@ private:
   bool tts_decoded_ = false;
   std::vector<float> tts_audio_buf_;
   int tts_audio_read_pos_ = 0;
+
+  // ----- TTS streaming (rs-tts-online) -------------------------------------
+  // Background worker drives `CosyVoice3LMModel::DecodeStream`; each emitted
+  // PCM chunk is pushed onto `tts_chunk_queue_`. `ProcessTTSStream` blocks
+  // on `tts_queue_cv_` until either a chunk arrives or the worker finishes,
+  // then swaps the chunk into `tts_audio_buf_`.
+  std::thread tts_worker_;
+  std::mutex  tts_queue_mu_;
+  std::condition_variable tts_queue_cv_;
+  std::deque<std::vector<float>> tts_chunk_queue_;
+  std::atomic<bool> tts_stream_done_{false};
+  std::atomic<bool> tts_stream_error_{false};
+  bool tts_stream_started_ = false;
+  static constexpr size_t kTtsChunkQueueMax = 8;
+
+  void StopTtsWorker();
 };
