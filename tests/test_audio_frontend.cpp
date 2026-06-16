@@ -35,7 +35,7 @@ void test_fbank_standard() {
   std::vector<float> feats;
     
   // Run Compute
-  processor.Compute(pcm, feats, false);
+  processor.Compute(pcm, feats);
 
   // Expected Calculation:
   // Num Frames = (16000 - 400) / 160 + 1 = 97.5 -> 98 frames
@@ -80,7 +80,7 @@ void test_fbank_lfr() {
   auto pcm = generate_sine_wave(1.0f);
   std::vector<float> feats;
     
-  processor.Compute(pcm, feats, false);
+  processor.Compute(pcm, feats);
 
   // Expected Calculation:
   // Basic Frames: 98

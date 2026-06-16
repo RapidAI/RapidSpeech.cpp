@@ -33,7 +33,24 @@ FetchContent_Declare(openfst
     URL      https://github.com/csukuangfj/openfst/archive/refs/tags/v1.8.5-2026-06-15.tar.gz
     URL_HASH SHA256=5f9323ded5c9cf4d4e23325dd92652b18b553556ad92b59996e687ebd9688490
 )
+
+# Force fst to build as a static archive regardless of the parent project's
+# BUILD_SHARED_LIBS. The Python wheel build flips BUILD_SHARED_LIBS=ON, which
+# would otherwise produce a libfst.so that rapidspeech-core.so picks up as a
+# DT_NEEDED — and downstream test executables fail to link because libfst.so
+# isn't on their search path. fst is a purely internal dep of wetext_processor,
+# so static is the right default everywhere.
+set(_RS_PREV_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+set(BUILD_SHARED_LIBS OFF)
+# Position-independent code is still required so the static archive can be
+# linked into the eventual rapidspeech-core shared lib / Python module.
+set(_RS_PREV_CMAKE_PIC ${CMAKE_POSITION_INDEPENDENT_CODE})
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 FetchContent_MakeAvailable(openfst)
+
+set(BUILD_SHARED_LIBS ${_RS_PREV_BUILD_SHARED_LIBS})
+set(CMAKE_POSITION_INDEPENDENT_CODE ${_RS_PREV_CMAKE_PIC})
 
 # Public include path so consumers can `#include "fst/fst.h"` etc.
 if(TARGET fst)
