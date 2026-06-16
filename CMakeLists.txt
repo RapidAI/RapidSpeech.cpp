@@ -701,6 +701,21 @@ if (RS_BUILD_TESTS)
 
             add_test(NAME ${test_target} COMMAND ${test_target})
 
+            # On Windows the loader resolves DLLs from the exe's own
+            # directory or PATH — there's no rpath. CMake's multi-config
+            # generator puts test exes in build/Release/ but shared
+            # dependencies (ggml*.dll, etc.) land in build/bin/Release/,
+            # so launching the test fails with STATUS_DLL_NOT_FOUND
+            # (0xC0000135). Copy all transitive DLL deps next to the exe.
+            # $<TARGET_RUNTIME_DLLS:> requires CMake 3.21+.
+            if (WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
+                add_custom_command(TARGET ${test_target} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        $<TARGET_RUNTIME_DLLS:${test_target}>
+                        $<TARGET_FILE_DIR:${test_target}>
+                    COMMAND_EXPAND_LISTS)
+            endif()
+
             # test_cosyvoice3_e2e exits 77 (GNU automake skip convention) when
             # RS_CV3_E2E_MODEL is unset. Teach ctest to treat that as Skipped
             # instead of Failed.
