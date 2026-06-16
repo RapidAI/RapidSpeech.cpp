@@ -24,6 +24,9 @@ set(HAVE_SPECIAL   OFF CACHE BOOL "Build special"          FORCE)
 
 if(MSVC)
     add_compile_options(/W0 /wd4244 /wd4267 /utf-8)
+    # Prevent <windows.h> max/min macros from clobbering
+    # std::numeric_limits<...>::max() in openfst/randgen.h.
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
 FetchContent_Declare(openfst

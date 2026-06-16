@@ -25,10 +25,10 @@ jobs:
           - os: ubuntu-latest
             backend: cuda
           # 3. Windows CPU
-          - os: windows-latest
+          - os: windows-2022
             backend: cpu
           # 4. Windows CUDA
-          - os: windows-latest
+          - os: windows-2022
             backend: cuda
           # 5. macOS Metal (macOS supports Metal by default)
           - os: macos-latest
@@ -42,7 +42,7 @@ jobs:
 
       # Specific setup for Windows CUDA
       - name: Install CUDA (Windows)
-        if: matrix.os == 'windows-latest' && matrix.backend == 'cuda'
+        if: matrix.os == 'windows-2022' && matrix.backend == 'cuda'
         uses: jimver/cuda-toolkit@v0.2.20
         with:
           cuda: '11.8.0'

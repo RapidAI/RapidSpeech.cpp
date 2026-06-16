@@ -295,6 +295,11 @@ set_target_properties(wetext_processor PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON)
+if(MSVC)
+    # openfst/randgen.h uses std::numeric_limits<...>::max(); without
+    # NOMINMAX the Windows SDK max() macro turns that into a syntax error.
+    target_compile_definitions(wetext_processor PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
 
 target_link_libraries(rapidspeech-core PRIVATE wetext_processor)
 
