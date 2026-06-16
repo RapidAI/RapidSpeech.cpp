@@ -48,11 +48,23 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
+
+// Cross-platform setenv: MSVC's CRT exposes _putenv_s instead.
+#if defined(_WIN32)
+static inline int rs_setenv(const char *name, const char *value, int /*overwrite*/) {
+    return _putenv_s(name, value);
+}
+#else
+static inline int rs_setenv(const char *name, const char *value, int overwrite) {
+    return setenv(name, value, overwrite);
+}
+#endif
 
 #define LOG_INFO(fmt, ...)  std::printf("[imatrix] " fmt "\n", ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) std::fprintf(stderr, "[imatrix] ERROR: " fmt "\n", ##__VA_ARGS__)
@@ -443,8 +455,8 @@ int main(int argc, char **argv) {
     // rs_init_from_file (Load reads it). Kokoro uses RS_KOKORO_VOICE_PATH for
     // the same purpose. Harmless for archs that don't read these.
     if (args.voice_path) {
-        setenv("RS_CV3_VOICE_PATH", args.voice_path, 1);
-        setenv("RS_KOKORO_VOICE_PATH", args.voice_path, 1);
+        rs_setenv("RS_CV3_VOICE_PATH", args.voice_path, 1);
+        rs_setenv("RS_KOKORO_VOICE_PATH", args.voice_path, 1);
     }
 
     LOG_INFO("Importance Matrix Collection Tool");

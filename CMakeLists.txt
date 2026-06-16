@@ -691,14 +691,23 @@ if (RS_BUILD_TESTS)
             # AudioProcessor methods are likewise hidden inside
             # librapidspeech-core (CXX_VISIBILITY_PRESET hidden). Compile the
             # TU directly into the test binary. fftsg.c's rdft is extern "C"
-            # and stays default-visible in the shared lib, so we don't need
-            # to recompile it here.
+            # but isn't dllexported from the Windows DLL, so compile it in
+            # too for cross-platform link.
             if (module STREQUAL "audio_frontend")
                 target_sources(${test_target} PRIVATE
-                    rapidspeech/src/frontend/audio_processor.cpp)
+                    rapidspeech/src/frontend/audio_processor.cpp
+                    rapidspeech/src/frontend/fftsg.c)
             endif()
 
             add_test(NAME ${test_target} COMMAND ${test_target})
+
+            # test_cosyvoice3_e2e exits 77 (GNU automake skip convention) when
+            # RS_CV3_E2E_MODEL is unset. Teach ctest to treat that as Skipped
+            # instead of Failed.
+            if (module STREQUAL "cosyvoice3_e2e")
+                set_tests_properties(${test_target} PROPERTIES
+                    SKIP_RETURN_CODE 77)
+            endif()
         endif()
     endforeach()
 endif()

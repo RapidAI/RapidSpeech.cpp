@@ -39,6 +39,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <io.h>      // _setmode, _fileno
+#include <fcntl.h>   // _O_BINARY
 #endif
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
