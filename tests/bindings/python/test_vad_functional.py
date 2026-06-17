@@ -22,11 +22,21 @@ def vad(vad_model_path):
 
 
 def _make_clip() -> np.ndarray:
-    """1 s silence + 1 s noise burst + 1 s silence, 16 kHz mono."""
+    """1 s silence + 1 s voiced-like burst + 1 s silence, 16 kHz mono.
+
+    Silero VAD is trained on real speech and rejects flat gaussian noise.
+    We synthesize a voiced-speech-like signal instead: 150 Hz fundamental
+    with harmonics, amplitude-modulated at 4 Hz (syllable rate). This is
+    not a speech accuracy test — we just need a deterministic signal that
+    crosses the speech threshold.
+    """
     sr = 16000
     silence = np.zeros(sr, dtype=np.float32)
-    rng = np.random.default_rng(0)
-    burst = rng.standard_normal(sr).astype(np.float32) * 0.5
+    t = np.arange(sr) / sr
+    fund = 150.0
+    harm = sum(np.sin(2 * np.pi * fund * k * t) / k for k in range(1, 8))
+    am = 0.5 + 0.5 * np.sin(2 * np.pi * 4 * t)
+    burst = (harm * am * 0.5).astype(np.float32)
     return np.concatenate([silence, burst, silence])
 
 
