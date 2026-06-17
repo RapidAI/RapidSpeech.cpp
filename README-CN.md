@@ -13,41 +13,75 @@
 
 # RapidSpeech.cpp 🎙️
 
-在本地用一个 GGUF 驱动的 C++ runtime 跑 ASR 和 TTS。
+面向 Python 开发者的本地 ASR / TTS，底层由 C++ GGUF runtime 驱动。
 
-**RapidSpeech.cpp** 是一个纯 C/C++ 语音推理引擎，面向端侧语音识别、语音合成、VAD、说话人嵌入和声音克隆。它使用 **ggml** 后端和统一的 **GGUF** 模型格式，让部署变成一个原生 runtime 加一个模型文件。
+**RapidSpeech.cpp** 给 Python 开发者提供简单的本地语音识别、语音合成、VAD、说话人嵌入和声音克隆 API。底层使用纯 C/C++ 引擎、**ggml** 后端和统一的 **GGUF** 模型格式，所以你写的是 Python，跑的是原生性能，不需要启动语音服务。
 
 ------
 
-## 60 秒搞定
+## Python 60 秒跑起来
+
+### 安装
+
+```bash
+pip install rapidspeech
+```
+
+GPU wheel：
+
+```bash
+pip install rapidspeech-metal   # macOS / Apple Silicon
+pip install rapidspeech-cuda    # Linux / NVIDIA
+```
 
 ### 文本转语音
 
 ```bash
-./build/rs-tts-offline \
-  -m /path/to/omnivoice-f16.gguf \
-  -t "Hello, welcome to RapidSpeech." \
-  --lang English \
-  -o output.wav
+python python-api-examples/tts/tts-offline.py \
+  --model /path/to/omnivoice-f16.gguf \
+  --text "Hello, welcome to RapidSpeech." \
+  --output output.wav
 ```
 
 ### 语音转文本
 
 ```bash
-./build/rs-asr-offline \
-  -m /path/to/funasr-nano-fp16.gguf \
-  -w /path/to/audio.wav \
-  --gpu true
+python python-api-examples/asr/asr-offline.py \
+  --model /path/to/funasr-nano-fp16.gguf \
+  --audio /path/to/audio.wav
+```
+
+### Python API
+
+```python
+import rapidspeech
+
+tts = rapidspeech.tts_synthesizer("/path/to/omnivoice-f16.gguf")
+tts.set_params(instruct="male, young adult", language="English", seed=42)
+pcm = tts.synthesize("Hello from a native speech engine.")
+sample_rate = tts.get_sample_rate()
+```
+
+```python
+import rapidspeech
+
+asr = rapidspeech.asr_offline("/path/to/funasr-nano-fp16.gguf")
+sample_rate = asr.get_model_meta()["audio_sample_rate"]
+pcm = ...  # 1-D float32 mono PCM，采样率为 sample_rate
+asr.push_audio(pcm)
+asr.process()
+print(asr.get_text())
 ```
 
 ------
 
 ## 为什么是 RapidSpeech.cpp
 
+- **Python API，原生核心**：写 Python，底层跑 C++ / ggml 引擎。
 - **一个模型格式**：ASR、TTS、VAD、说话人模型都使用 GGUF。
-- **一个原生 runtime**：纯 C/C++，生产环境不需要 Python runtime。
-- **一个端侧后端栈**：CPU、Metal、CUDA、Vulkan、CANN、OpenCL、WebGPU。
-- **为语音而生**：VAD 分段、流式缓冲、声音克隆、量化，以及 Apple Metal DAC 加速。
+- **NumPy 输入输出**：ASR 接收 float32 PCM；TTS 返回 float32 PCM。
+- **默认本地运行**：没有云 API，没有语音服务，没有 Python 模型栈。
+- **端侧后端栈**：CPU、Metal、CUDA、Vulkan、CANN、OpenCL、WebGPU。
 
 ------
 
@@ -83,14 +117,14 @@ CosyVoice3、Qwen3-ASR、Qwen3-TTS。
 
 ## 文档
 
-- [技术说明](docs/TECHNICAL-CN.md)：架构、设计取舍、后端、模型转换和绑定接口。
 - [Python 示例](python-api-examples/README.md)
+- [技术说明](docs/TECHNICAL-CN.md)：架构、设计取舍、后端、模型转换和绑定接口。
 - [浏览器 / WASM 示例](wasm-examples/README.md)
 - [Node.js 示例](node-api-example/README.md)
 
 ------
 
-## 🛠️ 快速开始
+## 原生 C++ CLI
 
 ### 模型下载
 
@@ -159,11 +193,7 @@ cmake --build build --config Release
 
 ### Python
 
-```bash
-pip install rapidspeech
-```
-
-详细 CLI 参数、Python API、多语言绑定和模型转换说明见 [技术说明](docs/TECHNICAL-CN.md)。
+离线 ASR、流式 ASR、离线 TTS、流式 TTS、VAD 和声音克隆见 [Python 示例](python-api-examples/README.md)。
 
 ------
 
@@ -180,3 +210,6 @@ pip install rapidspeech
 1. [Fun-ASR](https://github.com/FunAudioLLM/Fun-ASR)
 2. [llama.cpp](https://github.com/ggml-org/llama.cpp)
 3. [ggml](https://github.com/ggml-org/ggml)
+4. [cppjieba](https://github.com/yanyiwu/cppjieba) —— 中文分词
+5. [WeText](https://github.com/wenet-e2e/wetext) —— 文本归一化（ITN/TN）
+6. [miniaudio](https://github.com/mackron/miniaudio) —— 单文件音频 I/O

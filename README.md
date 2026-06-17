@@ -14,45 +14,78 @@ English | [简体中文](./README-CN.md)
 
 # RapidSpeech.cpp 🎙️
 
-Run local ASR and TTS from one GGUF-powered C++ runtime.
+Python-friendly local ASR and TTS, powered by a native C++ GGUF runtime.
 
-**RapidSpeech.cpp** is a pure C/C++ speech inference engine for on-device
-speech recognition, text-to-speech, VAD, speaker embedding, and voice cloning.
-It uses **ggml** backends and a unified **GGUF** model format, so deployment is
-one native runtime plus one model file.
+**RapidSpeech.cpp** gives Python developers a simple API for local speech
+recognition, text-to-speech, VAD, speaker embedding, and voice cloning. Under
+the hood it uses a pure C/C++ engine, **ggml** backends, and a unified **GGUF**
+model format, so you get native performance without running a speech server.
 
 ------
 
-## Try It In 60 Seconds
+## Python In 60 Seconds
+
+### Install
+
+```bash
+pip install rapidspeech
+```
+
+GPU wheels:
+
+```bash
+pip install rapidspeech-metal   # macOS / Apple Silicon
+pip install rapidspeech-cuda    # Linux / NVIDIA
+```
 
 ### Text to speech
 
 ```bash
-./build/rs-tts-offline \
-  -m /path/to/omnivoice-f16.gguf \
-  -t "Hello, welcome to RapidSpeech." \
-  --lang English \
-  -o output.wav
+python python-api-examples/tts/tts-offline.py \
+  --model /path/to/omnivoice-f16.gguf \
+  --text "Hello, welcome to RapidSpeech." \
+  --output output.wav
 ```
 
 ### Speech to text
 
 ```bash
-./build/rs-asr-offline \
-  -m /path/to/funasr-nano-fp16.gguf \
-  -w /path/to/audio.wav \
-  --gpu true
+python python-api-examples/asr/asr-offline.py \
+  --model /path/to/funasr-nano-fp16.gguf \
+  --audio /path/to/audio.wav
+```
+
+### Python API
+
+```python
+import rapidspeech
+
+tts = rapidspeech.tts_synthesizer("/path/to/omnivoice-f16.gguf")
+tts.set_params(instruct="male, young adult", language="English", seed=42)
+pcm = tts.synthesize("Hello from a native speech engine.")
+sample_rate = tts.get_sample_rate()
+```
+
+```python
+import rapidspeech
+
+asr = rapidspeech.asr_offline("/path/to/funasr-nano-fp16.gguf")
+sample_rate = asr.get_model_meta()["audio_sample_rate"]
+pcm = ...  # 1-D float32 mono PCM at sample_rate
+asr.push_audio(pcm)
+asr.process()
+print(asr.get_text())
 ```
 
 ------
 
 ## Why RapidSpeech.cpp
 
+- **Python API, native core**: write Python, run a C++/ggml engine underneath.
 - **One model format**: ASR, TTS, VAD, and speaker models use GGUF.
-- **One native runtime**: pure C/C++, no Python runtime required in production.
-- **One edge-first backend stack**: CPU, Metal, CUDA, Vulkan, CANN, OpenCL, and WebGPU.
-- **Built for speech**: VAD segmentation, streaming buffers, voice cloning,
-  quantization, and Apple Metal DAC acceleration.
+- **NumPy in, NumPy out**: ASR takes float32 PCM; TTS returns float32 PCM.
+- **Local by default**: no cloud API, no speech server, no Python model stack.
+- **Edge-first backends**: CPU, Metal, CUDA, Vulkan, CANN, OpenCL, and WebGPU.
 
 ------
 
@@ -89,15 +122,15 @@ CosyVoice3, Qwen3-ASR, Qwen3-TTS.
 
 ## Documentation
 
+- [Python examples](python-api-examples/README.md)
 - [Technical Notes](docs/TECHNICAL.md): architecture, design tradeoffs, backends,
   model conversion, and binding surfaces.
-- [Python examples](python-api-examples/README.md)
 - [Browser / WASM examples](wasm-examples/README.md)
 - [Node.js example](node-api-example/README.md)
 
 ------
 
-## 🛠️ Quick Start
+## Native C++ CLI
 
 ### Download Models
 
@@ -166,12 +199,8 @@ Build artifacts are located in the `build/` directory:
 
 ### Python
 
-```bash
-pip install rapidspeech
-```
-
-Detailed CLI flags, Python APIs, binding surfaces, and model conversion recipes
-live in [Technical Notes](docs/TECHNICAL.md).
+See [Python examples](python-api-examples/README.md) for offline ASR, streaming
+ASR, offline TTS, streaming TTS, VAD, and voice cloning.
 
 ------
 
@@ -188,3 +217,6 @@ If you are interested in the following areas, we welcome your PRs or participati
 1. [Fun-ASR](https://github.com/FunAudioLLM/Fun-ASR)
 2. [llama.cpp](https://github.com/ggml-org/llama.cpp)
 3. [ggml](https://github.com/ggml-org/ggml)
+4. [cppjieba](https://github.com/yanyiwu/cppjieba) — Chinese word segmentation
+5. [WeText](https://github.com/wenet-e2e/wetext) — text normalization (ITN/TN)
+6. [miniaudio](https://github.com/mackron/miniaudio) — single-file audio I/O
