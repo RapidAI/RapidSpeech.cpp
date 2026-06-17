@@ -40,8 +40,8 @@ jobs:
             runner: ubuntu-22.04
             backend: cuda
             expected_uname: x86_64
-            cuda_archs: "75;86;89"
-            parallel_jobs: 2
+            cuda_archs: "75-virtual;86-real;89-virtual"
+            parallel_jobs: 1
             archive_ext: tar.gz
           - target: windows-x64-cpu
             runner: windows-2022
@@ -101,7 +101,7 @@ jobs:
         run: |
           sudo swapoff -a || true
           sudo rm -f /swapfile /mnt/swapfile
-          sudo fallocate -l 12G /mnt/swapfile
+          sudo fallocate -l 20G /mnt/swapfile
           sudo chmod 600 /mnt/swapfile
           sudo mkswap /mnt/swapfile
           sudo swapon /mnt/swapfile
