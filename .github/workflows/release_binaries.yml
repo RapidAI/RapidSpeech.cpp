@@ -40,7 +40,8 @@ jobs:
             runner: ubuntu-22.04
             backend: cuda
             expected_uname: x86_64
-            cuda_archs: "70;75;80;86;89"
+            cuda_archs: "75;86;89"
+            parallel_jobs: 2
             archive_ext: tar.gz
           - target: windows-x64-cpu
             runner: windows-2022
@@ -51,7 +52,8 @@ jobs:
             runner: windows-2022
             backend: cuda
             cmake_arch: x64
-            cuda_archs: "70;75;80;86;89"
+            cuda_archs: "75;86"
+            parallel_jobs: 2
             archive_ext: zip
           - target: macos-x64-metal
             runner: macos-13
@@ -65,7 +67,7 @@ jobs:
             archive_ext: tar.gz
 
     env:
-      CMAKE_BUILD_PARALLEL_LEVEL: 4
+      CMAKE_BUILD_PARALLEL_LEVEL: ${{ matrix.parallel_jobs || 4 }}
       RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag || github.ref_name }}
       TARGET_NAME: ${{ matrix.target }}
       BACKEND: ${{ matrix.backend }}
@@ -118,6 +120,14 @@ jobs:
           cuda: '12.4.0'
           method: 'network'
 
+      - name: Setup ccache
+        if: runner.os != 'Windows'
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ matrix.target }}
+          max-size: 2G
+          variant: ccache
+
       - name: Configure CMake
         shell: bash
         run: |
@@ -135,7 +145,11 @@ jobs:
           )
 
           if [ "$RUNNER_OS" != "Windows" ]; then
-            args+=(-DCMAKE_BUILD_TYPE=Release)
+            args+=(
+              -DCMAKE_BUILD_TYPE=Release
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            )
           fi
 
           if [ -n "$CMAKE_ARCH" ]; then
@@ -150,6 +164,9 @@ jobs:
               args+=(-DRS_CUDA=ON)
               if [ -n "$CUDA_ARCHS" ]; then
                 args+=("-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS}")
+              fi
+              if [ "$RUNNER_OS" != "Windows" ]; then
+                args+=(-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache)
               fi
               ;;
             metal)
