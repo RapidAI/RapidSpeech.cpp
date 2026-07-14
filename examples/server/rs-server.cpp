@@ -25,6 +25,7 @@
 #include "rs_json.h"
 #include "rs_ws.h"
 
+#include "core/rs_context.h"
 #include "rapidspeech.h"
 #include "utils/rs_log.h"
 #include "utils/rs_wav.h"
@@ -115,8 +116,18 @@ struct Engine {
     std::string arch;
     int sample_rate = 16000;
 
+    void unload() {
+        if (ctx) {
+            rs_free(ctx);
+            ctx = nullptr;
+        }
+        arch.clear();
+        sample_rate = 16000;
+    }
+
     bool load(const std::string &path, int threads, bool gpu,
               rs_task_type_t task = RS_TASK_ASR_OFFLINE) {
+        unload();
         rs_init_params_t p = rs_default_params();
         p.model_path = path.c_str();
         p.n_threads = threads;
@@ -129,11 +140,17 @@ struct Engine {
         sample_rate = m.audio_sample_rate;
         return true;
     }
-    ~Engine() { if (ctx) rs_free(ctx); }
+    ~Engine() { unload(); }
 };
 
 static Engine g_asr, g_tts;
 static bool g_have_asr = false, g_have_tts = false;
+static std::string g_asr_model_path;
+static int g_model_threads = 4;
+static bool g_model_gpu = true;
+static int g_asr_reload_every = 0; // 0 = disabled
+static int g_asr_final_segments_since_reload = 0;
+static bool g_mem_log = false;
 
 struct AsrServerConfig {
     bool two_pass = false;
@@ -141,7 +158,7 @@ struct AsrServerConfig {
 };
 static AsrServerConfig g_asr_cfg;
 
-// VAD is a separate handle (rs_vad_t), only used by the /asr/vad WebSocket.
+// VAD is a separate handle (rs_vad_t), used by /asr/vad and HTTP VAD mode.
 static rs_vad_t *g_vad = nullptr;
 static std::mutex g_vad_mu;
 static bool g_have_vad = false;
@@ -155,6 +172,52 @@ struct VadServerConfig {
 };
 static VadServerConfig g_vad_cfg;
 
+struct AsrSegment {
+    int index = 0;
+    float start_s = 0.0f;
+    float end_s = 0.0f;
+    std::string text;
+};
+
+static bool parse_bool_value(const std::string &v, bool current);
+
+static void log_asr_memory_locked(const char *label) {
+    if (!g_mem_log || !g_asr.ctx || !g_asr.ctx->sched) return;
+    fprintf(stderr, "[server] memory %s: ASR backend buffers", label ? label : "");
+    for (auto b : g_asr.ctx->backends) {
+        if (!b) continue;
+        size_t bytes = ggml_backend_sched_get_buffer_size(g_asr.ctx->sched, b);
+        const char *name = ggml_backend_name(b);
+        fprintf(stderr, " %s=%.1fMiB", name ? name : "backend",
+                (double)bytes / 1048576.0);
+    }
+    fprintf(stderr, "\n");
+}
+
+// Caller must hold g_asr.mu. This is intentionally opt-in because it unloads
+// and reloads ASR weights, causing a latency spike but returning CUDA buffers
+// to the driver between long stability-test segments.
+static void note_asr_final_segment_locked(const char *label) {
+    log_asr_memory_locked(label);
+    if (g_asr_reload_every <= 0 || g_asr_model_path.empty()) return;
+    g_asr_final_segments_since_reload++;
+    if (g_asr_final_segments_since_reload < g_asr_reload_every) return;
+
+    fprintf(stderr, "[server] reloading ASR after %d final segment(s) to release backend buffers\n",
+            g_asr_final_segments_since_reload);
+    g_asr_final_segments_since_reload = 0;
+    g_asr.unload();
+    if (!g_asr.load(g_asr_model_path, g_model_threads, g_model_gpu)) {
+        g_have_asr = false;
+        fprintf(stderr, "[server] ASR reload failed; ASR is now unavailable\n");
+        return;
+    }
+    g_have_asr = true;
+    fprintf(stderr, "[server] ASR reloaded: %s @ %d Hz\n",
+            g_asr.arch.c_str(), g_asr.sample_rate);
+    log_asr_memory_locked("after-reload");
+}
+
 // ── core operations ─────────────────────────────────────────────────────
 
 // Transcribe a mono float PCM buffer (at g_asr.sample_rate) → text.
@@ -166,6 +229,10 @@ static bool transcribe_pcm_locked(const float *pcm, int n, std::string &text,
                                   std::string &err, bool two_pass = false,
                                   bool ctc_precheck = false,
                                   bool ctc_only = false) {
+    if (!g_asr.ctx) {
+        err = "no ASR model loaded";
+        return false;
+    }
     rs_reset(g_asr.ctx);
     rs_set_ctc_precheck(g_asr.ctx, ctc_precheck);
     rs_set_use_llm(g_asr.ctx, !(two_pass || ctc_only));
@@ -204,9 +271,137 @@ static bool transcribe_pcm_locked(const float *pcm, int n, std::string &text,
     return true;
 }
 
-// Transcribe WAV bytes → text (HTTP path). Decodes then locks + transcribes.
-static bool do_transcribe(const std::string &audio_bytes, std::string &text,
-                          std::string &err) {
+static bool transcribe_pcm_vad_locked(const std::vector<float> &pcm,
+                                      const AsrServerConfig &asr_cfg,
+                                      const VadServerConfig &cfg,
+                                      std::vector<AsrSegment> &segments,
+                                      std::string &text, std::string &err) {
+    if (rs_vad_reset(g_vad) != RS_OK) {
+        err = "rs_vad_reset failed";
+        return false;
+    }
+    if (rs_vad_set_threshold(g_vad, cfg.threshold) != RS_OK) {
+        err = "rs_vad_set_threshold failed";
+        return false;
+    }
+
+    const int sr = g_asr.sample_rate > 0 ? g_asr.sample_rate : 16000;
+    const int chunk_samples = std::max(1, sr / 10); // 100 ms
+    std::vector<float> seg;
+    bool in_speech = false;
+    bool pending_end = false;
+    int pending_silence_samples = 0;
+    int seg_index = 0;
+    int64_t seg_start_sample = 0;
+    int64_t total_samples = 0;
+
+    auto append_text = [&](const std::string &seg_text) {
+        if (seg_text.empty()) return;
+        if (!text.empty()) text += "\n";
+        text += seg_text;
+    };
+
+    auto transcribe_seg = [&](int64_t end_sample) -> bool {
+        if (seg.empty()) return true;
+        int min_samples = (sr * cfg.min_segment_ms) / 1000;
+        if ((int)seg.size() < min_samples) return true;
+
+        std::string seg_text;
+        if (!transcribe_pcm_locked(seg.data(), (int)seg.size(), seg_text, err,
+                                  asr_cfg.two_pass, asr_cfg.ctc_precheck)) {
+            return false;
+        }
+        if (!seg_text.empty()) {
+            AsrSegment out;
+            out.index = seg_index;
+            out.start_s = (float)((double)seg_start_sample / sr);
+            out.end_s = (float)((double)end_sample / sr);
+            out.text = seg_text;
+            segments.push_back(out);
+            append_text(seg_text);
+        }
+        return true;
+    };
+
+    auto finalize_seg = [&](int64_t end_sample) -> bool {
+        if (!transcribe_seg(end_sample)) return false;
+        note_asr_final_segment_locked("http-vad-final");
+        in_speech = false;
+        pending_end = false;
+        pending_silence_samples = 0;
+        seg_index++;
+        seg.clear();
+        return true;
+    };
+
+    auto force_split_seg = [&](int64_t end_sample) -> bool {
+        if (!finalize_seg(end_sample)) return false;
+        in_speech = true;
+        seg_start_sample = end_sample;
+        return true;
+    };
+
+    auto handle_frames = [&]() {
+        rs_vad_frame_t frames[64];
+        int nf;
+        while ((nf = rs_vad_drain_frames(g_vad, frames, 64)) > 0) {
+            for (int i = 0; i < nf; i++) {
+                if (frames[i].is_speech_start) {
+                    if (pending_end) {
+                        pending_end = false;
+                        pending_silence_samples = 0;
+                    } else if (!in_speech) {
+                        in_speech = true;
+                        seg.clear();
+                        seg_start_sample = total_samples;
+                    }
+                }
+                if (frames[i].is_speech_end && in_speech) {
+                    pending_end = true;
+                    pending_silence_samples = 0;
+                }
+            }
+            if (nf < 64) break;
+        }
+    };
+
+    for (size_t offset = 0; offset < pcm.size();) {
+        int n = (int)std::min<size_t>((size_t)chunk_samples, pcm.size() - offset);
+        const float *chunk = pcm.data() + offset;
+        if (rs_vad_push_audio(g_vad, chunk, n) != RS_OK) {
+            err = "rs_vad_push_audio failed";
+            return false;
+        }
+        handle_frames();
+        if (in_speech) {
+            seg.insert(seg.end(), chunk, chunk + n);
+            if (pending_end) pending_silence_samples += n;
+        }
+
+        total_samples += n;
+        if (pending_end &&
+            pending_silence_samples >= (sr * cfg.end_silence_ms) / 1000) {
+            if (!finalize_seg(total_samples)) return false;
+        }
+        if (in_speech && cfg.max_segment_ms > 0 &&
+            seg.size() >= (size_t)((sr * cfg.max_segment_ms) / 1000)) {
+            if (pending_end) {
+                if (!finalize_seg(total_samples)) return false;
+            } else if (!force_split_seg(total_samples)) {
+                return false;
+            }
+        }
+        offset += n;
+    }
+    if (in_speech) {
+        if (!finalize_seg(total_samples)) return false;
+    }
+    return true;
+}
+
+static bool do_transcribe_with_config(const std::string &audio_bytes,
+                                      const AsrServerConfig &cfg,
+                                      std::string &text, std::string &err) {
     if (!g_have_asr) { err = "no ASR model loaded"; return false; }
     std::vector<float> pcm;
     if (!decode_audio(audio_bytes, g_asr.sample_rate, pcm)) {
@@ -214,9 +409,34 @@ static bool do_transcribe(const std::string &audio_bytes, std::string &text,
         return false;
     }
     std::lock_guard<std::mutex> lk(g_asr.mu);
-    return transcribe_pcm_locked(pcm.data(), (int)pcm.size(), text, err,
-                                 g_asr_cfg.two_pass,
-                                 g_asr_cfg.ctc_precheck);
+    bool ok = transcribe_pcm_locked(pcm.data(), (int)pcm.size(), text, err,
+                                    cfg.two_pass,
+                                    cfg.ctc_precheck);
+    if (ok) note_asr_final_segment_locked("http-final");
+    return ok;
+}
+
+// Transcribe WAV bytes → text (HTTP/MCP path). Decodes then locks + transcribes.
+static bool do_transcribe(const std::string &audio_bytes, std::string &text,
+                          std::string &err) {
+    return do_transcribe_with_config(audio_bytes, g_asr_cfg, text, err);
+}
+
+static bool do_transcribe_vad(const std::string &audio_bytes,
+                              const AsrServerConfig &asr_cfg,
+                              const VadServerConfig &vad_cfg,
+                              std::vector<AsrSegment> &segments,
+                              std::string &text, std::string &err) {
+    if (!g_have_asr) { err = "no ASR model loaded"; return false; }
+    if (!g_have_vad) { err = "no VAD model loaded (use --vad-model)"; return false; }
+    std::vector<float> pcm;
+    if (!decode_audio(audio_bytes, g_asr.sample_rate, pcm)) {
+        err = "could not decode audio (expected WAV)";
+        return false;
+    }
+    std::unique_lock<std::mutex> alk(g_asr.mu);
+    std::unique_lock<std::mutex> vlk(g_vad_mu);
+    return transcribe_pcm_vad_locked(pcm, asr_cfg, vad_cfg, segments, text, err);
 }
 
 // Synthesize text → mono float PCM at g_tts.sample_rate.
@@ -257,6 +477,78 @@ static void send_error(httplib::Response &res, int status, const std::string &ms
     send_json(res, status, e);
 }
 
+static bool request_has_value(const httplib::Request &req, const char *key) {
+    return req.has_file(key) || req.has_param(key);
+}
+
+static std::string request_value(const httplib::Request &req, const char *key,
+                                 const std::string &current = "") {
+    if (req.has_file(key)) return req.get_file_value(key).content;
+    if (req.has_param(key)) return req.get_param_value(key);
+    return current;
+}
+
+static bool request_bool(const httplib::Request &req, const char *key,
+                         bool current) {
+    if (!request_has_value(req, key)) return current;
+    std::string v = request_value(req, key);
+    return parse_bool_value(v.empty() ? "1" : v, current);
+}
+
+static float request_float(const httplib::Request &req, const char *key,
+                           float current, float lo, float hi) {
+    if (!request_has_value(req, key)) return current;
+    std::string v = request_value(req, key);
+    char *end = nullptr;
+    float parsed = std::strtof(v.c_str(), &end);
+    if (end == v.c_str()) return current;
+    return std::max(lo, std::min(hi, parsed));
+}
+
+static int request_int(const httplib::Request &req, const char *key,
+                       int current, int lo, int hi) {
+    if (!request_has_value(req, key)) return current;
+    std::string v = request_value(req, key);
+    char *end = nullptr;
+    long parsed = std::strtol(v.c_str(), &end, 10);
+    if (end == v.c_str()) return current;
+    return std::max(lo, std::min(hi, (int)parsed));
+}
+
+static AsrServerConfig request_asr_config(const httplib::Request &req) {
+    AsrServerConfig cfg = g_asr_cfg;
+    cfg.two_pass = request_bool(req, "two_pass", cfg.two_pass);
+    cfg.ctc_precheck = request_bool(req, "ctc_precheck", cfg.ctc_precheck);
+    return cfg;
+}
+
+static VadServerConfig request_vad_config(const httplib::Request &req) {
+    VadServerConfig cfg = g_vad_cfg;
+    cfg.threshold = request_float(req, "vad_threshold", cfg.threshold, 0.0f, 1.0f);
+    cfg.threshold = request_float(req, "threshold", cfg.threshold, 0.0f, 1.0f);
+    cfg.end_silence_ms = request_int(req, "vad_end_silence_ms", cfg.end_silence_ms, 0, 60000);
+    cfg.end_silence_ms = request_int(req, "end_silence_ms", cfg.end_silence_ms, 0, 60000);
+    cfg.end_silence_ms = request_int(req, "silence_ms", cfg.end_silence_ms, 0, 60000);
+    cfg.partial_ms = request_int(req, "vad_partial_ms", cfg.partial_ms, 0, 60000);
+    cfg.partial_ms = request_int(req, "partial_ms", cfg.partial_ms, 0, 60000);
+    cfg.min_segment_ms = request_int(req, "vad_min_segment_ms", cfg.min_segment_ms, 0, 60000);
+    cfg.min_segment_ms = request_int(req, "min_segment_ms", cfg.min_segment_ms, 0, 60000);
+    cfg.max_segment_ms = request_int(req, "vad_max_segment_ms", cfg.max_segment_ms, 0, 3600000);
+    cfg.max_segment_ms = request_int(req, "max_segment_ms", cfg.max_segment_ms, 0, 3600000);
+    return cfg;
+}
+
+static bool request_wants_vad(const httplib::Request &req) {
+    if (request_has_value(req, "vad")) return request_bool(req, "vad", false);
+    if (request_has_value(req, "use_vad")) return request_bool(req, "use_vad", false);
+    if (request_has_value(req, "vad_segments"))
+        return request_bool(req, "vad_segments", false);
+    return request_has_value(req, "vad_threshold") ||
+           request_has_value(req, "vad_end_silence_ms") ||
+           request_has_value(req, "vad_min_segment_ms") ||
+           request_has_value(req, "vad_max_segment_ms");
+}
+
 static void handle_transcriptions(const httplib::Request &req, httplib::Response &res) {
     if (!g_have_asr) { send_error(res, 503, "no ASR model loaded"); return; }
     if (!req.has_file("file")) {
@@ -265,19 +557,38 @@ static void handle_transcriptions(const httplib::Request &req, httplib::Response
     }
     const auto &file = req.get_file_value("file");
     std::string text, err;
-    if (!do_transcribe(file.content, text, err)) {
+    std::vector<AsrSegment> segments;
+    AsrServerConfig asr_cfg = request_asr_config(req);
+    VadServerConfig vad_cfg = request_vad_config(req);
+    bool use_vad = request_wants_vad(req);
+    bool ok = use_vad
+                  ? do_transcribe_vad(file.content, asr_cfg, vad_cfg,
+                                      segments, text, err)
+                  : do_transcribe_with_config(file.content, asr_cfg, text, err);
+    if (!ok) {
         send_error(res, 400, err, "server_error");
         return;
     }
-    std::string fmt = req.has_file("response_format")
-                          ? req.get_file_value("response_format").content
-                          : "json";
+    std::string fmt = request_value(req, "response_format", "json");
     if (fmt == "text") {
         res.status = 200;
         res.set_content(text, "text/plain; charset=utf-8");
     } else {
         rsjson::Value o = rsjson::Value::object();
         o["text"] = text;
+        if (use_vad) {
+            o["vad"] = true;
+            rsjson::Value arr = rsjson::Value::array();
+            for (const auto &s : segments) {
+                rsjson::Value item = rsjson::Value::object();
+                item["id"] = s.index;
+                item["start"] = s.start_s;
+                item["end"] = s.end_s;
+                item["text"] = s.text;
+                arr.push_back(item);
+            }
+            o["segments"] = arr;
+        }
         send_json(res, 200, o);
     }
 }
@@ -715,12 +1026,18 @@ static void ws_asr_vad(rsws::Conn &c) {
 
     auto finalize_seg = [&]() {
         transcribe_seg("final");
+        note_asr_final_segment_locked("ws-vad-final");
         in_speech = false;
         pending_end = false;
         pending_silence_samples = 0;
         seg_index++;
         seg.clear();
         last_partial_len = 0;
+    };
+
+    auto force_split_seg = [&]() {
+        finalize_seg();
+        in_speech = true;
     };
 
     std::vector<float> pcm;
@@ -772,7 +1089,8 @@ static void ws_asr_vad(rsws::Conn &c) {
             }
             if (in_speech && cfg.max_segment_ms > 0 &&
                 seg.size() >= (size_t)((sr * cfg.max_segment_ms) / 1000)) {
-                finalize_seg();
+                if (pending_end) finalize_seg();
+                else force_split_seg();
             }
         } else if (op == rsws::OP_TEXT) {
             rsjson::Value j;
@@ -885,6 +1203,8 @@ static void usage(const char *argv0) {
         "  --vad-max-segment-ms N  Force-finalize long speech (default 0=off)\n"
         "  --two-pass        FunASR-Nano: CTC first pass + LLM final re-decode\n"
         "  --ctc-precheck    FunASR-Nano: skip LLM on CTC-empty silence/noise\n"
+        "  --mem-log         Log ASR scheduler compute-buffer high-water marks\n"
+        "  --asr-reload-every N  Reload ASR after N final segments to release GPU buffers (0=off)\n"
         "  --host HOST        HTTP bind host (default 127.0.0.1)\n"
         "  --port PORT        HTTP port (default 8080)\n"
         "  --ws-port PORT     WebSocket port (default HTTP port + 1)\n"
@@ -941,6 +1261,10 @@ int main(int argc_raw, char **argv_raw) {
         }
         else if (a == "--two-pass") g_asr_cfg.two_pass = true;
         else if (a == "--ctc-precheck") g_asr_cfg.ctc_precheck = true;
+        else if (a == "--mem-log") g_mem_log = true;
+        else if (a == "--asr-reload-every") {
+            g_asr_reload_every = std::max(0, atoi(next("--asr-reload-every")));
+        }
         else if (a == "--host") host = next("--host");
         else if (a == "--port") port = atoi(next("--port"));
         else if (a == "--ws-port") ws_port = atoi(next("--ws-port"));
@@ -952,6 +1276,9 @@ int main(int argc_raw, char **argv_raw) {
         else { fprintf(stderr, "unknown arg: %s\n", a.c_str()); usage(argv[0]); return 1; }
     }
     if (ws_port < 0) ws_port = port + 1;
+    g_asr_model_path = asr_model;
+    g_model_threads = threads;
+    g_model_gpu = gpu;
     if (asr_model.empty() && tts_model.empty()) {
         fprintf(stderr, "[server] warning: no model given; inference will return "
                         "errors. Pass --asr-model / --tts-model.\n");
@@ -980,6 +1307,14 @@ int main(int argc_raw, char **argv_raw) {
         fprintf(stderr, "[server] ASR decode: two-pass=%s ctc-precheck=%s\n",
                 g_asr_cfg.two_pass ? "on" : "off",
                 g_asr_cfg.ctc_precheck ? "on" : "off");
+        if (g_mem_log) {
+            std::lock_guard<std::mutex> lk(g_asr.mu);
+            log_asr_memory_locked("after-load");
+        }
+        if (g_asr_reload_every > 0) {
+            fprintf(stderr, "[server] ASR auto-reload enabled: every %d final segment(s)\n",
+                    g_asr_reload_every);
+        }
     }
     if (!tts_model.empty()) {
         fprintf(stderr, "[server] loading TTS: %s\n", tts_model.c_str());

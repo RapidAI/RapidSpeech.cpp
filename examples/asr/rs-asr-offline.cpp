@@ -65,10 +65,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <random>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -153,6 +155,8 @@ struct OfflineArgs {
   float spk_threshold = 0.5f;           // ahc only
   int num_speakers = 0;                 // 0 = auto
   int max_speakers = 10;                // spectral auto estimation cap
+  const char *hotwords = nullptr;       // comma-separated inline hotwords
+  const char *hotword_file = nullptr;   // one hotword per line (# = comment)
 };
 
 static bool parse_bool(const std::string &v) {
@@ -194,6 +198,9 @@ static void print_usage(const char *prog) {
          "(default: 0.3)\n"
       << "      --max-segment-s <s>  Max segment length for ASR input "
          "(default: 30.0)\n"
+      << "      --hotwords <list>    Comma-separated hotwords for RAG biasing "
+         "(FunASRNano)\n"
+      << "      --hotword-file <p>   Hotwords file, one per line (# = comment)\n"
       << "  -h, --help               Show this help\n"
       << std::endl;
 }
@@ -237,6 +244,10 @@ static bool parse_args(int argc, char **argv, OfflineArgs &args) {
       args.prob_smooth = std::stof(argv[++i]);
     } else if (a == "--max-segment-s" && i + 1 < argc) {
       args.max_segment_s = std::stof(argv[++i]);
+    } else if (a == "--hotwords" && i + 1 < argc) {
+      args.hotwords = argv[++i];
+    } else if (a == "--hotword-file" && i + 1 < argc) {
+      args.hotword_file = argv[++i];
     } else if (a == "-h" || a == "--help") {
       print_usage(argv[0]);
       return false;
@@ -254,6 +265,53 @@ static bool parse_args(int argc, char **argv, OfflineArgs &args) {
     return false;
   }
   return true;
+}
+
+// ─────────────────────────────────────────────────────
+// Collect hotwords from --hotwords (comma-separated) and --hotword-file
+// (one per line, # starts a comment). Trimmed and de-duplicated.
+// ─────────────────────────────────────────────────────
+static std::string trim_ws(const std::string &s) {
+  size_t b = s.find_first_not_of(" \t\r\n");
+  if (b == std::string::npos)
+    return "";
+  size_t e = s.find_last_not_of(" \t\r\n");
+  return s.substr(b, e - b + 1);
+}
+
+static std::vector<std::string> collect_hotwords(const OfflineArgs &args) {
+  std::vector<std::string> out;
+  auto add = [&](const std::string &raw) {
+    std::string w = trim_ws(raw);
+    if (w.empty())
+      return;
+    if (std::find(out.begin(), out.end(), w) == out.end())
+      out.push_back(w);
+  };
+
+  if (args.hotwords) {
+    std::stringstream ss(args.hotwords);
+    std::string item;
+    while (std::getline(ss, item, ','))
+      add(item);
+  }
+
+  if (args.hotword_file) {
+    std::ifstream f(args.hotword_file);
+    if (!f) {
+      std::cerr << "Warning: cannot open hotword file: " << args.hotword_file
+                << "\n";
+    } else {
+      std::string line;
+      while (std::getline(f, line)) {
+        size_t hash = line.find('#');
+        if (hash != std::string::npos)
+          line = line.substr(0, hash);
+        add(line);
+      }
+    }
+  }
+  return out;
 }
 
 // ─────────────────────────────────────────────────────
@@ -943,6 +1001,23 @@ int main(int argc, char **argv) {
   LOG_INFO("Architecture: %s  SampleRate: %d  Vocab: %d", meta.arch_name,
            meta.audio_sample_rate, meta.vocab_size);
   LOG_INFO("Backend: %s", rs_get_backend_name(asr_ctx));
+
+  // ── Hotwords (RAG biasing, FunASRNano) ─────────────────
+  {
+    std::vector<std::string> hotwords = collect_hotwords(args);
+    if (!hotwords.empty()) {
+      std::vector<const char *> ptrs;
+      ptrs.reserve(hotwords.size());
+      for (const auto &h : hotwords)
+        ptrs.push_back(h.c_str());
+      if (rs_set_hotwords(asr_ctx, ptrs.data(), (int32_t)ptrs.size()) == RS_OK) {
+        LOG_INFO("Hotwords: loaded %zu entries", hotwords.size());
+      } else {
+        rs_error_info_t err = rs_get_last_error();
+        LOG_ERROR("Failed to set hotwords: %s", err.message);
+      }
+    }
+  }
 
   // ── 2. Load audio ──────────────────────────────────────
   LOG_INFO("Loading WAV: %s", args.wav_path);

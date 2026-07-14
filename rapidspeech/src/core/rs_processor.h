@@ -61,6 +61,11 @@ public:
   void SetUserInputPrompt(const std::string &prompt);
 
   /**
+   * Sets hotwords for RAG contextual biasing (FunASRNano only).
+   */
+  void SetHotwords(const std::vector<std::string> &hotwords);
+
+  /**
    * Executes one iteration of the processing pipeline.
    * @return 0: No new results, 1: New text/audio output available, -1: Error
    */

@@ -69,6 +69,13 @@ public:
   // Set the user input prompt for the LLM decoder (FunASRNano only).
   virtual void SetUserInputPrompt(const std::string &prompt) { (void)prompt; }
 
+  // Set hotwords for RAG contextual biasing (FunASRNano only). The model
+  // retrieves the entries matching the CTC hypothesis and injects them into the
+  // LLM prompt. An empty list disables biasing.
+  virtual void SetHotwords(const std::vector<std::string> &hotwords) {
+    (void)hotwords;
+  }
+
   // --- TTS interface (default no-ops; overridden by TTS models) ---
 
   virtual bool PushText(RSState &state, const char *text,

@@ -52,6 +52,12 @@ void RSProcessor::SetUserInputPrompt(const std::string &prompt) {
   }
 }
 
+void RSProcessor::SetHotwords(const std::vector<std::string> &hotwords) {
+  if (model_) {
+    model_->SetHotwords(hotwords);
+  }
+}
+
 int RSProcessor::Process() {
   if (!model_ || !state_ || !sched_) {
     RS_LOG_ERR("Processor error: Missing model, state, or scheduler.");
