@@ -213,6 +213,18 @@ Build artifacts are located in the `build/` directory:
   --silence-ms 600
 ```
 
+**Hotword biasing (FunASR-Nano)**
+
+```bash
+# Bias proper nouns / fix homophones (e.g. 郭总 → 虢总); use --hotword-file for a large list
+./build/rs-asr-offline \
+  -m /path/to/funasr-nano-fp16.gguf \
+  -w /path/to/audio.wav \
+  --hotwords "虢总,阿里巴巴"
+```
+
+> See [docs/funasr-nano.md](docs/funasr-nano.md#6-热词rag-上下文偏置) for details.
+
 **Streaming ASR (X-ASR)**
 
 ```bash

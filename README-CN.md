@@ -206,6 +206,18 @@ cmake --build build -j
   --silence-ms 600
 ```
 
+**热词偏置（FunASR-Nano）**
+
+```bash
+# 纠正专有名词/谐音（如「郭总」→「虢总」）；也可用 --hotword-file 传大词库
+./build/rs-asr-offline \
+  -m /path/to/funasr-nano-fp16.gguf \
+  -w /path/to/audio.wav \
+  --hotwords "虢总,阿里巴巴"
+```
+
+> 详见 [docs/funasr-nano.md](docs/funasr-nano.md#6-热词rag-上下文偏置)。
+
 **流式 ASR（X-ASR）**
 
 ```bash

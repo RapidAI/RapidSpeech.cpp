@@ -8,12 +8,17 @@
 #include "sensevoice_encoder.h"
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 struct SenseVoiceLayerEncoder;
 struct SenseVoiceEncoder;
+
+namespace rs {
+class HotwordRetriever;
+}
 
 /**
  * FunASRNano hyperparameters structure
@@ -106,6 +111,10 @@ public:
 
   void SetUserInputPrompt(const std::string &prompt) override;
 
+  // Hotword RAG (方案 B): retrieve hotwords matching the CTC hypothesis and
+  // inject the matched subset into the LLM prompt. Empty list disables it.
+  void SetHotwords(const std::vector<std::string> &hotwords) override;
+
   // Imatrix activation collection: per-MUL_MAT node observer, fires during
   // compute via ggml_backend_sched_set_eval_callback.  Forwarded to the
   // SenseVoice encoder too so encoder-side mul_mat nodes are captured.
@@ -116,6 +125,17 @@ private:
   bool ctc_precheck_ = false;   // CTC pre-check before LLM (disabled by default)
   std::string user_input_prompt_;
   std::string cached_user_input_prompt_;
+  // Prompt actually fed to the LLM this utterance: equals user_input_prompt_
+  // when no hotwords are retrieved, otherwise the hotword-injected prompt.
+  std::string active_prompt_;
+  std::vector<std::string> hotwords_;
+  std::unique_ptr<rs::HotwordRetriever> hotword_retriever_;
+  float hotword_tau_ = 0.34f; // max normalized pinyin edit distance
+  int hotword_topk_ = 20;     // cap on injected hotwords
+  // Deterministic post-substitution: force exact hotword spelling on the final
+  // transcript when its pinyin matches (overrides LLM homophone choices). On by
+  // default when hotwords are set; disable with RS_HOTWORD_FORCE=0.
+  bool hotword_force_ = true;
   std::vector<int32_t> cached_prefix_tokens_;
   std::vector<int32_t> cached_suffix_tokens_;
   RSModelMeta meta_;
@@ -154,4 +174,7 @@ private:
                ggml_backend_t backend);
   bool DecodeWithLLM(RSState &state, ggml_backend_sched_t sched);
   bool DecodeWithoutLLM(RSState &state, ggml_backend_sched_t sched);
+
+  // Compose the hotword-injected user prompt (逐字对齐 Fun-ASR get_prompt).
+  std::string BuildHotwordPrompt(const std::vector<std::string> &hotwords) const;
 };

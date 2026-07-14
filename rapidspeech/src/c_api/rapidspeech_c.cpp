@@ -14,6 +14,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 // ============================================
 // Internal Thread-Local Error Storage
@@ -583,6 +584,33 @@ RS_API rs_error_t rs_set_user_input_prompt(rs_context_t *ctx,
     return RS_ERR_INFERENCE_FAILED;
   } catch (...) {
     set_error(RS_ERR_INFERENCE_FAILED, "SetUserInputPrompt unknown error");
+    return RS_ERR_INFERENCE_FAILED;
+  }
+}
+
+RS_API rs_error_t rs_set_hotwords(rs_context_t *ctx, const char *const *words,
+                                  int32_t count) {
+  if (!ctx || !ctx->processor) {
+    set_error(RS_ERR_INVALID_ARGS, "Context or processor is NULL");
+    return RS_ERR_INVALID_ARGS;
+  }
+
+  try {
+    std::vector<std::string> hotwords;
+    if (words && count > 0) {
+      hotwords.reserve(count);
+      for (int32_t i = 0; i < count; ++i) {
+        if (words[i])
+          hotwords.emplace_back(words[i]);
+      }
+    }
+    ctx->processor->SetHotwords(hotwords);
+    return RS_OK;
+  } catch (const std::exception &e) {
+    set_error(RS_ERR_INFERENCE_FAILED, "SetHotwords failed: %s", e.what());
+    return RS_ERR_INFERENCE_FAILED;
+  } catch (...) {
+    set_error(RS_ERR_INFERENCE_FAILED, "SetHotwords unknown error");
     return RS_ERR_INFERENCE_FAILED;
   }
 }

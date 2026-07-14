@@ -160,6 +160,7 @@ set(RS_SOURCES
         rapidspeech/src/arch/sensevoice_encoder.cpp
         rapidspeech/src/arch/context_graph.cpp
         rapidspeech/src/arch/keyword_loader.cpp
+        rapidspeech/src/arch/hotword_retriever.cpp
         rapidspeech/src/arch/kws_decoder.cpp
         rapidspeech/src/arch/funasr-nano.cpp
         rapidspeech/src/arch/silero_vad.cpp

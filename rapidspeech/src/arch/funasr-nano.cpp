@@ -4,6 +4,7 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "gguf.h"
+#include "hotword_retriever.h"
 #include "sensevoice.h"
 #include "utils/debug_utils.h"
 #include "utils/rs_log.h"
@@ -93,7 +94,8 @@ static std::string decode_ctc_token_bytes(const std::string &token) {
 // --- FunASRNanoModel Implementation ---
 
 FunASRNanoModel::FunASRNanoModel()
-    : ctx_weights_(nullptr), user_input_prompt_("语音转写：") {
+    : ctx_weights_(nullptr), user_input_prompt_("语音转写："),
+      active_prompt_("语音转写：") {
   encoder_ = std::make_unique<SenseVoiceEncoderModel>();
   ctc_decoder_ = std::make_unique<FunASRNanoTransformerDecoder>();
   audio_adaptor_ = std::make_unique<FunASRNanoTransformerDecoder>();
@@ -558,14 +560,17 @@ bool FunASRNanoModel::DecodeWithLLM(RSState &state,
   const int llm_dim = llm_model_->hparams().n_embd;    // Qwen3 hidden dim
 
   if (cached_prefix_tokens_.empty() ||
-      cached_user_input_prompt_ != user_input_prompt_) {
+      cached_user_input_prompt_ != active_prompt_) {
     std::string user_input = "<|im_start|>system\nYou are a helpful "
                              "assistant.<|im_end|>\n<|im_start|>user\n" +
-                             user_input_prompt_;
+                             active_prompt_;
     std::string suffix_input = "<|im_end|>\n<|im_start|>assistant\n";
     cached_prefix_tokens_ = llm_model_->vocab().tokenize(user_input, false);
     cached_suffix_tokens_ = llm_model_->vocab().tokenize(suffix_input, false);
-    cached_user_input_prompt_ = user_input_prompt_;
+    cached_user_input_prompt_ = active_prompt_;
+    if (std::getenv("RS_HOTWORD_DEBUG"))
+      RS_LOG_INFO("[hotword] LLM user prompt = |%s| (%zu prefix tokens)",
+                  active_prompt_.c_str(), cached_prefix_tokens_.size());
   }
   const std::vector<int32_t> &prefix_tokens = cached_prefix_tokens_;
   const std::vector<int32_t> &suffix_tokens = cached_suffix_tokens_;
@@ -1178,9 +1183,57 @@ void FunASRNanoModel::SetCTCPrecheck(bool enable) {
 
 void FunASRNanoModel::SetUserInputPrompt(const std::string &prompt) {
   user_input_prompt_ = prompt;
+  active_prompt_ = prompt;
   cached_user_input_prompt_.clear();
   cached_prefix_tokens_.clear();
   cached_suffix_tokens_.clear();
+}
+
+void FunASRNanoModel::SetHotwords(const std::vector<std::string> &hotwords) {
+  hotwords_ = hotwords;
+  if (hotwords_.empty()) {
+    hotword_retriever_.reset();
+    return;
+  }
+  // Optional runtime tuning without a rebuild.
+  if (const char *e = std::getenv("RS_HOTWORD_TAU"))
+    hotword_tau_ = std::atof(e);
+  if (const char *e = std::getenv("RS_HOTWORD_TOPK"))
+    hotword_topk_ = std::atoi(e);
+  if (const char *e = std::getenv("RS_HOTWORD_FORCE"))
+    hotword_force_ = std::atoi(e) != 0;
+  if (!hotword_retriever_) {
+    hotword_retriever_ = std::make_unique<rs::HotwordRetriever>();
+    hotword_retriever_->Load(); // warns + degrades if pinyin data missing
+  }
+  hotword_retriever_->SetHotwords(hotwords_);
+  RS_LOG_INFO("Hotword config: tau=%.3f topk=%d", hotword_tau_, hotword_topk_);
+}
+
+std::string FunASRNanoModel::BuildHotwordPrompt(
+    const std::vector<std::string> &hotwords) const {
+  std::string joined;
+  for (size_t i = 0; i < hotwords.size(); ++i) {
+    if (i)
+      joined += ", ";
+    joined += hotwords[i];
+  }
+  // Default matches Fun-ASR model.py get_prompt() byte-for-byte. Set
+  // RS_HOTWORD_PROMPT_STYLE=strong to use a more forceful instruction that
+  // tells the model to emit the exact hotword form (incl. rare characters).
+  const char *style = std::getenv("RS_HOTWORD_PROMPT_STYLE");
+  std::string p;
+  if (style && std::string(style) == "strong") {
+    p = "请把下面这段语音转写为文本。如果语音中出现了与热词列表读音相同或相近的词，"
+        "必须严格按照热词列表中的写法输出（即使是生僻字也要照写，不要替换成其他同音字）。"
+        "\n\n热词列表：[" + joined + "]\n" + user_input_prompt_;
+  } else {
+    p = "请结合上下文信息，更加准确地完成语音转写任务。如果没有相关信息，"
+        "我们会留空。\n\n\n**上下文信息：**\n\n\n";
+    p += "热词列表：[" + joined + "]\n";
+    p += user_input_prompt_;
+  }
+  return p;
 }
 
 /**
@@ -1196,13 +1249,42 @@ bool FunASRNanoModel::Decode(RSState &state, ggml_backend_sched_t sched) {
   if (!sv_state.encoder_out)
     return false;
 
-  // ── CTC pre-check (optional): detect silence before running LLM ──
-  // LLMs are generative and will produce plausible text from any input,
-  // including silence features.  A cheap CTC pass tells us whether the
-  // audio contains actual speech before we commit to the LLM.
-  // Enabled via rs_set_ctc_precheck() / --ctc-precheck.
+  // ── CTC pass: silence pre-check and/or hotword retrieval ──
+  //   * hotword RAG   — needs a real CTC hypothesis, so it runs the FULL CTC
+  //                     decoder (DecodeWithoutLLM) and retrieves from it.
+  //   * ctc_precheck_ — only needs "is there any non-blank token", so when no
+  //                     hotwords are active it uses a cheap ctc_lo-only pass.
   bool has_speech = true;
-  if (ctc_precheck_ && runtime_use_llm_ && llm_model_) {
+  std::vector<std::string> retrieved;
+
+  const bool want_hotwords = hotword_retriever_ &&
+                             !hotword_retriever_->Empty() &&
+                             runtime_use_llm_ && llm_model_;
+
+  if (want_hotwords) {
+    // Full CTC decode → collapsed hypothesis ids in sv_state.ids.
+    if (DecodeWithoutLLM(state, sched)) {
+      std::string ctc_text;
+      for (int32_t id : sv_state.ids) {
+        auto it = vocab_.id_to_token.find(id);
+        if (it != vocab_.id_to_token.end())
+          ctc_text += decode_ctc_token_bytes(it->second);
+      }
+      if (ctc_precheck_)
+        has_speech = !sv_state.ids.empty();
+      if (has_speech) {
+        retrieved =
+            hotword_retriever_->Retrieve(ctc_text, hotword_tau_, hotword_topk_);
+        RS_LOG_INFO("Hotword: CTC='%s' retrieved %zu/%zu hotwords",
+                    ctc_text.c_str(), retrieved.size(),
+                    hotword_retriever_->Size());
+      }
+    }
+    // Clear the CTC tokens so they don't leak into the final transcription and
+    // reset the scheduler for a fresh LLM graph.
+    sv_state.tokens.clear();
+    ggml_backend_sched_reset(sched);
+  } else if (ctc_precheck_ && runtime_use_llm_ && llm_model_) {
     has_speech = false;
 
     struct ggml_init_params ctc_params = {2 * 1024 * ggml_tensor_overhead(),
@@ -1254,6 +1336,11 @@ bool FunASRNanoModel::Decode(RSState &state, ggml_backend_sched_t sched) {
     return true;
   }
 
+  // Compose the prompt for this utterance: hotword-injected when we retrieved
+  // anything, otherwise the plain user prompt (zero regression when unused).
+  active_prompt_ =
+      retrieved.empty() ? user_input_prompt_ : BuildHotwordPrompt(retrieved);
+
   // Choose decode path based on LLM availability AND runtime toggle
   bool success = false;
   if (runtime_use_llm_ && llm_model_) {
@@ -1291,6 +1378,17 @@ std::string FunASRNanoModel::GetTranscription(RSState &state) {
     result += s;
   }
   sv_state.tokens.clear();
+
+  // Deterministic hotword forcing: rewrite homophone spans to the exact hotword
+  // spelling the LLM refused to emit (e.g. 郭总 → 虢总).
+  if (hotword_force_ && hotword_retriever_ && !hotword_retriever_->Empty()) {
+    std::string forced = hotword_retriever_->ApplySubstitutions(result);
+    if (forced != result) {
+      RS_LOG_INFO("Hotword force: '%s' -> '%s'", result.c_str(),
+                  forced.c_str());
+      result = std::move(forced);
+    }
+  }
   return result;
 }
 

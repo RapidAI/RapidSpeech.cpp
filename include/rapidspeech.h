@@ -257,6 +257,15 @@ RS_API rs_error_t rs_set_tts_diffusion_steps(rs_context_t* ctx, int32_t n_steps)
 // Returns: RS_OK on success
 RS_API rs_error_t rs_set_user_input_prompt(rs_context_t* ctx, const char* prompt);
 
+// Set hotwords for RAG contextual biasing (FunASRNano only, other models no-op).
+// The model runs a CTC pass, retrieves the hotwords whose pinyin approximately
+// matches the CTC hypothesis, and injects that subset into the LLM prompt.
+// `words` is an array of `count` UTF-8 strings; pass count=0 (or words=NULL) to
+// clear all hotwords. Requires the LLM decoder to be enabled.
+// Returns: RS_OK on success
+RS_API rs_error_t rs_set_hotwords(rs_context_t* ctx, const char* const* words,
+                                  int32_t count);
+
 // Enable/disable LLM decoder at runtime (FunASRNano only, other models no-op).
 // When disabled, Decode() uses CTC-greedy (fast, lower accuracy).
 // When enabled,  Decode() uses the LLM (slower, higher accuracy).

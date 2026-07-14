@@ -128,14 +128,21 @@ bool FireRedVadModel::MapTensors(ggml_context* gguf_data) {
         return false;
     }
 
-    // Copy CMVN stats to host. On the CUDA build these tensors live in a device
-    // buffer, so reading ->data directly segfaults; use ggml_backend_tensor_get.
-    cmvn_means_host_.resize(ggml_nelements(weights_.cmvn_means));
-    cmvn_inv_std_host_.resize(ggml_nelements(weights_.cmvn_inv_std));
-    ggml_backend_tensor_get(weights_.cmvn_means, cmvn_means_host_.data(), 0,
-                            ggml_nbytes(weights_.cmvn_means));
-    ggml_backend_tensor_get(weights_.cmvn_inv_std, cmvn_inv_std_host_.data(), 0,
-                            ggml_nbytes(weights_.cmvn_inv_std));
+    // Copy CMVN stats to host. Depending on how the GGUF was loaded these
+    // tensors either live in a backend buffer (device or CPU backend buffer →
+    // read via ggml_backend_tensor_get) or are plain context-allocated tensors
+    // with no ->buffer (no_alloc=false → ->data is valid, but tensor_get would
+    // assert on the NULL buffer). Handle both.
+    auto copy_to_host = [](ggml_tensor *t, std::vector<float> &dst) {
+        dst.resize(ggml_nelements(t));
+        if (t->buffer) {
+            ggml_backend_tensor_get(t, dst.data(), 0, ggml_nbytes(t));
+        } else {
+            memcpy(dst.data(), t->data, ggml_nbytes(t));
+        }
+    };
+    copy_to_host(weights_.cmvn_means, cmvn_means_host_);
+    copy_to_host(weights_.cmvn_inv_std, cmvn_inv_std_host_);
     return true;
 }
 

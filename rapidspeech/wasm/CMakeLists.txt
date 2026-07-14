@@ -76,6 +76,9 @@ set(RS_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/sensevoice_encoder.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/context_graph.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/keyword_loader.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/hotword_retriever.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/frontend/kokoro_pinyin.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/utils/rs_data_paths.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/kws_decoder.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/funasr-nano.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/silero_vad.cpp

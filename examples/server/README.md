@@ -50,6 +50,9 @@ Options: `--asr-model`, `--tts-model`, `--vad-model` (for `/asr/vad`),
 `--vad-min-segment-ms` (default 500), `--vad-max-segment-ms` (default `0`=off),
 `--two-pass` (FunASR-Nano CTC first pass + LLM final re-decode),
 `--ctc-precheck` (skip LLM on CTC-empty silence/noise),
+`--mem-log` (log ASR scheduler compute-buffer high-water marks),
+`--asr-reload-every N` (reload ASR after N final segments to release backend
+buffers; default `0`=off),
 `--host` (default 127.0.0.1), `--port` (8080), `--ws-port` (default port+1),
 `--web-dir` (serve a static UI dir at `/`), `--mcp-stdio`, `-t/--threads` (4),
 `--cpu`, `-h`.
@@ -83,6 +86,25 @@ curl http://127.0.0.1:8080/v1/audio/transcriptions \
 # → {"text":"..."}
 # add  -F response_format=text  for plain text
 ```
+
+For long WAV files, load a VAD model and ask the HTTP endpoint to split speech
+before ASR:
+
+```bash
+curl "http://127.0.0.1:8080/v1/audio/transcriptions" \
+    -F file=@long.wav \
+    -F model=rapidspeech-asr \
+    -F vad=true \
+    -F vad_end_silence_ms=900 \
+    -F vad_min_segment_ms=300 \
+    -F vad_max_segment_ms=15000
+# → {"text":"...","vad":true,"segments":[{"id":0,"start":...,"end":...,"text":"..."}]}
+```
+
+HTTP VAD mode uses the same server-wide VAD defaults as `/asr/vad`, and accepts
+the same override fields: `vad_threshold`, `vad_end_silence_ms`,
+`vad_min_segment_ms`, `vad_max_segment_ms`, `two_pass`, and `ctc_precheck`.
+The fields can be sent either as multipart form fields or URL query parameters.
 
 With the official OpenAI Python client:
 
@@ -242,7 +264,14 @@ Streaming TTS: send one text frame, then read a binary audio frame per chunk
   reply with an error on that endpoint (use `/asr/vad` or the HTTP API instead).
 - `/tts/stream` streams per-chunk only on CosyVoice3; other TTS models emit a
   single chunk at the end (use `/tts/segmented` for sentence-level streaming).
+- **GPU memory**: ggml/CUDA keeps model weights and scheduler compute buffers
+  resident for reuse, so `nvidia-smi` will not drop after each segment. For
+  long VAD runs, set `vad_max_segment_ms` to bound the largest offline ASR graph.
+  Use `--mem-log` to check whether internal compute buffers plateau. If you need
+  the process to return CUDA buffers during a soak test, use
+  `--asr-reload-every N`; this trades a reload pause for lower high-water memory.
 - This is an **example** server (plain HTTP, no auth/TLS/rate-limiting). Put it
   behind a reverse proxy for anything exposed.
-- ASR uses the offline whole-clip path. For long audio, pre-segment with a VAD
-  or use `rs-asr-online` for true streaming.
+- HTTP ASR uses the offline whole-clip path by default. For long audio, pass
+  `vad=true` with `--vad-model` to segment before ASR, or use `/asr/stream` with
+  an X-ASR model for true streaming.
