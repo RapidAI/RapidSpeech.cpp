@@ -275,6 +275,7 @@ setuptools.setup(
         "relative_to": __file__,
     },
     setup_requires=["setuptools_scm"],
+    install_requires=["numpy"],
     author="lovemefan",
     author_email="lovemefan@outlook.com",
     packages=["rapidspeech"],

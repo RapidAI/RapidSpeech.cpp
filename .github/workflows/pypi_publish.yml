@@ -75,9 +75,12 @@ jobs:
           # macos-latest is arm64-only; build arm64 wheels (Metal backend).
           CIBW_ARCHS_MACOS: arm64
 
-          # Install build dependencies (patchelf on Linux fixes ggml NEEDED entries)
+          # Install build dependencies (patchelf on Linux fixes ggml NEEDED entries).
+          # numpy is intentionally NOT installed: pybind11/numpy.h needs numpy only at
+          # runtime, and recent numpy releases ship no manylinux2014 wheels, forcing a
+          # source build that fails on the image's GCC 10.2.1 (numpy requires >= 10.3).
           CIBW_BEFORE_BUILD: >
-            pip install pybind11 numpy cmake &&
+            pip install pybind11 cmake &&
             (command -v yum >/dev/null 2>&1 && yum install -y patchelf zip unzip || true)
 
           # Skip legacy Python versions, PyPy, and musllinux (not needed for end users).
