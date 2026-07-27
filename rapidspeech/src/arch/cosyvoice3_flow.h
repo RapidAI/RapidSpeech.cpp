@@ -70,6 +70,11 @@ public:
    */
   bool RunFlow(CosyVoice3State &state, ggml_backend_sched_t sched);
 
+  // Batched Flow: N states' speech tokens -> mel in one pipeline (encode
+  // per-slot, 5 Euler steps batched at CFG=2N, per-slot host trim).
+  bool RunFlow_Batch(CosyVoice3State **states, int n,
+                     ggml_backend_sched_t sched);
+
   /**
    * Streaming variant used by `CosyVoice3LMModel::DecodeStream`. Differs from
    * the offline `RunFlow` in two ways:
@@ -229,8 +234,18 @@ private:
                                  float dt_value,
                                  ggml_tensor *&position_ids_out) const;
 
-  // One DiT block (mirrors cosyvoice-graph.cpp:399).
+  // One DiT block (mirrors cosyvoice-graph.cpp:399). `attn_mask` is an
+  // optional additive mask inserted before softmax (batched multi-slot Flow).
   ggml_tensor *BuildDiTBlock(ggml_context *ctx, const DiTBlock &b,
                              ggml_tensor *x, ggml_tensor *time_emb,
-                             ggml_tensor *position_ids, int64_t cut_len) const;
+                             ggml_tensor *position_ids, int64_t cut_len,
+                             ggml_tensor *attn_mask = nullptr) const;
+
+  // Batched CFM Euler step for N slots (CFG batch=2N, pre-padded inputs,
+  // cut_len=0 with host-side prompt trim). See RunFlow_Batch.
+  ggml_tensor *BuildCFMStepGraph_Batch(
+      ggml_context *ctx, ggml_tensor *x_init, ggml_tensor *mu,
+      ggml_tensor *spks, ggml_tensor *cond, ggml_tensor *attn_mask,
+      int n_slots, float t_value, float dt_value,
+      ggml_tensor *&position_ids_out) const;
 };

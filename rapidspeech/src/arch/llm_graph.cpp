@@ -178,6 +178,43 @@ void llm_graph_result::set_kv_write_indices(uint32_t index,
   }
 }
 
+void llm_graph_result::set_kv_write_indices_batched(const uint32_t *indices,
+                                                    uint32_t n_seq,
+                                                    uint32_t n_layers) {
+  if (!indices) return;
+  std::vector<int32_t> rows(indices, indices + n_seq);
+  for (uint32_t il = 0; il < n_layers; ++il) {
+    char name[64];
+    snprintf(name, sizeof(name), "kv_write_idx_layer_%u", il);
+    ggml_tensor *idx = get_input_tensor(name);
+    if (!idx || !idx->data) continue;
+    const int64_t n_idx = ggml_nelements(idx);
+    const int64_t n = std::min<int64_t>((int64_t)n_seq, n_idx);
+    ggml_backend_tensor_set(idx, rows.data(), 0, (size_t)n * sizeof(int32_t));
+  }
+}
+
+void llm_graph_result::set_batched_causal_mask(ggml_tensor *mask,
+                                               uint32_t n_kv_max,
+                                               const uint32_t *n_kv_cache_per_seq,
+                                               uint32_t n_seq) {
+  if (!mask || !mask->data || !n_kv_cache_per_seq) return;
+  // mask shape [n_kv_max, 1, 1, n_seq]; row-major, ne[0]=n_kv_max contiguous,
+  // ne[3]=n_seq is the slowest axis. Slice s occupies
+  // [s * n_kv_max, (s+1) * n_kv_max) floats.
+  const size_t slice = (size_t)n_kv_max;
+  std::vector<float> slice_data(slice, 0.0f);
+  for (uint32_t s = 0; s < n_seq; ++s) {
+    const uint32_t cur = n_kv_cache_per_seq[s];
+    for (uint32_t j = 0; j < n_kv_max; ++j) {
+      slice_data[j] = (j > cur) ? -1e4f : 0.0f;
+    }
+    const size_t off = (size_t)s * slice * sizeof(float);
+    ggml_backend_tensor_set(mask, slice_data.data(), off,
+                            slice_data.size() * sizeof(float));
+  }
+}
+
 void llm_graph_result::assign_kv_backend(ggml_backend_sched_t sched,
                                          ggml_backend_t backend,
                                          uint32_t n_layers) {
@@ -362,6 +399,19 @@ ggml_tensor *llm_graph_builder::build_causal_mask(ggml_context *ctx,
   return mask;
 }
 
+ggml_tensor *llm_graph_builder::build_causal_mask_batched(ggml_context *ctx,
+                                                          uint32_t n_kv_max,
+                                                          uint32_t n_seq) {
+  // 4D input [n_kv_max, 1, 1, n_seq]. ne3=n_seq isolates sequences in
+  // ggml_flash_attn_ext; ne1=1 (n_batch, one query per seq); ne2=1 broadcasts
+  // over n_head_kv. Runtime fill via set_batched_causal_mask.
+  ggml_tensor *mask =
+      ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_kv_max, 1, 1, n_seq);
+  ggml_set_input(mask);
+  ggml_set_name(mask, "causal_mask");
+  return mask;
+}
+
 ggml_tensor *llm_graph_builder::build_attn_bias(ggml_context *ctx,
                                                 uint32_t n_tokens,
                                                 float scale) {
@@ -418,16 +468,60 @@ llm_graph_builder::build_kv_cache_lookup(ggml_context *ctx, ggml_tensor *k_cur,
           ggml_reshape_2d(ctx, ggml_cont(ctx, v_cur), kv_dim, n_cur);
 
       if (!current_opts_.is_decode_step) {
+        const size_t slot_off =
+            (size_t)current_opts_.kv_slot_row_offset * (size_t)kv_dim *
+            sizeof(float);
         ggml_tensor *k_after =
-            ggml_set_2d_inplace(ctx, k_gpu, k_cur_2d, k_gpu->nb[1], 0);
+            ggml_set_2d_inplace(ctx, k_gpu, k_cur_2d, k_gpu->nb[1], slot_off);
         ggml_tensor *v_after =
-            ggml_set_2d_inplace(ctx, v_gpu, v_cur_2d, v_gpu->nb[1], 0);
+            ggml_set_2d_inplace(ctx, v_gpu, v_cur_2d, v_gpu->nb[1], slot_off);
         ggml_tensor *k_view =
-            ggml_view_2d(ctx, k_after, kv_dim, n_cur, k_after->nb[1], 0);
+            ggml_view_2d(ctx, k_after, kv_dim, n_cur, k_after->nb[1], slot_off);
         ggml_tensor *v_view =
-            ggml_view_2d(ctx, v_after, kv_dim, n_cur, v_after->nb[1], 0);
+            ggml_view_2d(ctx, v_after, kv_dim, n_cur, v_after->nb[1], slot_off);
         return {ggml_reshape_3d(ctx, k_view, head_dim, n_head_kv, n_cur),
                 ggml_reshape_3d(ctx, v_view, head_dim, n_head_kv, n_cur)};
+      }
+
+      // ── Batched decode (n_seq sequences, one token each) ─────────────────
+      // k_gpu is the shared [kv_dim, n_kv_max*n_seq] buffer; slot s owns rows
+      // [s*n_kv_max, (s+1)*n_kv_max). ONE set_rows writes every slot's new
+      // column at absolute row s*n_kv_max + n_cached[s] (write_idx supplied at
+      // runtime). The 2D buffer's memory is identical to the 4D flash-attn
+      // layout [head_dim, n_head_kv, n_kv_max, n_seq], so attention views it
+      // zero-copy. No chained writes, no shared-buffer aliasing.
+      if (current_opts_.n_seq > 1) {
+        const uint32_t n_seq = current_opts_.n_seq;
+        ggml_tensor *k_cur_2d_batch =
+            ggml_reshape_2d(ctx, ggml_cont(ctx, k_cur), kv_dim, n_seq);
+        ggml_tensor *v_cur_2d_batch =
+            ggml_reshape_2d(ctx, ggml_cont(ctx, v_cur), kv_dim, n_seq);
+
+        ggml_tensor *write_idx =
+            ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seq);
+        ggml_set_input(write_idx);
+        char idx_name[64];
+        snprintf(idx_name, sizeof(idx_name), "kv_write_idx_layer_%d", il);
+        ggml_set_name(write_idx, idx_name);
+
+        ggml_tensor *k_after =
+            ggml_set_rows(ctx, k_gpu, k_cur_2d_batch, write_idx);
+        ggml_tensor *v_after =
+            ggml_set_rows(ctx, v_gpu, v_cur_2d_batch, write_idx);
+
+        // View the first n_seq slices of the shared [kv_dim, n_kv_max*n_slots]
+        // buffer (the scheduler keeps DECODING slots contiguous at physical
+        // 0..n_seq-1). Memory == 4D flash-attn layout
+        // [head_dim, n_head_kv, n_kv_max, n_seq] -> zero-copy reshape.
+        const int64_t n_cols = (int64_t)current_opts_.n_kv_max * n_seq;
+        ggml_tensor *k_view =
+            ggml_view_2d(ctx, k_after, kv_dim, n_cols, k_after->nb[1], 0);
+        ggml_tensor *v_view =
+            ggml_view_2d(ctx, v_after, kv_dim, n_cols, v_after->nb[1], 0);
+        return {ggml_reshape_4d(ctx, k_view, head_dim, n_head_kv,
+                                current_opts_.n_kv_max, n_seq),
+                ggml_reshape_4d(ctx, v_view, head_dim, n_head_kv,
+                                current_opts_.n_kv_max, n_seq)};
       }
 
       if (current_opts_.fixed_kv_cache_shape) {
@@ -441,11 +535,17 @@ llm_graph_builder::build_kv_cache_lookup(ggml_context *ctx, ggml_tensor *k_cur,
         ggml_tensor *k_after = ggml_set_rows(ctx, k_gpu, k_cur_2d, write_idx);
         ggml_tensor *v_after = ggml_set_rows(ctx, v_gpu, v_cur_2d, write_idx);
 
+        // View this slot's slice of the shared [kv_dim, n_kv_max*n_seq] buffer
+        // (slot s = rows [s*n_kv_max, (s+1)*n_kv_max)). kv_slot_row_offset is 0
+        // for the legacy single-buffer path.
         const int64_t n_total = current_opts_.n_kv_max;
+        const size_t slot_off =
+            (size_t)current_opts_.kv_slot_row_offset * (size_t)kv_dim *
+            sizeof(float);
         ggml_tensor *k_view =
-            ggml_view_2d(ctx, k_after, kv_dim, n_total, k_after->nb[1], 0);
+            ggml_view_2d(ctx, k_after, kv_dim, n_total, k_after->nb[1], slot_off);
         ggml_tensor *v_view =
-            ggml_view_2d(ctx, v_after, kv_dim, n_total, v_after->nb[1], 0);
+            ggml_view_2d(ctx, v_after, kv_dim, n_total, v_after->nb[1], slot_off);
         return {ggml_reshape_3d(ctx, k_view, head_dim, n_head_kv, n_total),
                 ggml_reshape_3d(ctx, v_view, head_dim, n_head_kv, n_total)};
       }
@@ -699,27 +799,27 @@ ggml_tensor *llm_graph_builder::build_flash_attn(ggml_context *ctx,
                                                  ggml_tensor *mask,
                                                  float scale) {
   // Flash attention with optional causal mask.
-  // mask should be a 2D [n_kv, n_tokens] input tensor with -INF for masked
-  // positions. max_bias=0.0f means no ALiBi; logit_softcap=0.0f means no
-  // softcap.
   //
-  // ggml_flash_attn_ext expects:
-  //   q: [d_k, n_batch, n_head]
-  //   k: [d_k, n_kv,    n_head_kv]
-  //   v: [d_k, n_kv,    n_head_kv]
-  //   res: [d_k, n_head, n_batch, 1]
-  // Input tensors are in [d_k, n_head, n_seq] layout, so we permute (0,2,1,3).
+  // Single-sequence (3D inputs): q/k/v are [d_k, n_head*, n_tokens/n_kv].
+  //   permute (0,2,1,3) -> [d_k, n_tokens, n_head] etc.; ne3=1.
+  //
+  // Batched (4D inputs, n_seq>1): q=[d_k, 1, n_head, n_seq] already in flash
+  //   layout (n_batch=1, ne3=n_seq) so q needs no permute; k/v are
+  //   [d_k, n_head_kv, n_kv, n_seq] -> permute (0,2,1,3) -> [d_k, n_kv,
+  //   n_head_kv, n_seq]. Each sequence attends only over its own KV slice
+  //   (isolated by ne3) - no N^2 cross-sequence attention.
+  const bool batched = ggml_n_dims(q) >= 4;
 
-  q = ggml_cont(
-      ctx,
-      ggml_permute(ctx, q, 0, 2, 1,
-                   3)); // [d_k, n_head, n_tokens] -> [d_k, n_tokens, n_head]
-  k = ggml_cont(
-      ctx, ggml_permute(ctx, k, 0, 2, 1,
-                        3)); // [d_k, n_head_kv, n_kv] -> [d_k, n_kv, n_head_kv]
-  v = ggml_cont(
-      ctx, ggml_permute(ctx, v, 0, 2, 1,
-                        3)); // [d_k, n_head_kv, n_kv] -> [d_k, n_kv, n_head_kv]
+  if (batched) {
+    q = ggml_cont(ctx, q); // [d_k, 1, n_head, n_seq] (already flash layout)
+    k = ggml_cont(ctx,
+                  ggml_permute(ctx, k, 0, 2, 1, 3)); // -> [d_k, n_kv, n_head_kv, n_seq]
+    v = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+  } else {
+    q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+    k = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
+    v = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+  }
 
   // ggml_flash_attn_ext requires mask to be F16, convert if necessary.
   if (mask && mask->type != GGML_TYPE_F16) {
@@ -729,6 +829,11 @@ ggml_tensor *llm_graph_builder::build_flash_attn(ggml_context *ctx,
   ggml_tensor *result =
       ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f);
 
+  if (batched) {
+    // result [d_k, n_head, 1, n_seq] -> [d_k, n_head, n_seq]
+    return ggml_reshape_3d(ctx, result, result->ne[0], result->ne[1],
+                           result->ne[3]);
+  }
   // Result is [d_k, n_head, n_batch, 1], reshape to [d_k, n_head, n_batch]
   return ggml_reshape_3d(ctx, result, result->ne[0], result->ne[1],
                          result->ne[2]);

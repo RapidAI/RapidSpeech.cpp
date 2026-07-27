@@ -31,6 +31,12 @@
 #include "utils/rs_wav.h"
 #include "../common/rs_cli_utf8.h"
 
+// TTS continuous batching (CosyVoice3 only; other archs fall back to the
+// mutex-serialized path).
+#include "arch/cosyvoice3.h"
+#include "arch/cosyvoice3_batch.h"
+#include "arch/xasr.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -42,6 +48,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -151,6 +158,13 @@ static bool g_model_gpu = true;
 static int g_asr_reload_every = 0; // 0 = disabled
 static int g_asr_final_segments_since_reload = 0;
 static bool g_mem_log = false;
+
+// TTS continuous-batching scheduler (CosyVoice3 only). When non-null, HTTP
+// and WS TTS handlers Submit() to it instead of locking g_tts.mu, so up to
+// --tts-slots requests decode concurrently (token-interleaved).
+static std::unique_ptr<TtsBatchScheduler> g_tts_batch;
+static int g_tts_slots = 2;
+static int g_tts_voc_workers = 1;
 
 struct AsrServerConfig {
     bool two_pass = false;
@@ -271,6 +285,9 @@ static bool transcribe_pcm_locked(const float *pcm, int n, std::string &text,
     return true;
 }
 
+// Caller holds g_vad_mu for the stateful VAD handle. ASR is locked only while
+// a finalized segment is actually transcribed, so VAD scanning does not block
+// unrelated ASR requests.
 static bool transcribe_pcm_vad_locked(const std::vector<float> &pcm,
                                       const AsrServerConfig &asr_cfg,
                                       const VadServerConfig &cfg,
@@ -307,9 +324,13 @@ static bool transcribe_pcm_vad_locked(const std::vector<float> &pcm,
         if ((int)seg.size() < min_samples) return true;
 
         std::string seg_text;
-        if (!transcribe_pcm_locked(seg.data(), (int)seg.size(), seg_text, err,
-                                  asr_cfg.two_pass, asr_cfg.ctc_precheck)) {
-            return false;
+        {
+            std::lock_guard<std::mutex> alk(g_asr.mu);
+            if (!transcribe_pcm_locked(seg.data(), (int)seg.size(), seg_text, err,
+                                      asr_cfg.two_pass, asr_cfg.ctc_precheck)) {
+                return false;
+            }
+            note_asr_final_segment_locked("http-vad-final");
         }
         if (!seg_text.empty()) {
             AsrSegment out;
@@ -325,7 +346,6 @@ static bool transcribe_pcm_vad_locked(const std::vector<float> &pcm,
 
     auto finalize_seg = [&](int64_t end_sample) -> bool {
         if (!transcribe_seg(end_sample)) return false;
-        note_asr_final_segment_locked("http-vad-final");
         in_speech = false;
         pending_end = false;
         pending_silence_samples = 0;
@@ -434,7 +454,6 @@ static bool do_transcribe_vad(const std::string &audio_bytes,
         err = "could not decode audio (expected WAV)";
         return false;
     }
-    std::unique_lock<std::mutex> alk(g_asr.mu);
     std::unique_lock<std::mutex> vlk(g_vad_mu);
     return transcribe_pcm_vad_locked(pcm, asr_cfg, vad_cfg, segments, text, err);
 }
@@ -444,6 +463,17 @@ static bool do_synthesize(const std::string &text, const std::string &instruct,
                           const std::string &language, int seed, int steps,
                           std::vector<float> &pcm, std::string &err) {
     if (!g_have_tts) { err = "no TTS model loaded"; return false; }
+
+    // CosyVoice3 with --tts-slots > 1: route through the continuous-batching
+    // scheduler so N requests decode concurrently (token-interleaved).
+    if (g_tts_batch) {
+        auto fut = g_tts_batch->Submit(text, instruct, language, seed);
+        auto result = fut.get();
+        if (!result.second.empty()) { err = result.second; return false; }
+        pcm = std::move(result.first);
+        return true;
+    }
+
     std::lock_guard<std::mutex> lk(g_tts.mu);
     rs_reset(g_tts.ctx);
     rs_set_tts_params(g_tts.ctx, instruct.c_str(), language.c_str(), seed);
@@ -808,8 +838,8 @@ static int run_mcp_stdio(FILE *out) {
 // text frames carry JSON control/result messages. ASR input is 16 kHz; TTS
 // output is the model's rate, announced in a leading {"type":"audio_info"}.
 //
-// Each model runs one session at a time (ggml contexts are single-threaded):
-// a handler try_locks its model mutex and rejects with "model busy" if held.
+// ggml scheduler/model objects are still protected by per-model mutexes, but
+// streaming ASR keeps per-connection state and only locks around each chunk.
 
 static void pcm16_to_float(const std::string &b, std::vector<float> &out) {
     size_t n = b.size() / 2;
@@ -927,18 +957,21 @@ static std::vector<std::string> split_sentences(const std::string &text) {
 // tokens update and a final on {"type":"eos"} / close.
 static void ws_asr_stream(rsws::Conn &c) {
     if (!g_have_asr) { ws_msg(c, "error", "error", "no ASR model loaded"); return; }
-    std::unique_lock<std::mutex> lk(g_asr.mu, std::try_to_lock);
-    if (!lk.owns_lock()) { ws_msg(c, "error", "error", "ASR model busy"); return; }
-    if (!rs_asr_stream_supported(g_asr.ctx)) {
-        ws_msg(c, "error", "error", "model does not support streaming (need X-ASR)");
-        return;
+    {
+        std::lock_guard<std::mutex> lk(g_asr.mu);
+        auto *xasr = g_asr.ctx ? dynamic_cast<XASRModel *>(g_asr.ctx->model.get()) : nullptr;
+        if (!xasr) {
+            ws_msg(c, "error", "error", "model does not support streaming (need X-ASR)");
+            return;
+        }
     }
-    int chunk_len = 32;
-    if (c.query().find("chunk_len=16") != std::string::npos) chunk_len = 16;
-    else if (c.query().find("chunk_len=48") != std::string::npos) chunk_len = 48;
-    else if (c.query().find("chunk_len=96") != std::string::npos) chunk_len = 96;
-    rs_asr_stream_reset(g_asr.ctx);
-    rs_asr_stream_set_chunk_len(g_asr.ctx, chunk_len);
+
+    int chunk_len = query_int(c.query(), "chunk_len", 32, 16, 192);
+    if (chunk_len != 16 && chunk_len != 32 && chunk_len != 48 &&
+        chunk_len != 96 && chunk_len != 192) {
+        chunk_len = 32;
+    }
+    auto stream_state = std::make_shared<XASRState>();
     ws_msg(c, "ready");
 
     std::vector<float> pcm;
@@ -946,16 +979,49 @@ static void ws_asr_stream(rsws::Conn &c) {
     while (c.recv(op, msg)) {
         if (op == rsws::OP_BINARY) {
             pcm16_to_float(msg, pcm);
-            int r = rs_asr_stream_push(g_asr.ctx, pcm.data(), (int)pcm.size());
-            if (r == 1) ws_msg(c, "partial", "text", rs_asr_stream_get_text(g_asr.ctx));
+            bool ok = false;
+            bool changed = false;
+            std::string partial;
+            {
+                std::lock_guard<std::mutex> lk(g_asr.mu);
+                auto *xasr = g_asr.ctx ? dynamic_cast<XASRModel *>(g_asr.ctx->model.get()) : nullptr;
+                if (xasr) {
+                    const size_t before = stream_state->tokens.size();
+                    xasr->SetChunkLen(chunk_len);
+                    ok = xasr->EncodeStreamingChunk(pcm.data(), pcm.size(),
+                                                    *stream_state,
+                                                    g_asr.ctx->sched);
+                    changed = ok && stream_state->tokens.size() != before;
+                    if (changed) partial = xasr->GetTranscription(*stream_state);
+                }
+            }
+            if (!ok) {
+                ws_msg(c, "error", "error", "ASR streaming chunk failed");
+                return;
+            }
+            if (changed) ws_msg(c, "partial", "text", partial);
         } else if (op == rsws::OP_TEXT) {
             rsjson::Value j;
             try { j = rsjson::parse(msg); } catch (...) { continue; }
             if (j["type"].as_string() == "eos") break;
         }
     }
-    rs_asr_stream_finish(g_asr.ctx);
-    ws_msg(c, "final", "text", rs_asr_stream_get_text(g_asr.ctx));
+    bool ok = false;
+    std::string final_text;
+    {
+        std::lock_guard<std::mutex> lk(g_asr.mu);
+        auto *xasr = g_asr.ctx ? dynamic_cast<XASRModel *>(g_asr.ctx->model.get()) : nullptr;
+        if (xasr) {
+            xasr->SetChunkLen(chunk_len);
+            ok = xasr->FinishStream(*stream_state, g_asr.ctx->sched);
+            if (ok) final_text = xasr->GetTranscription(*stream_state);
+        }
+    }
+    if (!ok) {
+        ws_msg(c, "error", "error", "ASR streaming finish failed");
+        return;
+    }
+    ws_msg(c, "final", "text", final_text);
 }
 
 // (2) VAD + offline ASR. Client streams PCM; VAD segments it, each segment gets
@@ -963,9 +1029,7 @@ static void ws_asr_stream(rsws::Conn &c) {
 static void ws_asr_vad(rsws::Conn &c) {
     if (!g_have_asr) { ws_msg(c, "error", "error", "no ASR model loaded"); return; }
     if (!g_have_vad) { ws_msg(c, "error", "error", "no VAD model (use --vad-model)"); return; }
-    std::unique_lock<std::mutex> alk(g_asr.mu, std::try_to_lock);
-    std::unique_lock<std::mutex> vlk(g_vad_mu, std::try_to_lock);
-    if (!alk.owns_lock() || !vlk.owns_lock()) { ws_msg(c, "error", "error", "model busy"); return; }
+    std::unique_lock<std::mutex> vlk(g_vad_mu);
     AsrServerConfig asr_cfg = g_asr_cfg;
     VadServerConfig cfg = g_vad_cfg;
     const std::string &q = c.query();
@@ -1011,11 +1075,20 @@ static void ws_asr_vad(rsws::Conn &c) {
         if ((int)seg.size() < min_samples) return;
         std::string text, err;
         bool is_partial = strcmp(kind, "partial") == 0;
-        if (transcribe_pcm_locked(seg.data(), (int)seg.size(), text, err,
-                                  asr_cfg.two_pass && !is_partial,
-                                  asr_cfg.ctc_precheck,
-                                  asr_cfg.two_pass && is_partial) &&
-            (is_partial || !text.empty())) {
+        bool ok = false;
+        {
+            std::lock_guard<std::mutex> alk(g_asr.mu);
+            ok = transcribe_pcm_locked(seg.data(), (int)seg.size(), text, err,
+                                       asr_cfg.two_pass && !is_partial,
+                                       asr_cfg.ctc_precheck,
+                                       asr_cfg.two_pass && is_partial);
+            if (ok && !is_partial) note_asr_final_segment_locked("ws-vad-final");
+        }
+        if (!ok) {
+            ws_msg(c, "error", "error", err.empty() ? "ASR transcribe failed" : err);
+            return;
+        }
+        if (is_partial || !text.empty()) {
             rsjson::Value o = rsjson::Value::object();
             o["type"] = kind; o["segment"] = seg_index; o["text"] = text;
             o["two_pass"] = asr_cfg.two_pass && !is_partial;
@@ -1026,7 +1099,6 @@ static void ws_asr_vad(rsws::Conn &c) {
 
     auto finalize_seg = [&]() {
         transcribe_seg("final");
-        note_asr_final_segment_locked("ws-vad-final");
         in_speech = false;
         pending_end = false;
         pending_silence_samples = 0;
@@ -1106,9 +1178,10 @@ static void ws_asr_vad(rsws::Conn &c) {
 // stream back per-segment audio (works for any TTS model).
 static void ws_tts_segmented(rsws::Conn &c) {
     if (!g_have_tts) { ws_msg(c, "error", "error", "no TTS model loaded"); return; }
-    std::unique_lock<std::mutex> lk(g_tts.mu, std::try_to_lock);
-    if (!lk.owns_lock()) { ws_msg(c, "error", "error", "TTS model busy"); return; }
 
+    // Batch mode: no lock needed — each segment is Submit()ed to the
+    // scheduler and decodes concurrently with other connections.
+    const uint64_t sid = reinterpret_cast<uint64_t>(&c) ^ 0xDEADBEEF;
     int op; std::string msg;
     if (!c.recv(op, msg) || op != rsws::OP_TEXT) return;
     rsjson::Value req;
@@ -1123,11 +1196,21 @@ static void ws_tts_segmented(rsws::Conn &c) {
     info["format"] = "pcm_s16le";
     ws_send_json(c, info);
 
+    std::unique_lock<std::mutex> lk(g_tts.mu, std::defer_lock);
+    if (!g_tts_batch) lk.lock();
+
     auto segs = split_sentences(text);
     for (size_t i = 0; i < segs.size(); i++) {
         std::vector<float> pcm;
-        std::string err;
-        {
+        if (g_tts_batch) {
+            auto fut = g_tts_batch->Submit(segs[i], voice, lang, 42, sid);
+            auto result = fut.get();
+            if (!result.second.empty()) {
+                ws_msg(c, "error", "error", result.second);
+                continue;
+            }
+            pcm = std::move(result.first);
+        } else {
             // do_synthesize locks g_tts.mu; we already hold it — inline the drive.
             rs_reset(g_tts.ctx);
             rs_set_tts_params(g_tts.ctx, voice.c_str(), lang.c_str(), 42);
@@ -1150,11 +1233,13 @@ static void ws_tts_segmented(rsws::Conn &c) {
 
 // (4) Pure streaming TTS: drive rs_process and emit each audio chunk immediately
 // (low first-chunk latency for CosyVoice3; one big chunk for offline-only models).
+// Batch mode: sentence-level pipelining — sentence N+1 decodes in the scheduler
+// while sentence N streams to the client, and multiple connections interleave
+// at token granularity instead of getting "TTS model busy".
 static void ws_tts_stream(rsws::Conn &c) {
     if (!g_have_tts) { ws_msg(c, "error", "error", "no TTS model loaded"); return; }
-    std::unique_lock<std::mutex> lk(g_tts.mu, std::try_to_lock);
-    if (!lk.owns_lock()) { ws_msg(c, "error", "error", "TTS model busy"); return; }
 
+    const uint64_t sid = reinterpret_cast<uint64_t>(&c) ^ 0xDEADBEEF;
     int op; std::string msg;
     if (!c.recv(op, msg) || op != rsws::OP_TEXT) return;
     rsjson::Value req;
@@ -1168,6 +1253,51 @@ static void ws_tts_stream(rsws::Conn &c) {
     info["type"] = "audio_info"; info["sample_rate"] = g_tts.sample_rate;
     info["format"] = "pcm_s16le";
     ws_send_json(c, info);
+
+    std::unique_lock<std::mutex> lk(g_tts.mu, std::defer_lock);
+    if (!g_tts_batch) lk.lock();
+
+    if (g_tts_batch) {
+        auto segs = split_sentences(text);
+        if (segs.empty()) { ws_msg(c, "final"); return; }
+
+        // First sentence: true streaming via DecodeStream (chunk-level audio,
+        // first chunk ~350 ms — under 500 ms target). Runs on the vocoder sched
+        // so the main LM thread can continue batched decode of other sessions.
+        if (!segs.empty()) {
+            struct ChunkState { rsws::Conn *c; std::string pcm16; };
+            ChunkState cs{&c, {}};
+            bool ok = g_tts_batch->StreamFirstSentence(
+                segs[0], voice, lang, 42,
+                [&cs](const float *pcm, size_t n) {
+                    cs.c->send_binary(float_to_pcm16(pcm, n).data(), n * 2);
+                });
+            if (!ok) {
+                ws_msg(c, "error", "error", "stream first sentence failed");
+                return;
+            }
+        }
+
+        // Remaining sentences: normal batch Submit (batched decode + flow/hift,
+        // concurrent with other sessions' work on the main LM sched).
+        if (segs.size() > 1) {
+            std::vector<std::future<std::pair<std::vector<float>, std::string>>> futs;
+            futs.reserve(segs.size() - 1);
+            for (size_t i = 1; i < segs.size(); ++i)
+                futs.push_back(g_tts_batch->Submit(segs[i], voice, lang, 42, sid));
+            for (auto &fut : futs) {
+                auto result = fut.get();
+                if (!result.second.empty()) {
+                    ws_msg(c, "error", "error", result.second);
+                    continue;
+                }
+                std::string b = float_to_pcm16(result.first.data(), result.first.size());
+                c.send_binary(b.data(), b.size());
+            }
+        }
+        ws_msg(c, "final");
+        return;
+    }
 
     rs_reset(g_tts.ctx);
     rs_set_tts_params(g_tts.ctx, voice.c_str(), lang.c_str(), 42);
@@ -1191,37 +1321,40 @@ static void ws_tts_stream(rsws::Conn &c) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "RapidSpeech server — OpenAI-compatible HTTP API + MCP\n\n"
-        "Usage: %s [--asr-model asr.gguf] [--tts-model tts.gguf] [options]\n\n"
-        "  --asr-model PATH   ASR GGUF (enables /v1/audio/transcriptions + transcribe tool)\n"
-        "  --tts-model PATH   TTS GGUF (enables /v1/audio/speech + synthesize tool)\n"
-        "  --vad-model PATH   VAD GGUF (enables the /asr/vad WebSocket)\n"
-        "  --vad-threshold F  VAD speech threshold (default 0.5)\n"
-        "  --vad-end-silence-ms N  Silence before finalizing segment (default 600)\n"
-        "  --vad-partial-ms N Partial ASR interval for /asr/vad (default 600, 0=off)\n"
-        "  --vad-min-segment-ms N  Minimum segment to transcribe (default 500)\n"
-        "  --vad-max-segment-ms N  Force-finalize long speech (default 0=off)\n"
-        "  --two-pass        FunASR-Nano: CTC first pass + LLM final re-decode\n"
-        "  --ctc-precheck    FunASR-Nano: skip LLM on CTC-empty silence/noise\n"
-        "  --mem-log         Log ASR scheduler compute-buffer high-water marks\n"
-        "  --asr-reload-every N  Reload ASR after N final segments to release GPU buffers (0=off)\n"
-        "  --host HOST        HTTP bind host (default 127.0.0.1)\n"
-        "  --port PORT        HTTP port (default 8080)\n"
-        "  --ws-port PORT     WebSocket port (default HTTP port + 1)\n"
-        "  --web-dir DIR      Serve a static web UI dir at / (e.g. examples/server)\n"
-        "  --mcp-stdio        Run as an MCP server over stdio (no HTTP)\n"
-        "  -t, --threads N    CPU threads per model (default 4)\n"
-        "  --cpu              Disable GPU\n"
-        "  -h, --help\n\n"
-        "WebSocket endpoints (binary = int16 mono PCM, text = JSON):\n"
-        "  /asr/stream      pure streaming ASR (X-ASR)     partial+final\n"
-        "  /asr/vad         VAD-segmented offline ASR      partial+final per segment\n"
-        "                   query overrides: vad_threshold, vad_end_silence_ms,\n"
-        "                   vad_partial_ms,\n"
-        "                   vad_min_segment_ms, vad_max_segment_ms,\n"
-        "                   two_pass, ctc_precheck\n"
-        "  /tts/segmented   sentence-by-sentence TTS       audio per segment\n"
-        "  /tts/stream      pure streaming TTS             audio chunks as generated\n\n"
+        "RapidSpeech server — OpenAI-compatible HTTP API + MCP\n"
+        "Usage: %s [--asr-model asr.gguf] [--tts-model tts.gguf] [options]\n"
+        "  --asr-model PATH   ASR GGUF (enables /v1/audio/transcriptions + transcribe tool)"
+        "  --tts-model PATH   TTS GGUF (enables /v1/audio/speech + synthesize tool)"
+        "  --vad-model PATH   VAD GGUF (enables the /asr/vad WebSocket)"
+        "  --vad-threshold F  VAD speech threshold (default 0.5)"
+        "  --vad-end-silence-ms N  Silence before finalizing segment (default 600)"
+        "  --vad-partial-ms N Partial ASR interval for /asr/vad (default 600, 0=off)"
+        "  --vad-min-segment-ms N  Minimum segment to transcribe (default 500)"
+        "  --vad-max-segment-ms N  Force-finalize long speech (default 0=off)"
+        "  --two-pass        FunASR-Nano: CTC first pass + LLM final re-decode"
+        "  --ctc-precheck    FunASR-Nano: skip LLM on CTC-empty silence/noise"
+        "  --tts-slots N     TTS concurrent requests via continuous batching"
+        "  --tts-voc-workers N  Flow/HiFT worker threads (CUDA streams, default 1)"
+        "                    (CosyVoice3 only; default 2, 1=serialized)"
+        "  --mem-log         Log ASR scheduler compute-buffer high-water marks"
+        "  --asr-reload-every N  Reload ASR after N final segments to release GPU buffers (0=off)"
+        "  --host HOST        HTTP bind host (default 127.0.0.1)"
+        "  --port PORT        HTTP port (default 8080)"
+        "  --ws-port PORT     WebSocket port (default HTTP port + 1)"
+        "  --web-dir DIR      Serve a static web UI dir at / (e.g. examples/server)"
+        "  --mcp-stdio        Run as an MCP server over stdio (no HTTP)"
+        "  -t, --threads N    CPU threads per model (default 4)"
+        "  --cpu              Disable GPU"
+        "  -h, --help\n"
+        "WebSocket endpoints (binary = int16 mono PCM, text = JSON):"
+        "  /asr/stream      pure streaming ASR (X-ASR)     partial+final"
+        "  /asr/vad         VAD-segmented offline ASR      partial+final per segment"
+        "                   query overrides: vad_threshold, vad_end_silence_ms,"
+        "                   vad_partial_ms,"
+        "                   vad_min_segment_ms, vad_max_segment_ms,"
+        "                   two_pass, ctc_precheck"
+        "  /tts/segmented   sentence-by-sentence TTS       audio per segment"
+        "  /tts/stream      pure streaming TTS             audio chunks as generated\n"
         "At least one of --asr-model / --tts-model is required.\n",
         argv0);
 }
@@ -1230,6 +1363,11 @@ int main(int argc_raw, char **argv_raw) {
     rs::cli::Utf8Args utf8(argc_raw, argv_raw);
     int argc = utf8.argc();
     char **argv = utf8.argv();
+
+    // Multi-worker uses two CUDA schedulers concurrently; CUDA graph capture
+    // coordinates via a global lock that would serialize them. Disable it so
+    // the two streams can overlap. (Harmless on non-CUDA - env is ignored.)
+    setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 0);
 
     std::string asr_model, tts_model, vad_model, host = "127.0.0.1", web_dir;
     int port = 8080, ws_port = -1, threads = 4;
@@ -1261,6 +1399,12 @@ int main(int argc_raw, char **argv_raw) {
         }
         else if (a == "--two-pass") g_asr_cfg.two_pass = true;
         else if (a == "--ctc-precheck") g_asr_cfg.ctc_precheck = true;
+        else if (a == "--tts-slots") {
+            g_tts_slots = std::max(1, atoi(next("--tts-slots")));
+        }
+        else if (a == "--tts-voc-workers" || a == "--voc-workers") {
+            g_tts_voc_workers = std::max(1, atoi(next("--tts-voc-workers")));
+        }
         else if (a == "--mem-log") g_mem_log = true;
         else if (a == "--asr-reload-every") {
             g_asr_reload_every = std::max(0, atoi(next("--asr-reload-every")));
@@ -1327,6 +1471,29 @@ int main(int argc_raw, char **argv_raw) {
         }
         g_have_tts = true;
         fprintf(stderr, "[server] TTS ready: %s @ %d Hz\n", g_tts.arch.c_str(), g_tts.sample_rate);
+
+        // Continuous batching: CosyVoice3 only (its LM decode is split into
+        // per-token steps the scheduler can interleave). Other archs keep the
+        // mutex-serialized path.
+        if (g_tts_slots > 1 && g_tts.arch == "cosyvoice3") {
+            auto *cv3 = dynamic_cast<CosyVoice3LMModel *>(g_tts.ctx->model.get());
+            if (cv3) {
+                // Try to create a 2nd GPU sched for LM || Flow/HiFT concurrency
+                // (CUDA only - shares weights, independent stream). Metal/CPU
+                // returns nullptr -> single-worker path.
+                auto scheds_voc =g_tts.ctx->create_extra_gpu_scheds(g_tts_voc_workers);
+                g_tts_batch = std::make_unique<TtsBatchScheduler>(
+                    cv3, g_tts.ctx->sched, std::move(scheds_voc), g_tts_slots);
+                g_tts_batch->Start();
+                fprintf(stderr,
+                        "[server] TTS continuous batching: %d slots (%s)\n",
+                        g_tts_slots, scheds_voc.empty() ? "single-worker" : (std::to_string(scheds_voc.size()) + "-worker CUDA").c_str());
+            } else {
+                fprintf(stderr,
+                        "[server] TTS batching unavailable (model cast failed); "
+                        "using serialized path\n");
+            }
+        }
     }
     if (!vad_model.empty()) {
         fprintf(stderr, "[server] loading VAD: %s\n", vad_model.c_str());

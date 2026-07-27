@@ -88,13 +88,19 @@ llm_graph_result_ptr llm_build_qwen2::build_graph(const int32_t *tokens,
   ggml_tensor *positions = build_position_tensor(ctx_, pos, n_tokens);
   ggml_tensor *causal_mask = nullptr;
   if (current_opts_.causal_mask) {
-    uint32_t n_kv_cache =
-        kv_cache ? kv_cache->size() : current_opts_.n_kv_cache;
-    if (current_opts_.is_decode_step && current_opts_.fixed_kv_cache_shape &&
-        current_opts_.n_kv_max > n_tokens) {
-      n_kv_cache = current_opts_.n_kv_max - n_tokens;
+    if (current_opts_.n_seq > 1) {
+      // Batched decode: per-sequence 4D mask [n_kv_max, 1, 1, n_seq].
+      causal_mask =
+          build_causal_mask_batched(ctx_, current_opts_.n_kv_max, current_opts_.n_seq);
+    } else {
+      uint32_t n_kv_cache =
+          kv_cache ? kv_cache->size() : current_opts_.n_kv_cache;
+      if (current_opts_.is_decode_step && current_opts_.fixed_kv_cache_shape &&
+          current_opts_.n_kv_max > n_tokens) {
+        n_kv_cache = current_opts_.n_kv_max - n_tokens;
+      }
+      causal_mask = build_causal_mask_tensor(ctx_, n_tokens, n_kv_cache);
     }
-    causal_mask = build_causal_mask_tensor(ctx_, n_tokens, n_kv_cache);
   }
 
   for (int32_t il = n_layers_start; il < n_layers_end; ++il) {
@@ -172,13 +178,19 @@ llm_graph_result_ptr llm_build_qwen2::build_graph_from_embeds(
   ggml_tensor *positions = build_position_tensor(ctx_, pos, n_tokens);
   ggml_tensor *causal_mask = nullptr;
   if (current_opts_.causal_mask) {
-    uint32_t n_kv_cache =
-        kv_cache ? kv_cache->size() : current_opts_.n_kv_cache;
-    if (current_opts_.is_decode_step && current_opts_.fixed_kv_cache_shape &&
-        current_opts_.n_kv_max > n_tokens) {
-      n_kv_cache = current_opts_.n_kv_max - n_tokens;
+    if (current_opts_.n_seq > 1) {
+      // Batched decode: per-sequence 4D mask [n_kv_max, 1, 1, n_seq].
+      causal_mask =
+          build_causal_mask_batched(ctx_, current_opts_.n_kv_max, current_opts_.n_seq);
+    } else {
+      uint32_t n_kv_cache =
+          kv_cache ? kv_cache->size() : current_opts_.n_kv_cache;
+      if (current_opts_.is_decode_step && current_opts_.fixed_kv_cache_shape &&
+          current_opts_.n_kv_max > n_tokens) {
+        n_kv_cache = current_opts_.n_kv_max - n_tokens;
+      }
+      causal_mask = build_causal_mask_tensor(ctx_, n_tokens, n_kv_cache);
     }
-    causal_mask = build_causal_mask_tensor(ctx_, n_tokens, n_kv_cache);
   }
 
   for (int32_t il = n_layers_start; il < n_layers_end; ++il) {
@@ -329,6 +341,14 @@ ggml_tensor *llm_build_qwen2::build_attention_layer(
       build_kv_cache_lookup(ctx, k, v, kv_cache, n_tokens, il);
 
   const float scale = 1.0f / sqrtf(static_cast<float>(n_embd_head));
+
+  // Batched decode: reshape q to 4D [head_dim, 1, n_head, n_seq] so
+  // build_flash_attn routes through the ne3-batched path (each sequence
+  // attends only over its own KV slice). k_final/v_final are already 4D from
+  // build_kv_cache_lookup; causal_mask is 4D from build_causal_mask_batched.
+  if (current_opts_.n_seq > 1) {
+    q = ggml_reshape_4d(ctx, q, n_embd_head, 1, n_head, current_opts_.n_seq);
+  }
 
   if (cparams_.flash_attn) {
     cur = build_flash_attn(ctx, q, k_final, v_final, causal_mask, scale);

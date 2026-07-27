@@ -165,6 +165,12 @@ set(RS_SOURCES
         rapidspeech/src/arch/funasr-nano.cpp
         rapidspeech/src/arch/silero_vad.cpp
         rapidspeech/src/arch/fireredvad.cpp
+        rapidspeech/src/arch/tenvad.cpp
+        third_party/ten-vad/fftw.c
+        third_party/ten-vad/stft.cc
+        third_party/ten-vad/biquad.cc
+        third_party/ten-vad/fscvrt.cc
+        third_party/ten-vad/pitch_est.cc
         rapidspeech/src/arch/xasr.h
         rapidspeech/src/arch/xasr.cpp
         rapidspeech/src/arch/xasr_zipformer.cpp
@@ -181,6 +187,8 @@ set(RS_SOURCES
         rapidspeech/src/arch/cosyvoice3.h
         rapidspeech/src/arch/cosyvoice3.cpp
         rapidspeech/src/arch/cosyvoice3_decode.cpp
+        rapidspeech/src/arch/cosyvoice3_batch.h
+        rapidspeech/src/arch/cosyvoice3_batch.cpp
         rapidspeech/src/arch/cosyvoice3_ras.h
         rapidspeech/src/arch/cosyvoice3_ras.cpp
         rapidspeech/src/arch/cosyvoice3_flow.h
@@ -222,6 +230,8 @@ set(RS_SOURCES
         rapidspeech/src/frontend/seamless_mel.cpp
         rapidspeech/src/arch/qwen3_asr.h
         rapidspeech/src/arch/qwen3_asr.cpp
+        rapidspeech/src/arch/moss_transcribe.h
+        rapidspeech/src/arch/moss_transcribe.cpp
         rapidspeech/src/utils/rs_wav.cpp
         rapidspeech/src/utils/rs_data_paths.cpp
 #        rapidspeech/src/arch/mimo_tokenizer.cpp
@@ -255,6 +265,7 @@ target_include_directories(rapidspeech-core PUBLIC
 
 target_include_directories(rapidspeech-core PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cppjieba/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ten-vad
 )
 
 # Symbol-export macro. For a static build (RS_STATIC_EXE) define RS_STATIC so

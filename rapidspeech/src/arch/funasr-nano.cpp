@@ -1380,7 +1380,7 @@ std::string FunASRNanoModel::GetTranscription(RSState &state) {
   sv_state.tokens.clear();
 
   // Deterministic hotword forcing: rewrite homophone spans to the exact hotword
-  // spelling the LLM refused to emit (e.g. 郭总 → 虢总).
+  // spelling the LLM refused to emit .
   if (hotword_force_ && hotword_retriever_ && !hotword_retriever_->Empty()) {
     std::string forced = hotword_retriever_->ApplySubstitutions(result);
     if (forced != result) {

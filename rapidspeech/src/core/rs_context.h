@@ -25,10 +25,31 @@ struct rs_context_t {
   gguf_context *ctx_gguf = nullptr;
   ggml_context *gguf_data = nullptr;
 
+  // Second GPU backend + scheduler for multi-worker pipelining (CUDA only).
+  // Shares the read-only weight buffers with `sched` but runs on an independent
+  // CUDA stream so a second worker thread can compute Flow/HiFT concurrently
+  // with LM decode. Metal is NOT supported (single command queue = no gain),
+  // so create_extra_gpu_scheds(n) returns empty there and the caller falls
+  // back to single-worker.
+  std::vector<ggml_backend_t> extra_gpu_backends;
+  std::vector<ggml_backend_t> extra_cpu_backends;
+  std::vector<ggml_backend_sched_t> extra_scheds;
+
   rs_context_t();
   ~rs_context_t();
 
   bool init_backend(bool prefer_cpu = false);
+
+  // Create a second GPU sched (independent CUDA backend + stream, shared
+  // weights). Returns nullptr if the GPU backend is not CUDA (Metal/CPU) or
+  // creation fails - caller should keep single-worker in that case.
+  // Exported (rs-server links it directly; core lib is hidden-visibility).
+#if defined(_WIN32)
+  __declspec(dllexport)
+#else
+  __attribute__((visibility("default")))
+#endif
+  std::vector<ggml_backend_sched_t> create_extra_gpu_scheds(int n);
 };
 
 // --- Internal Framework Registry API ---

@@ -1,0 +1,187 @@
+{
+    "registry_version": 1,
+    "repo": "RapidAI/RapidSpeech",
+    "sources": {
+        "modelscope": "https://www.modelscope.cn/models/RapidAI/RapidSpeech/resolve/master/",
+        "huggingface": "https://huggingface.co/RapidAI/RapidSpeech/resolve/main/"
+    },
+    "defaults": {
+        "asr": "funasr-nano",
+        "tts": "kokoro-zh",
+        "vad": "silero-vad"
+    },
+    "models": {
+        "funasr-nano": {
+            "task": "asr",
+            "languages": ["zh", "en"],
+            "license": "see model card (RapidAI/RapidSpeech)",
+            "description": "FunASR-Nano offline ASR: CTC first pass + optional LLM rescoring, zh/en",
+            "default_variant": "q4_k_m",
+            "recommended_backends": ["cpu", "metal", "cuda"],
+            "example": "rapidspeech transcribe audio.wav",
+            "variants": {
+                "q3_k": {
+                    "size_bytes": 499063360,
+                    "sha256": "2e060dc62ace358ee358e9d14dc32410f69678e395ac4e13a9cc5485a2b9cbc4",
+                    "files": {
+                        "modelscope": "ASR/FunASRNano/funasr-nano-q3_k.gguf",
+                        "huggingface": "ASR/FunasrNano/funasr-nano-q3_k.gguf"
+                    }
+                },
+                "q4_k_m": {
+                    "size_bytes": 692140864,
+                    "sha256": "82c5bc2aea12a852ce55bf78183d0c23624454df181da59b1b9e1fef8292e6ab",
+                    "files": {
+                        "modelscope": "ASR/FunASRNano/funasr-nano-q4_k_m.gguf",
+                        "huggingface": "ASR/FunasrNano/funasr-nano-q4_k_m.gguf"
+                    }
+                },
+                "q6_k": {
+                    "size_bytes": 886263360,
+                    "sha256": "b1ef1dc8ce00e0b81523c8979039e99ab56b57bc52a5e58356063114636dd04c",
+                    "files": {
+                        "modelscope": "ASR/FunASRNano/funasr-nano-q6_k.gguf",
+                        "huggingface": "ASR/FunasrNano/funasr-nano-q6_k.gguf"
+                    }
+                },
+                "q8_0": {
+                    "size_bytes": 1126925504,
+                    "sha256": "864a598a49f849ca80e7f664da8b95305ea281fe724538c815dd4fadbb1da89f",
+                    "files": {
+                        "modelscope": "ASR/FunASRNano/funasr-nano-q8_0.gguf"
+                    }
+                }
+            }
+        },
+        "kokoro-zh": {
+            "task": "tts",
+            "languages": ["zh"],
+            "license": "Apache-2.0",
+            "description": "Kokoro v1.1-zh TTS: 82M params, 100 Chinese voices, deterministic, 24 kHz",
+            "default_variant": "q8_0",
+            "default_voice": "zf_001",
+            "recommended_backends": ["cpu", "metal", "cuda"],
+            "example": "rapidspeech speak \"你好，世界\" -o hello.wav",
+            "variants": {
+                "q4_k_m": {
+                    "size_bytes": 76425216,
+                    "sha256": "a83df5085e1a5b2ea4a40408baef311e98252673ab114c29bb75e52af9c64e15",
+                    "known_issues": "silent output on Metal (2026-07-16); works on CPU — use q8_0/f16 on macOS",
+                    "files": {
+                        "modelscope": "TTS/kokoro/kokoro-v1_1-zh-q4_k_m.gguf"
+                    }
+                },
+                "q8_0": {
+                    "size_bytes": 106742912,
+                    "sha256": "8f80e7bb3ede009dc5066bbd33a1c07d3588407fd4cee1c0fbb4ba462e3953dc",
+                    "files": {
+                        "modelscope": "TTS/kokoro/kokoro-v1_1-zh-q8_0.gguf"
+                    }
+                },
+                "f16": {
+                    "size_bytes": 163727136,
+                    "sha256": "0de363d93377879f35d96a8157552618ec1a3e1866f293cfc9013d2e5441699e",
+                    "files": {
+                        "modelscope": "TTS/kokoro/kokoro-v1_1-zh-f16.gguf"
+                    }
+                }
+            },
+            "voices": {
+                "zf_001": {
+                    "size_bytes": 522560,
+                    "sha256": "6d6e0bab5fa23f382f0748a455188087249a21914d534bb49bee6693f86e2d23",
+                    "files": {
+                        "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_001.gguf"
+                    }
+                },
+                "zf_002": {
+                    "size_bytes": 522560,
+                    "sha256": "1bcdc4bb676cd40eef5ab9ef43ec32d88bfeac5af54891f96c24d31d3585499f",
+                    "files": {
+                        "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_002.gguf"
+                    }
+                },
+                "zf_003": {
+                    "size_bytes": 522560,
+                    "sha256": "a001f7e7ac95164da207f6a450bb7b16d1c893ac99e430827220a3ea1334f816",
+                    "files": {
+                        "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_003.gguf"
+                    }
+                },
+                "zm_009": {
+                    "size_bytes": 522560,
+                    "sha256": "0ee971b5eb369b3ed903309e98ae044d731b3fd23206b5a1d5190aeec7c2d15e",
+                    "files": {
+                        "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_009.gguf"
+                    }
+                },
+                "zm_010": {
+                    "size_bytes": 522560,
+                    "sha256": "f4bcd1d2299b0c0760ef42a9838419e67096e91c5086bfc08551ecd726cbcd82",
+                    "files": {
+                        "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_010.gguf"
+                    }
+                },
+                "af_maple": {
+                    "size_bytes": 522560,
+                    "sha256": "0ea1af354637ebe53f37bfd5d5323c8e09c17eaa18c83c1d9fd22c560eea2fb5",
+                    "files": {
+                        "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-af_maple.gguf"
+                    }
+                },
+                "af_sol": {
+                    "size_bytes": 522560,
+                    "sha256": "ba5c791c8b2821f669b9b1f620b6e46c20709a7162127ae8474e619abb905c97",
+                    "files": {
+                        "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-af_sol.gguf"
+                    }
+                },
+                "bf_vale": {
+                    "size_bytes": 522560,
+                    "sha256": "2afa6cf7fd13727d018e776302c8802e8ff7b6297bd4c8f048c33717d5ef3398",
+                    "files": {
+                        "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-bf_vale.gguf"
+                    }
+                }
+            }
+        },
+        "silero-vad": {
+            "task": "vad",
+            "languages": ["*"],
+            "license": "MIT",
+            "description": "Silero VAD v6: tiny universal voice activity detector",
+            "default_variant": "v6",
+            "recommended_backends": ["cpu"],
+            "example": "rapidspeech transcribe long.wav --vad",
+            "variants": {
+                "v6": {
+                    "size_bytes": 1239680,
+                    "sha256": "e4d29fb7072c5584a960145a2de45cf4c0126eca6f338ba7d23741df551438d3",
+                    "files": {
+                        "modelscope": "VAD/silero_vad_v6.gguf",
+                        "huggingface": "VAD/silero_vad_v6.gguf"
+                    }
+                }
+            }
+        },
+        "firered-vad": {
+            "task": "vad",
+            "languages": ["*"],
+            "license": "see model card (RapidAI/RapidSpeech)",
+            "description": "FireRed streaming VAD",
+            "default_variant": "v1",
+            "recommended_backends": ["cpu"],
+            "example": "rapidspeech transcribe long.wav --vad firered-vad",
+            "variants": {
+                "v1": {
+                    "size_bytes": 2275648,
+                    "sha256": "00bb734dcbf790e86447ddd04269320cb5f24df1c44126a389145add32dd93e4",
+                    "files": {
+                        "modelscope": "VAD/firered-stream-vad.gguf",
+                        "huggingface": "VAD/firered-stream-vad.gguf"
+                    }
+                }
+            }
+        }
+    }
+}

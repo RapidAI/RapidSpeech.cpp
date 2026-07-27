@@ -116,9 +116,59 @@ struct CosyVoice3State : public RSState {
   };
   HiFTStreamCache hift_stream;
   int stream_token_offset = 0;  // tokens already emitted to Flow+HiFT
+
+  // Position-stable CFM noise for streaming (mirrors upstream
+  // CausalConditionalCFM.rand_noise): pre-generated once per DecodeStream,
+  // sliced to [T_mel * mel_dim] per chunk so a given mel frame sees the
+  // same noise in every chunk it participates in (lookahead re-compute and
+  // the finalize pass included). Empty in the offline path, where RunFlow
+  // draws fresh noise exactly as before to preserve parity.
+  std::vector<float> stream_noise;   // t-major [t * mel_dim + d]
 };
 
-class CosyVoice3LMModel : public ISpeechModel {
+// librapidspeech-core builds with CXX_VISIBILITY_PRESET hidden; rs-server
+// links the TTS batch scheduler against this class directly, so export it.
+#if defined(_WIN32)
+#define RS_CV3_EXPORT __declspec(dllexport)
+#else
+#define RS_CV3_EXPORT __attribute__((visibility("default")))
+#endif
+
+// ── Per-slot LM state for continuous-batching scheduler ──────────────────────
+// Holds the GPU KV cache, the persistent graph builder and AR bookkeeping for
+// one in-flight TTS request. Allocated by RunLM_Prefill; freed by free_kv()
+// (or the destructor) once decoding finishes.
+struct CosyVoice3LMSlot {
+  std::unique_ptr<llm_build_qwen2> builder;  // persists across AR steps
+  llm_cparams cparams;  // MUST outlive builder (it holds a const ref to this)
+
+  // KV cache is no longer per-slot: the model owns one batched buffer
+  // [kv_dim, n_kv_max * n_slots] per layer (see CosyVoice3LMModel::batch_kv_*).
+  // slot_index selects this slot's slice: rows [slot_index*n_kv_max,
+  // (slot_index+1)*n_kv_max). n_kv_max is the shared batch capacity (same for
+  // all slots).
+  int32_t slot_index = 0;
+  int32_t n_kv_max = 0;
+
+  int32_t cur_tok = -1;   // token to feed at next RunLM_Step
+  int32_t step = 0;       // AR steps completed so far
+  int32_t min_len = 0;    // ignore-EOS threshold
+  int32_t max_len = 0;    // hard stop
+  bool done = false;
+
+  void reset() {
+    builder.reset();
+    slot_index = 0;
+    n_kv_max = 0;
+    cur_tok = -1;
+    step = 0;
+    min_len = 0;
+    max_len = 0;
+    done = false;
+  }
+};
+
+class RS_CV3_EXPORT CosyVoice3LMModel : public ISpeechModel {
 public:
   CosyVoice3LMModel();
   ~CosyVoice3LMModel() override;
@@ -180,6 +230,51 @@ public:
   // anyway). Pass an empty std::function to disarm.
   void set_imatrix_callback(std::function<void(struct ggml_tensor *)> cb);
 
+  // ── Continuous-batching interface (used by TtsBatchScheduler) ────────────
+  // Allocate the shared batched KV cache: one [kv_dim, n_kv_max * n_slots]
+  // buffer per layer on the GPU. Must be called once before any prefill/step
+  // when n_slots > 1. n_kv_max is the per-slot capacity (same for all slots).
+  bool InitBatchKV(int n_slots, int n_kv_max, ggml_backend_sched_t sched);
+  void FreeBatchKV();
+  int  BatchNSeq() const { return batch_n_slots_; }
+  // Copy one slot's entire KV slice (all layers, k+v) from src_slot to
+  // dst_slot in the shared batched buffer. Used by the scheduler to compact
+  // DECODING slots into a contiguous physical prefix after one finishes.
+  void CopyBatchKVSlice(int src_slot, int dst_slot);
+
+  // Prefill: build KV cache (into slot.slot_index's slice of the shared
+  // batched buffer), sample first speech token. Fills slot.{cur_tok, min_len,
+  // max_len}. Returns false on error.
+  bool RunLM_Prefill(CosyVoice3State &state, CosyVoice3LMSlot &slot,
+                     ggml_backend_sched_t sched);
+
+  // One AR decode step: feeds slot.cur_tok, appends next token to
+  // state.speech_token_ids, updates slot.cur_tok and slot.step.
+  // Sets slot.done=true when EOS or max_len reached.
+  bool RunLM_Step(CosyVoice3State &state, CosyVoice3LMSlot &slot,
+                  ggml_backend_sched_t sched);
+
+  // Batched AR decode step (vLLM-style): runs n states' current tokens
+  // through ONE forward pass (n_seq=n, ne3-batched flash attention). Each
+  // slot's new K/V column is written into its slice of the shared batched
+  // buffer; each slot is sampled independently afterwards. slots[i].slot_index
+  // selects the KV slice. Returns false on hard error.
+  bool RunLM_Step_Batch(CosyVoice3State **states, CosyVoice3LMSlot **slots,
+                        int n, ggml_backend_sched_t sched);
+
+  // Run Flow + HiFT for a completed state (same as the offline path).
+  // Public so TtsBatchScheduler can call it after LM finishes.
+  bool RunFlow(CosyVoice3State &state, ggml_backend_sched_t sched);
+  bool RunHiFT(CosyVoice3State &state, ggml_backend_sched_t sched);
+
+  // Batched Flow + HiFT: N states through one pipeline each (vLLM-style
+  // batching of the vocoder stages). Used by TtsBatchScheduler when multiple
+  // slots are ready for Flow / HiFT simultaneously.
+  bool RunFlow_Batch(CosyVoice3State **states, int n,
+                     ggml_backend_sched_t sched);
+  bool RunHiFT_Batch(CosyVoice3State **states, int n,
+                     ggml_backend_sched_t sched);
+
 private:
   // Original LLM AR loop — implemented in cosyvoice3_decode.cpp.
   bool RunLM(CosyVoice3State &state, ggml_backend_sched_t sched);
@@ -212,6 +307,19 @@ private:
   ras_params default_sampler_;
   int32_t max_tokens_ = 1500;
   uint64_t seed_ = 0xC05A3ULL;
+
+  // ── Shared batched KV cache (continuous batching) ────────────────────────
+  // One buffer per layer: [kv_dim, n_kv_max * n_slots], allocated on the GPU
+  // by InitBatchKV. Slot s owns rows [s*n_kv_max, (s+1)*n_kv_max). Used by
+  // RunLM_Prefill (single slot, writes its slice) and RunLM_Step_Batch (all
+  // active slots, one set_rows writing each slot's column at absolute row
+  // s*n_kv_max + n_cached[s]). Empty/unused when n_slots <= 1.
+  std::vector<ggml_tensor *> batch_kv_k_;  // [n_layer]
+  std::vector<ggml_tensor *> batch_kv_v_;  // [n_layer]
+  ggml_backend_buffer_t batch_kv_buf_ = nullptr;
+  ggml_context *batch_kv_ctx_ = nullptr;
+  int batch_n_kv_max_ = 0;
+  int batch_n_slots_ = 0;
 
   // ----- Pipeline sub-models -----------------------------------------------
   // Flow + HiFT live in the same GGUF as the LLM (loaded in Load).

@@ -4,6 +4,7 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 #include "utils/rs_log.h"
+#include <cstring>
 
 // Include corresponding backend headers based on macro definitions
 #ifdef RS_USE_METAL
@@ -22,6 +23,7 @@
 #include "ggml-webgpu.h"
 #endif
 
+#include <cstring>
 #include <functional>
 #include <cstdlib>
 #include <iostream>
@@ -123,9 +125,15 @@ rs_context_t::~rs_context_t() {
   // gone
   if (sched)
     ggml_backend_sched_free(sched);
+  for (auto s : extra_scheds)
+    ggml_backend_sched_free(s);
 
   // Free all backend instances
   for (auto b : backends)
+    ggml_backend_free(b);
+  for (auto b : extra_gpu_backends)
+    ggml_backend_free(b);
+  for (auto b : extra_cpu_backends)
     ggml_backend_free(b);
 
   // Cleanup GGUF related resources
@@ -252,6 +260,55 @@ bool rs_context_t::init_backend(bool prefer_cpu) {
     RS_LOG_INFO("Scheduler: CPU-only mode");
   }
   return sched != nullptr;
+}
+
+std::vector<ggml_backend_sched_t>
+rs_context_t::create_extra_gpu_scheds(int n) {
+  if (backends.empty() || n <= 0) return {};
+
+  // Only CUDA benefits from extra backends: Metal uses a single device
+  // command queue (no real parallelism), CPU has no GPU stream concept.
+  bool is_cuda = false;
+  for (auto b : backends) {
+    const char *name = b ? ggml_backend_name(b) : nullptr;
+    if (name && strstr(name, "CUDA")) { is_cuda = true; break; }
+  }
+  if (!is_cuda) return {};
+
+#ifdef RS_USE_CUDA
+  std::vector<ggml_backend_sched_t> out;
+  for (int i = 0; i < n; ++i) {
+    ggml_backend_t gpu = ggml_backend_cuda_init(0);
+    if (!gpu) {
+      RS_LOG_WARN("create_extra_gpu_scheds: backend %d init failed", i);
+      break;
+    }
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    if (cpu) ggml_backend_cpu_set_n_threads(cpu, params.n_threads);
+
+    std::vector<ggml_backend_t> bs;
+    bs.push_back(gpu);
+    if (cpu) bs.push_back(cpu);
+    ggml_backend_sched_t sch = ggml_backend_sched_new(
+        bs.data(), nullptr, (int)bs.size(), 65536, false, true);
+    if (!sch) {
+      RS_LOG_WARN("create_extra_gpu_scheds: sched %d new failed", i);
+      ggml_backend_free(gpu);
+      if (cpu) ggml_backend_free(cpu);
+      break;
+    }
+    extra_gpu_backends.push_back(gpu);
+    extra_cpu_backends.push_back(cpu);
+    extra_scheds.push_back(sch);
+    out.push_back(sch);
+  }
+  if (!out.empty())
+    RS_LOG_INFO("Extra GPU scheds created: %d (CUDA multi-worker, shared weights)",
+                (int)out.size());
+  return out;
+#else
+  return {};
+#endif
 }
 
 rs_context_t *rs_context_init_internal(rs_init_params_t params) {

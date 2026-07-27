@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RapidSpeech — 本地语音演示</title>
+<style>
+  :root { --bg:#0f1115; --card:#171a21; --line:#262b36; --fg:#e6e9ef;
+          --mut:#9aa4b2; --acc:#4f8cff; --ok:#3ecf8e; --warn:#e0a33e; --err:#ff6b6b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,
+         "PingFang SC","Microsoft YaHei",sans-serif; }
+  header { padding:12px 18px; border-bottom:1px solid var(--line);
+           background:var(--card); display:flex; gap:12px; align-items:center;
+           flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  .badge { font-size:11px; color:var(--mut); background:#0d1017;
+           border:1px solid var(--line); border-radius:99px; padding:2px 9px;
+           white-space:nowrap; }
+  .badge b { color:var(--ok); font-weight:600; }
+  main { max-width:680px; margin:0 auto; padding:20px 16px 60px;
+         display:flex; flex-direction:column; gap:16px; }
+  .card { background:var(--card); border:1px solid var(--line);
+          border-radius:12px; padding:16px; }
+  .card h2 { font-size:13px; margin:0 0 12px; color:var(--acc);
+             font-weight:600; letter-spacing:.03em; }
+  #talk { width:100%; padding:20px; font-size:18px; font-weight:700;
+          border:0; border-radius:12px; background:var(--acc); color:#fff;
+          cursor:pointer; transition:background .15s; touch-action:none;
+          -webkit-user-select:none; user-select:none; }
+  #talk.rec { background:var(--err); }
+  #talk:disabled { opacity:.5; }
+  .out { margin-top:12px; background:#0b0e14; border:1px solid var(--line);
+         border-radius:8px; padding:10px 12px; min-height:44px;
+         white-space:pre-wrap; word-break:break-word; }
+  .meta { font-size:12px; color:var(--mut); margin-top:6px; min-height:16px; }
+  textarea { width:100%; background:#0d1017; border:1px solid var(--line);
+             color:var(--fg); border-radius:8px; padding:9px 11px;
+             font:inherit; resize:vertical; min-height:56px; }
+  input[type=text] { width:100%; background:#0d1017; border:1px solid var(--line);
+             color:var(--fg); border-radius:8px; padding:8px 11px; font:inherit; }
+  button.sec { background:#2a3140; color:#fff; border:0; border-radius:8px;
+               padding:9px 16px; font:inherit; font-weight:600; cursor:pointer;
+               margin-top:10px; }
+  button.sec:disabled { opacity:.5; }
+  label { display:block; font-size:12px; color:var(--mut); margin:10px 0 4px; }
+  audio { width:100%; margin-top:12px; }
+  .errbox { color:var(--err); font-size:13px; margin-top:8px;
+            white-space:pre-wrap; }
+  .lang { margin-left:auto; }
+  .lang button { background:none; border:1px solid var(--line); color:var(--mut);
+                 border-radius:6px; padding:2px 8px; font-size:12px; cursor:pointer; }
+  .lang button.on { color:var(--fg); border-color:var(--acc); }
+</style>
+</head>
+<body>
+<header>
+  <h1>RapidSpeech</h1>
+  <span class="badge" id="bStatus">connecting…</span>
+  <span class="badge" id="bAsr"></span>
+  <span class="badge" id="bTts"></span>
+  <span class="badge" id="bNet"></span>
+  <span class="lang">
+    <button id="zhBtn" class="on" onclick="setLang('zh')">中文</button>
+    <button id="enBtn" onclick="setLang('en')">EN</button>
+  </span>
+</header>
+
+<main>
+  <section class="card">
+    <h2 data-i18n="asrTitle">语音识别（按住说话）</h2>
+    <button id="talk" data-i18n="talkIdle">按住说话 / Hold to talk</button>
+    <div id="asrOut" class="out" data-i18n-ph="asrPh">识别结果会显示在这里</div>
+    <div id="asrMeta" class="meta"></div>
+    <div id="asrErr" class="errbox"></div>
+  </section>
+
+  <section class="card">
+    <h2 data-i18n="ttsTitle">语音合成</h2>
+    <textarea id="ttsText">你好，欢迎使用本地语音合成。今天天气不错。</textarea>
+    <button id="speakBtn" class="sec" data-i18n="speakBtn">合成并播放</button>
+    <audio id="player" controls style="display:none"></audio>
+    <div id="ttsMeta" class="meta"></div>
+    <div id="ttsErr" class="errbox"></div>
+  </section>
+
+  <section class="card">
+    <h2 data-i18n="echoTitle">语音闭环（识别 → 朗读回来）</h2>
+    <div class="meta" data-i18n="echoHint">
+      开启后：松开说话按钮，识别出的文字会自动用 TTS 朗读回来 —— 一个最小的本地语音助手回路。
+    </div>
+    <label><input type="checkbox" id="echoChk"> <span data-i18n="echoLabel">启用回声模式</span></label>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const I18N = {
+  zh: { asrTitle:"语音识别（按住说话）", talkIdle:"按住说话 / Hold to talk",
+        talkRec:"松开结束・正在录音…", asrPh:"识别结果会显示在这里",
+        ttsTitle:"语音合成", speakBtn:"合成并播放",
+        echoTitle:"语音闭环（识别 → 朗读回来）", echoLabel:"启用回声模式",
+        echoHint:"开启后：松开说话按钮，识别出的文字会自动用 TTS 朗读回来 —— 一个最小的本地语音助手回路。",
+        recognizing:"识别中…", synthesizing:"合成中…",
+        micDenied:"麦克风被拒绝。请在浏览器地址栏允许麦克风权限后重试。" },
+  en: { asrTitle:"Speech recognition (hold to talk)", talkIdle:"Hold to talk",
+        talkRec:"Recording… release to stop", asrPh:"Transcription appears here",
+        ttsTitle:"Text to speech", speakBtn:"Synthesize & play",
+        echoTitle:"Voice loop (ASR → speak it back)", echoLabel:"Enable echo mode",
+        echoHint:"When on, whatever you say is transcribed and spoken back by the local TTS — a minimal local voice-assistant loop.",
+        recognizing:"Recognizing…", synthesizing:"Synthesizing…",
+        micDenied:"Microphone denied. Allow mic access in the address bar and retry." }
+};
+let lang = "zh";
+function setLang(l) {
+  lang = l;
+  $("zhBtn").classList.toggle("on", l === "zh");
+  $("enBtn").classList.toggle("on", l === "en");
+  document.querySelectorAll("[data-i18n]").forEach(el => {
+    el.textContent = I18N[l][el.dataset.i18n] || el.textContent;
+  });
+}
+
+// ── status bar ─────────────────────────────────────────────────
+async function refreshStatus() {
+  try {
+    const s = await fetch("/api/status").then(r => r.json());
+    $("bStatus").innerHTML = "<b>●</b> local";
+    $("bAsr").textContent = "ASR " + (s.asr_model || "?") + " · " + (s.asr_backend || "?");
+    $("bTts").textContent = "TTS " + (s.tts_model || "?") + " · " + (s.tts_backend || "?");
+    $("bNet").textContent = s.offline_enforced ? "offline enforced" : "offline-capable";
+  } catch (e) {
+    $("bStatus").textContent = "server unreachable";
+  }
+}
+refreshStatus();
+
+// ── recording: AudioContext → 16-bit WAV ───────────────────────
+let ac = null, workNode = null, chunks = [], recSr = 48000, stream = null;
+function encodeWav(f32arrs, sr) {
+  let len = 0; f32arrs.forEach(a => len += a.length);
+  const pcm = new Int16Array(len);
+  let o = 0;
+  f32arrs.forEach(a => { for (let i = 0; i < a.length; i++)
+    pcm[o++] = Math.max(-32768, Math.min(32767, a[i] * 32767)); });
+  const buf = new ArrayBuffer(44 + pcm.length * 2);
+  const v = new DataView(buf);
+  const wr = (off, s) => { for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i)); };
+  wr(0, "RIFF"); v.setUint32(4, 36 + pcm.length * 2, true); wr(8, "WAVE");
+  wr(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  wr(36, "data"); v.setUint32(40, pcm.length * 2, true);
+  new Int16Array(buf, 44).set(pcm);
+  return new Blob([buf], { type: "audio/wav" });
+}
+async function startRec() {
+  $("asrErr").textContent = "";
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) { $("asrErr").textContent = I18N[lang].micDenied; return false; }
+  ac = new (window.AudioContext || window.webkitAudioContext)();
+  recSr = ac.sampleRate;
+  const src = ac.createMediaStreamSource(stream);
+  workNode = ac.createScriptProcessor(4096, 1, 1);
+  chunks = [];
+  workNode.onaudioprocess = e => chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  src.connect(workNode); workNode.connect(ac.destination);
+  return true;
+}
+function stopRec() {
+  if (workNode) workNode.disconnect();
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (ac) ac.close();
+  return encodeWav(chunks, recSr);
+}
+
+// ── hold-to-talk ────────────────────────────────────────────────
+const talk = $("talk");
+let recording = false;
+async function pressStart(e) {
+  e.preventDefault();
+  if (recording) return;
+  if (!await startRec()) return;
+  recording = true;
+  talk.classList.add("rec");
+  talk.textContent = I18N[lang].talkRec;
+}
+async function pressEnd(e) {
+  e.preventDefault();
+  if (!recording) return;
+  recording = false;
+  talk.classList.remove("rec");
+  talk.textContent = I18N[lang].talkIdle;
+  const wav = stopRec();
+  $("asrOut").textContent = I18N[lang].recognizing;
+  $("asrMeta").textContent = "";
+  try {
+    const r = await fetch("/api/transcribe", { method: "POST", body: wav });
+    const d = await r.json();
+    if (d.error) { $("asrOut").textContent = ""; $("asrErr").textContent = d.error + "\n→ " + d.next_step; return; }
+    $("asrOut").textContent = d.text || "(no speech)";
+    $("asrMeta").textContent = d.audio_s + "s audio · " + d.ms + " ms · RTF " + d.rtf;
+    if ($("echoChk").checked && d.text) speak(d.text);
+  } catch (err) { $("asrErr").textContent = String(err); }
+}
+talk.addEventListener("mousedown", pressStart);
+talk.addEventListener("touchstart", pressStart, { passive: false });
+window.addEventListener("mouseup", pressEnd);
+talk.addEventListener("touchend", pressEnd);
+
+// ── TTS ─────────────────────────────────────────────────────────
+async function speak(text) {
+  $("ttsErr").textContent = "";
+  $("ttsMeta").textContent = I18N[lang].synthesizing;
+  $("speakBtn").disabled = true;
+  try {
+    const r = await fetch("/api/speak", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text })
+    });
+    if (!r.ok) {
+      const d = await r.json();
+      $("ttsMeta").textContent = "";
+      $("ttsErr").textContent = d.error + "\n→ " + d.next_step;
+      return;
+    }
+    const ms = r.headers.get("X-Time-Ms"), rtf = r.headers.get("X-RTF"),
+          asec = r.headers.get("X-Audio-S");
+    const blob = await r.blob();
+    const p = $("player");
+    p.style.display = "block";
+    p.src = URL.createObjectURL(blob);
+    p.play();
+    $("ttsMeta").textContent = asec + "s audio · " + ms + " ms · RTF " + rtf;
+  } catch (err) { $("ttsErr").textContent = String(err); }
+  finally { $("speakBtn").disabled = false; }
+}
+$("speakBtn").onclick = () => speak($("ttsText").value.trim());
+</script>
+</body>
+</html>

@@ -1,24 +1,27 @@
-// VAD C-API — unified wrapper around SileroVadModel and FireRedVadModel.
+// VAD C-API — unified wrapper around SileroVadModel, FireRedVadModel and
+// TenVadModel.
 //
 // Architecture is auto-detected from the GGUF `general.architecture` key:
 //   "silero-vad"   -> SileroVadModel (32 ms windows, VADIterator hysteresis)
 //   "firered-vad"  -> FireRedVadModel (10 ms shift, DFSMN + postprocessor)
+//   "ten-vad"      -> TenVadModel (16 ms hop, mel+pitch frontend + LSTM)
 //
-// This file deliberately avoids the full rs_context_t pipeline. Both VAD
+// This file deliberately avoids the full rs_context_t pipeline. All VAD
 // classes provide LoadDirect() entry points that work with bare gguf/ggml
 // contexts and any backend handle, so we open the file once, pick a backend
 // (with optional GPU), and dispatch.
 //
 // Streaming semantics:
 //   rs_vad_push_audio() buffers samples, runs the model in its native chunk
-//   size (Silero: 512 samples; FireRed: arbitrary, model handles remainder),
-//   and emits two queues:
+//   size (Silero: 512 samples; TEN: 256; FireRed: arbitrary, model handles
+//   remainder), and emits two queues:
 //     - segments: closed [start_s, end_s] intervals
 //     - frames:   per-window/per-frame postprocessor events
 //   Both queues are drained by the matching rs_vad_drain_*() call.
 
 #include "arch/silero_vad.h"
 #include "arch/fireredvad.h"
+#include "arch/tenvad.h"
 #include "rapidspeech.h"
 #include "utils/rs_log.h"
 
@@ -74,6 +77,7 @@ void vad_set_error(rs_error_t code, const char* msg) {
 
 constexpr int VAD_SAMPLE_RATE = 16000;
 constexpr int SILERO_WINDOW   = 512;
+constexpr int TENVAD_WINDOW   = 256;
 
 } // namespace
 
@@ -95,10 +99,12 @@ struct rs_vad_t {
     std::string                       arch;
     std::shared_ptr<SileroVadModel>   silero;
     std::shared_ptr<FireRedVadModel>  firered;
+    std::shared_ptr<TenVadModel>      tenvad;
     std::shared_ptr<RSState>          state;
 
     // Streaming buffering
-    std::vector<float>  pending;     // Silero accumulator (waits for 512)
+    std::vector<float>  pending;     // windowed-model accumulator (512/256)
+    int                 window_size  = SILERO_WINDOW;
     int64_t             samples_in   = 0;   // total samples ever pushed
 
     // Silero hysteresis tracking
@@ -121,6 +127,7 @@ struct rs_vad_t {
         state.reset();
         silero.reset();
         firered.reset();
+        tenvad.reset();
 
         if (weight_buffer) ggml_backend_buffer_free(weight_buffer);
         if (sched)         ggml_backend_sched_free(sched);
@@ -243,9 +250,10 @@ RS_API rs_vad_t* rs_vad_init_from_file(const char* model_path,
     v->arch = gguf_get_val_str(v->ctx_gguf, arch_key);
     RS_LOG_INFO("VAD architecture: %s", v->arch.c_str());
 
-    if (v->arch != "silero-vad" && v->arch != "firered-vad") {
+    if (v->arch != "silero-vad" && v->arch != "firered-vad" &&
+        v->arch != "ten-vad") {
         vad_set_error(RS_ERR_UNSUPPORTED_FORMAT,
-                      "Unsupported VAD arch (expected silero-vad or firered-vad)");
+                      "Unsupported VAD arch (expected silero-vad, firered-vad or ten-vad)");
         return nullptr;
     }
 
@@ -277,8 +285,24 @@ RS_API rs_vad_t* rs_vad_init_from_file(const char* model_path,
             return nullptr;
         }
         v->state = v->silero->CreateState();
+        v->window_size = SILERO_WINDOW;
         v->silero_exit_threshold = std::max(
             0.01f, v->silero->GetThreshold() - 0.15f);
+    } else if (v->arch == "ten-vad") {
+        v->tenvad = std::make_shared<TenVadModel>();
+        if (!v->tenvad->LoadDirect(v->gguf_data, v->ctx_gguf, weight_backend)) {
+            vad_set_error(RS_ERR_MODEL_LOAD_FAILED, "TenVadModel::LoadDirect failed");
+            return nullptr;
+        }
+        v->state = v->tenvad->CreateState();
+        if (!v->state) {
+            vad_set_error(RS_ERR_INIT_FAILED, "TenVadModel::CreateState failed");
+            return nullptr;
+        }
+        v->window_size = v->tenvad->GetHopSize() > 0 ? v->tenvad->GetHopSize()
+                                                     : TENVAD_WINDOW;
+        v->silero_exit_threshold = std::max(
+            0.01f, v->tenvad->GetThreshold() - 0.15f);
     } else { // firered-vad
         v->firered = std::make_shared<FireRedVadModel>();
         if (!v->firered->LoadDirect(v->gguf_data, v->ctx_gguf, weight_backend)) {
@@ -316,6 +340,8 @@ RS_API rs_error_t rs_vad_reset(rs_vad_t* vad) {
     if (vad->silero) {
         // Recreate state — SileroVadState's ctor zeros h/c + context.
         vad->state = vad->silero->CreateState();
+    } else if (vad->tenvad) {
+        vad->tenvad->ResetState(*vad->state);
     } else if (vad->firered) {
         vad->firered->Reset(*vad->state);
     }
@@ -326,6 +352,9 @@ RS_API rs_error_t rs_vad_set_threshold(rs_vad_t* vad, float threshold) {
     if (!vad) return RS_ERR_INVALID_ARGS;
     if (vad->silero) {
         vad->silero->SetThreshold(threshold);
+        vad->silero_exit_threshold = std::max(0.01f, threshold - 0.15f);
+    } else if (vad->tenvad) {
+        vad->tenvad->SetThreshold(threshold);
         vad->silero_exit_threshold = std::max(0.01f, threshold - 0.15f);
     } else if (vad->firered) {
         vad->firered->SetThreshold(threshold);
@@ -346,22 +375,33 @@ RS_API float rs_vad_get_probability(const rs_vad_t* vad) {
 }
 
 // ============================================
-// Push audio — Silero path
+// Push audio — windowed path (Silero 512 / TEN 256)
 // ============================================
 
-static void vad_process_silero_window(rs_vad_t* v, const float* win, int n) {
-    // n == SILERO_WINDOW. Feed the single window to SileroVadModel::Encode().
+static void vad_process_windowed(rs_vad_t* v, const float* win, int n) {
+    // n == v->window_size. Feed one window to the model's Encode().
     std::vector<float> input(win, win + n);
     ggml_backend_sched_reset(v->sched);
-    if (!v->silero->Encode(input, *v->state, v->sched)) {
-        RS_LOG_WARN("Silero VAD Encode failed");
-        return;
+    float prob = 0.0f;
+    float enter = 0.5f;
+    if (v->silero) {
+        if (!v->silero->Encode(input, *v->state, v->sched)) {
+            RS_LOG_WARN("Silero VAD Encode failed");
+            return;
+        }
+        prob  = v->silero->GetSpeechProbability(*v->state);
+        enter = v->silero->GetThreshold();
+    } else {
+        if (!v->tenvad->Encode(input, *v->state, v->sched)) {
+            RS_LOG_WARN("TEN VAD Encode failed");
+            return;
+        }
+        prob  = v->tenvad->GetSpeechProbability(*v->state);
+        enter = v->tenvad->GetThreshold();
     }
-    float prob = v->silero->GetSpeechProbability(*v->state);
     v->speech_prob = prob;
     ++v->silero_frame_idx;
 
-    float enter = v->silero->GetThreshold();
     float exit_  = v->silero_exit_threshold;
     bool was = v->in_speech;
     bool now = was ? (prob >= exit_) : (prob >= enter);
@@ -375,7 +415,7 @@ static void vad_process_silero_window(rs_vad_t* v, const float* win, int n) {
     rs_vad_frame_t fr = {};
     fr.frame_idx       = v->silero_frame_idx;
     fr.raw_prob        = prob;
-    fr.smoothed_prob   = prob; // Silero exposes only one prob.
+    fr.smoothed_prob   = prob; // windowed models expose only one prob.
     fr.is_speech       = now ? 1 : 0;
     fr.is_speech_start = (!was && now) ? 1 : 0;
     fr.is_speech_end   = ( was && !now) ? 1 : 0;
@@ -393,12 +433,13 @@ static void vad_process_silero_window(rs_vad_t* v, const float* win, int n) {
     v->is_speech_flag = now ? 1 : 0;
 }
 
-static rs_error_t vad_push_silero(rs_vad_t* v, const float* pcm, int n) {
+static rs_error_t vad_push_windowed(rs_vad_t* v, const float* pcm, int n) {
+    const int window = v->window_size;
     v->pending.insert(v->pending.end(), pcm, pcm + n);
-    while ((int)v->pending.size() >= SILERO_WINDOW) {
-        v->samples_in += SILERO_WINDOW;
-        vad_process_silero_window(v, v->pending.data(), SILERO_WINDOW);
-        v->pending.erase(v->pending.begin(), v->pending.begin() + SILERO_WINDOW);
+    while ((int)v->pending.size() >= window) {
+        v->samples_in += window;
+        vad_process_windowed(v, v->pending.data(), window);
+        v->pending.erase(v->pending.begin(), v->pending.begin() + window);
     }
     return RS_OK;
 }
@@ -446,7 +487,7 @@ static rs_error_t vad_push_firered(rs_vad_t* v, const float* pcm, int n) {
 RS_API rs_error_t rs_vad_push_audio(rs_vad_t* vad, const float* pcm,
                                     int32_t n_samples) {
     if (!vad || !pcm || n_samples <= 0) return RS_ERR_INVALID_ARGS;
-    if (vad->silero)  return vad_push_silero(vad, pcm, n_samples);
+    if (vad->silero || vad->tenvad) return vad_push_windowed(vad, pcm, n_samples);
     if (vad->firered) return vad_push_firered(vad, pcm, n_samples);
     return RS_ERR_INIT_FAILED;
 }

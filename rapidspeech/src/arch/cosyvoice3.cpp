@@ -39,6 +39,7 @@ CosyVoice3LMModel::CosyVoice3LMModel() {
 }
 
 CosyVoice3LMModel::~CosyVoice3LMModel() {
+  FreeBatchKV();
   // Order matters: drop the model wrappers BEFORE freeing the GGUF resources
   // they reference, otherwise tensor pointers dangle.
   speech_tokenizer_.reset();
@@ -784,6 +785,9 @@ bool CosyVoice3LMModel::Decode(RSState &state, ggml_backend_sched_t sched) {
     // Legacy `cosyvoice3-llm` path: token-only output via GetTranscription.
     return true;
   }
+  // A state reused after DecodeStream would otherwise feed the streaming
+  // noise buffer into the offline RunFlow and break offline parity.
+  s.stream_noise.clear();
   auto t_flow0 = clk::now();
   if (!flow_->RunFlow(s, sched)) {
     RS_LOG_ERR("CosyVoice3: RunFlow failed");
@@ -819,6 +823,71 @@ bool CosyVoice3LMModel::Decode(RSState &state, ggml_backend_sched_t sched) {
               ms(t_flow0, t_flow1), ms(t_flow1, t_hift1),
               ms(t_prep0, t_hift1));
   return true;
+}
+
+// =====================================================================
+// Public Flow / HiFT wrappers — used by TtsBatchScheduler after the LM
+// stage of a slot completes. Mirror the offline Decode() behaviour.
+// =====================================================================
+
+bool CosyVoice3LMModel::RunFlow(CosyVoice3State &s, ggml_backend_sched_t sched) {
+  if (!flow_ready_ || !flow_) {
+    RS_LOG_ERR("CosyVoice3: RunFlow called but Flow not loaded");
+    return false;
+  }
+  // A state reused after DecodeStream would otherwise feed the streaming
+  // noise buffer into the offline RunFlow and break offline parity.
+  s.stream_noise.clear();
+  auto t0 = std::chrono::steady_clock::now();
+  bool ok = flow_->RunFlow(s, sched);
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+  RS_LOG_INFO("CosyVoice3-bench: RunFlow %.1fms (T_mel=%zu)", (double)ms,
+              s.mel_output.size() / 80);
+  return ok;
+}
+
+bool CosyVoice3LMModel::RunHiFT(CosyVoice3State &s, ggml_backend_sched_t sched) {
+  if (!hift_ready_ || !hift_) {
+    RS_LOG_ERR("CosyVoice3: RunHiFT called but HiFT not loaded");
+    return false;
+  }
+  auto t0 = std::chrono::steady_clock::now();
+  bool ok = hift_->RunHiFT(s, sched);
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+  RS_LOG_INFO("CosyVoice3-bench: RunHiFT %.1fms (T_pcm=%zu)", (double)ms,
+              s.audio_output.size());
+  return ok;
+}
+
+bool CosyVoice3LMModel::RunFlow_Batch(CosyVoice3State **states, int n,
+                                       ggml_backend_sched_t sched) {
+  if (!flow_ready_ || !flow_) {
+    RS_LOG_ERR("CosyVoice3: RunFlow_Batch called but Flow not loaded");
+    return false;
+  }
+  for (int i = 0; i < n; ++i) states[i]->stream_noise.clear();
+  auto t0 = std::chrono::steady_clock::now();
+  bool ok = flow_->RunFlow_Batch(states, n, sched);
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+  RS_LOG_INFO("CosyVoice3-bench: RunFlow_Batch %.1fms (n=%d)", (double)ms, n);
+  return ok;
+}
+
+bool CosyVoice3LMModel::RunHiFT_Batch(CosyVoice3State **states, int n,
+                                       ggml_backend_sched_t sched) {
+  if (!hift_ready_ || !hift_) {
+    RS_LOG_ERR("CosyVoice3: RunHiFT_Batch called but HiFT not loaded");
+    return false;
+  }
+  auto t0 = std::chrono::steady_clock::now();
+  bool ok = hift_->RunHiFT_Batch(states, n, sched);
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+  RS_LOG_INFO("CosyVoice3-bench: RunHiFT_Batch %.1fms (n=%d)", (double)ms, n);
+  return ok;
 }
 
 // =====================================================================
@@ -874,12 +943,20 @@ bool CosyVoice3LMModel::DecodeStream(RSState &state,
   constexpr int kTokenHopInit = 25;
   constexpr int kTokenHopMax  = 100;
   constexpr int kStreamScale  = 2;
-  // Non-finalize chunks run a reduced CFM trajectory: the tail of each
-  // intermediate chunk is recomputed (with more context) on the next chunk,
-  // so paying for the full 5 Euler steps there is wasted work. The final
-  // (finalize=true) chunk keeps the default to preserve quality of the tail
-  // that actually ships. Net: ~40 % Flow time off non-final chunks.
-  constexpr int kFlowStepsNonFinal = 3;
+  // Non-finalize chunks default to a reduced CFM trajectory: the tail of
+  // each intermediate chunk is recomputed (with more context) on the next
+  // chunk, so paying for the full 5 Euler steps there is partly wasted
+  // work (~40 % Flow time saved). The trade-off is audible: fewer Euler
+  // steps soften harmonic detail on every non-final chunk. Since Flow is
+  // a minor share of chunk latency (LM dominates), RS_CV3_STREAM_FLOW_STEPS
+  // lets deployments buy offline-equal quality (set 5 to match the offline
+  // path); 0/unset keeps the fast default.
+  int flow_steps_nonfinal = 3;
+  if (const char *p = std::getenv("RS_CV3_STREAM_FLOW_STEPS")) {
+    const int v = std::atoi(p);
+    if (v > 0) flow_steps_nonfinal = v;
+  }
+  const int kFlowStepsNonFinal = flow_steps_nonfinal;
   const int kPreLookahead = flow_->pre_lookahead_len();   // 3
   const int kTokenMelRatio = flow_->token_mel_ratio();    // 2
   const int kMelDim        = flow_->mel_dim();            // 80
@@ -890,6 +967,26 @@ bool CosyVoice3LMModel::DecodeStream(RSState &state,
   s.flow_done = false;
   s.hift_done = false;
   s.audio_output.clear();
+
+  const int T_pt_mel_noise = (int)(s.prompt_feat.size() / (size_t)kMelDim);
+  {
+    // Position-stable CFM noise (upstream CausalConditionalCFM.rand_noise):
+    // draw the whole utterance's noise once, t-major, sized for the worst
+    // case (prompt mel + max_speech_tokens*ratio). Each chunk's Flow pass
+    // memcpy's the [0, T_mel) prefix, so a given mel frame keeps its noise
+    // across the lookahead re-compute and the finalize pass. Without this
+    // every chunk re-rolls the overlap and each boundary is a seam between
+    // two noise realizations — audible as roughness at chunk joins.
+    const size_t max_frames =
+        (size_t)T_pt_mel_noise + (size_t)s.max_speech_tokens * kTokenMelRatio;
+    // Copy-construct off the seed state: consuming s.rng here would shift
+    // the LM sampling stream and break token parity with the offline path.
+    std::mt19937 noise_rng = s.rng;
+    noise_rng.discard(9973);           // decorrelate from the pipeline draws
+    std::normal_distribution<float> nd(0.f, 1.f);
+    s.stream_noise.resize(max_frames * (size_t)kMelDim);
+    for (auto &v : s.stream_noise) v = nd(noise_rng);
+  }
 
   // Prompt-token pad: round prompt_speech_token length up to a multiple
   // of token_hop_len so the very first chunk's token grid aligns with

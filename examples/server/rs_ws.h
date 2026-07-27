@@ -226,7 +226,12 @@ public:
         addr.sin_port = htons((uint16_t)port);
         inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
         if (bind(ls, (sockaddr *)&addr, sizeof(addr)) != 0) { RS_CLOSESOCK(ls); return false; }
-        if (::listen(ls, 16) != 0) { RS_CLOSESOCK(ls); return false; }
+        // Backlog large enough for bursty connection acceptance: the previous
+        // value (16) caused simultaneous-connect bursts > ~22 to get RST'd
+        // before accept() could drain them (seen as "no close frame received
+        // or sent" on the client). 512 comfortably absorbs a connection storm;
+        // the kernel clamps to somaxconn automatically.
+        if (::listen(ls, 512) != 0) { RS_CLOSESOCK(ls); return false; }
         for (;;) {
             rs_socket_t cs = accept(ls, nullptr, nullptr);
             if (cs == RS_INVALID_SOCKET) continue;

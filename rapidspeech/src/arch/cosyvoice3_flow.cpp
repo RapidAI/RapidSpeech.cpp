@@ -517,7 +517,8 @@ ggml_tensor *CosyVoice3FlowModel::BuildDiTBlock(ggml_context *ctx,
                                                 ggml_tensor *x,
                                                 ggml_tensor *time_emb,
                                                 ggml_tensor *position_ids,
-                                                int64_t cut_len) const {
+                                                int64_t cut_len,
+                                                ggml_tensor *attn_mask) const {
   const int64_t T_full = x->ne[1];
   const int64_t T_q    = T_full - cut_len;
   const int64_t batch  = x->ne[2];
@@ -590,6 +591,9 @@ ggml_tensor *CosyVoice3FlowModel::BuildDiTBlock(ggml_context *ctx,
   ggml_tensor *attn_scores = ggml_mul_mat(ctx, k, q);
   attn_scores = ggml_scale(ctx, attn_scores,
                            1.f / std::sqrt((float)head_dim_));
+  if (attn_mask) {
+    attn_scores = ggml_add(ctx, attn_scores, attn_mask);
+  }
   ggml_tensor *attn_weights = ggml_soft_max(ctx, attn_scores);
   v = ggml_cont(ctx, ggml_permute(ctx, v, 1, 0, 2, 3));
   ggml_tensor *attn_out = ggml_mul_mat(ctx, v, attn_weights);
@@ -777,6 +781,368 @@ ggml_tensor *CosyVoice3FlowModel::BuildCFMStepGraph(
   ggml_tensor *x_next = ggml_add(ctx, x_cur,
                                  ggml_scale(ctx, dphi, dt_value));
   return x_next;
+}
+
+// =====================================================================
+// Batched CFM step: N slots, CFG batch=2N. x_init/mu/cond are [mel_dim, T, N]
+// (per-slot); spks [mel_dim, N]. CFG duplication (x->both, mu->cond+null,
+// cond->both) is built in-graph via repeat/concat so only x evolves across
+// steps. cut_len=0 (prompt prefix trimmed on host after the last step).
+// =====================================================================
+ggml_tensor *CosyVoice3FlowModel::BuildCFMStepGraph_Batch(
+    ggml_context *ctx, ggml_tensor *x_init, ggml_tensor *mu,
+    ggml_tensor *spks, ggml_tensor *cond, ggml_tensor *attn_mask,
+    int n_slots, float t_value, float dt_value,
+    ggml_tensor *&position_ids_out) const {
+  const int64_t mel = x_init->ne[0];
+  const int64_t T = x_init->ne[1];
+  const int64_t N = n_slots;
+  const int64_t B = 2 * N;  // CFG batch
+
+  // CFG duplication -> [mel, T, 2, N] -> cont -> [mel, T, 2N] (interleaved
+  // s0c, s0n, s1c, s1n ... so a reshape_4d(out, mel, T, 2, N) splits cond/null).
+  auto to_2n = [&](ggml_tensor *t, bool null_half) -> ggml_tensor * {
+    const int64_t Tt = t->ne[1];
+    ggml_tensor *t4 = ggml_reshape_4d(ctx, t, t->ne[0], Tt, 1, N);
+    // cond half is always t; null half is zeros (mu) or a copy of t (x/cond).
+    // Use concat on ne[2] for both — ggml_repeat can't expand a middle dim
+    // while keeping a higher dim > 1, so concat([t, other], 2) is the portable
+    // way to build the [mel, T, 2, N] CFG-duplicated tensor.
+    ggml_tensor *other = null_half ? ggml_scale(ctx, t4, 0.0f) : t4;
+    ggml_tensor *dup = ggml_concat(ctx, t4, other, 2);  // [mel, T, 2, N]
+    dup = ggml_cont(ctx, dup);
+    return ggml_reshape_3d(ctx, dup, t->ne[0], Tt, B);
+  };
+
+  ggml_tensor *x_in   = to_2n(x_init, false);
+  ggml_tensor *cond_in = to_2n(cond, false);
+  ggml_tensor *mu_in  = to_2n(mu, true);   // null half zeroed
+  ggml_tensor *spks4 = ggml_reshape_3d(ctx, spks, mel, 1, N);
+  spks4 = ggml_reshape_4d(ctx, spks4, mel, 1, 1, N);
+  ggml_tensor *spks_in = ggml_cont(ctx, ggml_concat(ctx, spks4, spks4, 2));
+  // [mel, 1, B]: ne[1]=1 so it broadcasts over T inside ggml_repeat(spks, x).
+  spks_in = ggml_reshape_3d(ctx, spks_in, mel, 1, B);
+
+  // t embedding [dim, 2N] (same t for all slots/CFG).
+  ggml_tensor *t_in = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, B);
+  t_in = ggml_fill_inplace(ctx, t_in, t_value);
+  ggml_tensor *t_e = unsqueeze0(ctx, t_in);
+  t_e = ggml_repeat_4d(ctx, t_e, time_emb_table_->ne[0], t_e->ne[1],
+                       t_e->ne[2], t_e->ne[3]);
+  ggml_tensor *m = ggml_mul(ctx, t_e, time_emb_table_);
+  ggml_tensor *t_emb = ggml_concat(ctx, ggml_sin(ctx, m), ggml_cos(ctx, m), 0);
+  t_emb = linear(ctx, time_mlp0_w_, time_mlp0_b_, t_emb);
+  t_emb = ggml_silu(ctx, t_emb);
+  t_emb = linear(ctx, time_mlp2_w_, time_mlp2_b_, t_emb);  // [dim, 2N]
+
+  ggml_tensor *spks_bcast = ggml_repeat(ctx, spks_in, x_in);
+  ggml_tensor *concat = ggml_concat(ctx, x_in, cond_in, 0);
+  concat = ggml_concat(ctx, concat, mu_in, 0);
+  concat = ggml_concat(ctx, concat, spks_bcast, 0);
+  ggml_tensor *h = linear(ctx, input_proj_w_, input_proj_b_, concat);
+
+  // ConvPosEmbed (preserves ne[2]=2N).
+  {
+    ggml_tensor *p = ggml_cont(ctx, ggml_permute(ctx, h, 1, 0, 2, 3));
+    const int k1 = (int)cpe_c1_w_->ne[0];
+    p = ggml_pad_ext(ctx, p, k1 - 1, 0, 0, 0, 0, 0, 0, 0);
+    p = conv1d_grouped(ctx, cpe_c1_w_, cpe_c1_b_, p, 1, 0, 1, 16);
+    p = mish(ctx, p);
+    const int k2 = (int)cpe_c2_w_->ne[0];
+    p = ggml_pad_ext(ctx, p, k2 - 1, 0, 0, 0, 0, 0, 0, 0);
+    p = conv1d_grouped(ctx, cpe_c2_w_, cpe_c2_b_, p, 1, 0, 1, 16);
+    p = mish(ctx, p);
+    p = ggml_cont(ctx, ggml_permute(ctx, p, 1, 0, 2, 3));
+    h = ggml_add(ctx, h, p);
+  }
+
+  ggml_tensor *position_ids =
+      ggml_new_tensor_2d(ctx, GGML_TYPE_I32, h->ne[1], h->ne[2]);
+  ggml_set_input(position_ids);
+  ggml_set_name(position_ids, "flow.position_ids.batch");
+  position_ids_out = position_ids;
+
+  for (int i = 0; i < depth_; ++i) {
+    h = BuildDiTBlock(ctx, blocks_[i], h, t_emb, position_ids, 0, attn_mask);
+  }
+
+  // Final norm + proj -> out [mel, T, 2N].
+  {
+    ggml_tensor *e = ggml_silu(ctx, t_emb);
+    e = linear(ctx, norm_out_lin_w_, norm_out_lin_b_, e);
+    ggml_tensor *scale = ggml_view_2d(ctx, e, dim_, e->ne[1], e->nb[1], 0);
+    ggml_tensor *shift = ggml_view_2d(ctx, e, dim_, e->ne[1], e->nb[1],
+                                      (size_t)dim_ * e->nb[0]);
+    scale = ggml_scale_bias(ctx, ggml_cont(ctx, scale), 1.f, 1.f);
+    ggml_tensor *xn = layer_norm(ctx, nullptr, nullptr, h);
+    xn = ggml_mul(ctx, xn, unsqueeze1(ctx, scale));
+    xn = ggml_add(ctx, xn, unsqueeze1(ctx, ggml_cont(ctx, shift)));
+    h = xn;
+  }
+  ggml_tensor *out = linear(ctx, proj_out_w_, proj_out_b_, h);  // [mel, T, 2N]
+
+  // CFG split: reshape [mel, T, 2, N]; take ne[2]=0 (cond) / =1 (null) across
+  // all N slots (view_4d keeps the slot dim ne[3]=N).
+  out = ggml_reshape_4d(ctx, out, out->ne[0], out->ne[1], 2, N);
+  ggml_tensor *dphi_cond = ggml_view_4d(ctx, out, out->ne[0], out->ne[1], 1, N,
+                                        out->nb[1], out->nb[2], out->nb[3], 0);
+  ggml_tensor *dphi_null = ggml_view_4d(ctx, out, out->ne[0], out->ne[1], 1, N,
+                                        out->nb[1], out->nb[2], out->nb[3],
+                                        out->nb[2]);
+  dphi_cond = ggml_cont(ctx, dphi_cond);
+  dphi_null = ggml_cont(ctx, dphi_null);
+  dphi_cond = ggml_reshape_3d(ctx, dphi_cond, mel, T, N);
+  dphi_null = ggml_reshape_3d(ctx, dphi_null, mel, T, N);
+  dphi_cond = ggml_scale(ctx, dphi_cond, 1.f + cfg_rate_);
+  dphi_null = ggml_scale(ctx, dphi_null, cfg_rate_);
+  ggml_tensor *dphi = ggml_sub(ctx, dphi_cond, dphi_null);  // [mel, T, N]
+
+  ggml_tensor *x_next = ggml_add(ctx, x_init, ggml_scale(ctx, dphi, dt_value));
+  return x_next;
+}
+
+// =====================================================================
+// RunFlow_Batch - N states -> mel in one pipeline.
+//   encode: per-slot (cheap), results padded to T_max and stacked into
+//           persistent [mel, T_max, N] mu/cond + [mel, N] spks.
+//   solve:  5 Euler steps, each ONE forward over CFG batch=2N with a per-slot
+//           pad mask (bidirectional attention blocked from leaking across
+//           slots / into padded time). x evolves on-device [mel, T_max, N].
+//   out:    per-slot host trim of the prompt prefix -> mel_output.
+// =====================================================================
+bool CosyVoice3FlowModel::RunFlow_Batch(CosyVoice3State **states, int n,
+                                        ggml_backend_sched_t sched) {
+  if (n <= 0) return true;
+  if (n == 1) return RunFlow(*states[0], sched);
+
+  for (int i = 0; i < n; ++i) {
+    if (states[i]->embedding.size() != (size_t)spk_dim_in_) {
+      RS_LOG_ERR("Flow-batch: slot %d embedding size %zu != %d", i,
+                 states[i]->embedding.size(), spk_dim_in_);
+      return false;
+    }
+    states[i]->mel_output.clear();
+    states[i]->flow_done = false;
+  }
+
+  std::vector<int> T_pt(n), T_gen(n), T_pt_mel(n), T_gen_mel(n), T_mel(n);
+  int T_max = 0;
+  for (int i = 0; i < n; ++i) {
+    T_pt[i] = (int)states[i]->prompt_token.size();
+    T_gen[i] = (int)states[i]->speech_token_ids.size();
+    T_pt_mel[i] = (int)(states[i]->prompt_feat.size() / mel_dim_);
+    T_gen_mel[i] = T_gen[i] * token_mel_ratio_;
+    T_mel[i] = T_pt_mel[i] + T_gen_mel[i];
+    T_max = std::max(T_max, T_mel[i]);
+  }
+  const int N = n;
+  const int B = 2 * N;
+
+  constexpr int FLOW_MAX_NODES = 4096;
+  constexpr size_t FLOW_CTX_BYTES =
+      FLOW_MAX_NODES * (sizeof(ggml_tensor) + 256);
+  ggml_backend_t flow_backend = pick_flow_backend(sched);
+
+  std::vector<std::vector<float>> mu_host(N), cond_host(N), spks_host(N);
+  for (int i = 0; i < N; ++i) {
+    CosyVoice3State &s = *states[i];
+    const int T_tok = T_pt[i] + T_gen[i];
+    std::vector<int32_t> tokens_host;
+    tokens_host.reserve(T_tok);
+    if (T_pt[i] > 0)
+      tokens_host.insert(tokens_host.end(), s.prompt_token.begin(),
+                         s.prompt_token.end());
+    tokens_host.insert(tokens_host.end(), s.speech_token_ids.begin(),
+                       s.speech_token_ids.end());
+
+    ggml_init_params ip = {FLOW_CTX_BYTES, nullptr, true};
+    ggml_context *ctx = ggml_init(ip);
+    ggml_cgraph *gf = ggml_new_graph_custom(ctx, FLOW_MAX_NODES, false);
+    ggml_tensor *t_gen = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T_tok);
+    ggml_set_input(t_gen);
+    ggml_tensor *t_pf = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, mel_dim_,
+                                           T_pt_mel[i], 1);
+    if (T_pt_mel[i] > 0) ggml_set_input(t_pf);
+    ggml_tensor *t_emb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, spk_dim_in_);
+    ggml_set_input(t_emb);
+
+    auto enc = BuildEncodeGraph(ctx, /*prompt_token=*/nullptr, t_gen, t_pf,
+                                t_emb);
+    ggml_set_output(enc.mu);
+    ggml_set_output(enc.cond);
+    ggml_set_output(enc.spks);
+    ggml_build_forward_expand(gf, enc.mu);
+    ggml_build_forward_expand(gf, enc.cond);
+    ggml_build_forward_expand(gf, enc.spks);
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+      RS_LOG_ERR("Flow-batch: encode alloc failed (slot %d)", i);
+      ggml_free(ctx); return false;
+    }
+    ggml_backend_tensor_set(t_gen, tokens_host.data(), 0,
+                            tokens_host.size() * sizeof(int32_t));
+    if (T_pt_mel[i] > 0)
+      ggml_backend_tensor_set(t_pf, s.prompt_feat.data(), 0,
+                              s.prompt_feat.size() * sizeof(float));
+    ggml_backend_tensor_set(t_emb, s.embedding.data(), 0,
+                            s.embedding.size() * sizeof(float));
+    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+      RS_LOG_ERR("Flow-batch: encode compute failed (slot %d)", i);
+      ggml_free(ctx); return false;
+    }
+    mu_host[i].assign((size_t)mel_dim_ * T_mel[i], 0.f);
+    cond_host[i].assign((size_t)mel_dim_ * T_mel[i], 0.f);
+    spks_host[i].assign((size_t)mel_dim_, 0.f);
+    ggml_backend_tensor_get(enc.mu, mu_host[i].data(), 0,
+                            mu_host[i].size() * sizeof(float));
+    ggml_backend_tensor_get(enc.cond, cond_host[i].data(), 0,
+                            cond_host[i].size() * sizeof(float));
+    ggml_backend_tensor_get(enc.spks, spks_host[i].data(), 0,
+                            spks_host[i].size() * sizeof(float));
+    ggml_free(ctx);
+    ggml_backend_sched_reset(sched);
+  }
+
+  ggml_context *ctx_persist = nullptr;
+  ggml_backend_buffer_t persistent_buf = nullptr;
+  ggml_tensor *mu_dev = nullptr, *cond_dev = nullptr, *spks_dev = nullptr;
+  ggml_tensor *x_dev[2] = {nullptr, nullptr};
+  ggml_tensor *mask_dev = nullptr, *pos_dev = nullptr;
+  auto free_persist = [&]() {
+    if (persistent_buf) ggml_backend_buffer_free(persistent_buf);
+    if (ctx_persist) ggml_free(ctx_persist);
+  };
+  {
+    ggml_init_params ip = {(size_t)16 * ggml_tensor_overhead() + (1 << 18),
+                           nullptr, true};
+    ctx_persist = ggml_init(ip);
+    mu_dev = ggml_new_tensor_3d(ctx_persist, GGML_TYPE_F32, mel_dim_, T_max, N);
+    cond_dev = ggml_new_tensor_3d(ctx_persist, GGML_TYPE_F32, mel_dim_, T_max, N);
+    spks_dev = ggml_new_tensor_2d(ctx_persist, GGML_TYPE_F32, mel_dim_, N);
+    x_dev[0] = ggml_new_tensor_3d(ctx_persist, GGML_TYPE_F32, mel_dim_, T_max, N);
+    x_dev[1] = ggml_new_tensor_3d(ctx_persist, GGML_TYPE_F32, mel_dim_, T_max, N);
+    mask_dev = ggml_new_tensor_4d(ctx_persist, GGML_TYPE_F32, T_max, T_max, 1, B);
+    pos_dev = ggml_new_tensor_2d(ctx_persist, GGML_TYPE_I32, T_max, B);
+    persistent_buf = ggml_backend_alloc_ctx_tensors(ctx_persist, flow_backend);
+    if (!persistent_buf) {
+      RS_LOG_ERR("Flow-batch: persistent alloc failed");
+      free_persist(); return false;
+    }
+  }
+
+  std::vector<float> buf((size_t)mel_dim_ * T_max * N, 0.f);
+  auto fill_3d = [&](ggml_tensor *dev,
+                     const std::vector<std::vector<float>> &src) {
+    std::fill(buf.begin(), buf.end(), 0.f);
+    for (int i = 0; i < N; ++i) {
+      const size_t dst_base = (size_t)i * mel_dim_ * T_max;
+      for (int t = 0; t < T_mel[i]; ++t)
+        std::memcpy(&buf[dst_base + (size_t)t * mel_dim_],
+                    &src[i][(size_t)t * mel_dim_], mel_dim_ * sizeof(float));
+    }
+    ggml_backend_tensor_set(dev, buf.data(), 0, buf.size() * sizeof(float));
+  };
+  fill_3d(mu_dev, mu_host);
+  fill_3d(cond_dev, cond_host);
+  {
+    std::vector<float> spk_buf((size_t)mel_dim_ * N, 0.f);
+    for (int i = 0; i < N; ++i)
+      std::memcpy(&spk_buf[(size_t)i * mel_dim_], spks_host[i].data(),
+                  mel_dim_ * sizeof(float));
+    ggml_backend_tensor_set(spks_dev, spk_buf.data(), 0,
+                            spk_buf.size() * sizeof(float));
+  }
+  {
+    std::fill(buf.begin(), buf.end(), 0.f);
+    std::mt19937 rng(0xC05A3u);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (int i = 0; i < N; ++i) {
+      const size_t dst_base = (size_t)i * mel_dim_ * T_max;
+      for (int t = 0; t < T_mel[i]; ++t)
+        for (int d = 0; d < mel_dim_; ++d)
+          buf[dst_base + (size_t)t * mel_dim_ + d] = nd(rng);
+    }
+    ggml_backend_tensor_set(x_dev[0], buf.data(), 0, buf.size() * sizeof(float));
+  }
+  {
+    std::vector<float> mbuf((size_t)T_max * T_max * B, 0.f);
+    for (int i = 0; i < N; ++i) {
+      for (int c = 0; c < 2; ++c) {
+        const int b = 2 * i + c;
+        for (int t = 0; t < T_max; ++t)
+          for (int k = 0; k < T_max; ++k) {
+            const size_t idx = (size_t)t + (size_t)k * T_max +
+                               (size_t)b * T_max * T_max;
+            mbuf[idx] = (t < T_mel[i] && k < T_mel[i]) ? 0.f : -1e4f;
+          }
+      }
+    }
+    ggml_backend_tensor_set(mask_dev, mbuf.data(), 0,
+                            mbuf.size() * sizeof(float));
+  }
+  {
+    std::vector<int32_t> pbuf((size_t)T_max * B, 0);
+    for (int i = 0; i < N; ++i) {
+      for (int c = 0; c < 2; ++c) {
+        const int b = 2 * i + c;
+        for (int t = 0; t < T_mel[i]; ++t)
+          pbuf[(size_t)t + (size_t)b * T_max] = t;
+      }
+    }
+    ggml_backend_tensor_set(pos_dev, pbuf.data(), 0,
+                            pbuf.size() * sizeof(int32_t));
+  }
+
+  const int local_steps = euler_steps_;
+  for (int step = 0; step < local_steps; ++step) {
+    const float t = t_span_[step];
+    const float dt = t_span_[step + 1] - t_span_[step];
+    const int src = step & 1, dst = (step + 1) & 1;
+    ggml_init_params ip = {FLOW_CTX_BYTES, nullptr, true};
+    ggml_context *ctx = ggml_init(ip);
+    ggml_cgraph *gf = ggml_new_graph_custom(ctx, FLOW_MAX_NODES, false);
+    ggml_tensor *pos_out = nullptr;
+    ggml_tensor *x_next = BuildCFMStepGraph_Batch(
+        ctx, x_dev[src], mu_dev, spks_dev, cond_dev, mask_dev, N, t, dt, pos_out);
+    ggml_set_output(x_next);
+    ggml_build_forward_expand(gf, x_next);
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+      RS_LOG_ERR("Flow-batch: step %d alloc failed", step);
+      ggml_free(ctx); free_persist(); return false;
+    }
+    if (pos_out) {
+      ggml_backend_tensor_copy(pos_dev, pos_out);
+    }
+    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+      RS_LOG_ERR("Flow-batch: step %d compute failed", step);
+      ggml_free(ctx); free_persist(); return false;
+    }
+    ggml_backend_tensor_get(x_next, buf.data(), 0,
+                            (size_t)mel_dim_ * T_max * N * sizeof(float));
+    ggml_backend_tensor_set(x_dev[dst], buf.data(), 0,
+                            (size_t)mel_dim_ * T_max * N * sizeof(float));
+    ggml_free(ctx);
+    ggml_backend_sched_reset(sched);
+  }
+
+  {
+    const int final_buf = local_steps & 1;
+    std::vector<float> xout((size_t)mel_dim_ * T_max * N, 0.f);
+    ggml_backend_tensor_get(x_dev[final_buf], xout.data(), 0,
+                            xout.size() * sizeof(float));
+    for (int i = 0; i < N; ++i) {
+      const size_t base = (size_t)i * mel_dim_ * T_max;
+      const int T_gen_mel_i = T_gen_mel[i];
+      const int T_pt_mel_i = T_pt_mel[i];
+      states[i]->mel_output.assign((size_t)T_gen_mel_i * mel_dim_, 0.f);
+      for (int t = 0; t < T_gen_mel_i; ++t)
+        std::memcpy(&states[i]->mel_output[(size_t)t * mel_dim_],
+                    &xout[base + (size_t)(T_pt_mel_i + t) * mel_dim_],
+                    mel_dim_ * sizeof(float));
+      states[i]->flow_done = true;
+    }
+  }
+  free_persist();
+  return true;
 }
 
 // =====================================================================
@@ -996,13 +1362,25 @@ bool CosyVoice3FlowModel::RunFlowStreaming(CosyVoice3State &state,
 
   // -----------------------------------------------------------------------
   // Initial x: standard Gaussian noise [mel_dim, T_mel, 1]. Seeded so test
-  // runs are deterministic.
+  // runs are deterministic. Streaming uses the position-stable buffer
+  // pre-generated by DecodeStream (upstream CausalConditionalCFM.rand_noise
+  // semantics: mel frame t sees the same noise in every chunk it appears
+  // in, lookahead re-compute and finalize pass included) — without it each
+  // chunk re-rolls the overlap region and every boundary is a seam between
+  // two different noise realizations. Offline keeps the fresh draw.
   // -----------------------------------------------------------------------
   std::vector<float> h_x((size_t)mel_dim_ * T_mel);
   {
+    // Advance state.rng exactly once in both modes so the downstream HiFT
+    // noise sequence is unchanged by the stable-noise path.
     std::mt19937 rng(state.rng());
-    std::normal_distribution<float> nd(0.f, 1.f);
-    for (auto &v : h_x) v = nd(rng);
+    if (state.stream_noise.size() >= h_x.size()) {
+      std::memcpy(h_x.data(), state.stream_noise.data(),
+                  h_x.size() * sizeof(float));
+    } else {
+      std::normal_distribution<float> nd(0.f, 1.f);
+      for (auto &v : h_x) v = nd(rng);
+    }
   }
   ggml_backend_tensor_set(x_dev[0], h_x.data(), 0,
                           h_x.size() * sizeof(float));

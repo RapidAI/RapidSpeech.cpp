@@ -43,6 +43,11 @@ ggml_tensor *conv1d(ggml_context *ctx, ggml_tensor *w, ggml_tensor *b,
   ggml_tensor *im = ggml_im2col(ctx, w, x, stride, 0, 0, 0, dilation, 0,
                                 false, GGML_TYPE_F16);
   ggml_tensor *wm = ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1], w->ne[2]);
+  // Batched (ne[2]=N>1): broadcast the weight across the batch so mul_mat
+  // keeps the batch dim (result batch = b-arg's ne[2]).
+  if (im->ne[2] > 1) {
+    wm = ggml_repeat_4d(ctx, wm, wm->ne[0], wm->ne[1], im->ne[2], wm->ne[3]);
+  }
   ggml_tensor *y  = ggml_mul_mat(ctx, im, wm);
   y = ggml_reshape_3d(ctx, y, im->ne[1], w->ne[2], x->ne[2]);
   if (b) y = ggml_add(ctx, y, unsqueeze0(ctx, b));
@@ -671,6 +676,141 @@ bool CosyVoice3HiFTModel::RunHiFT(CosyVoice3State &state,
   state.hift_done = true;
   RS_LOG_INFO("HiFT: produced %zu samples @ %d Hz", state.audio_output.size(),
               sample_rate_);
+  return true;
+}
+
+// Batched vocoder: N states' mels -> PCM in one F0 + one main forward.
+bool CosyVoice3HiFTModel::RunHiFT_Batch(CosyVoice3State **states, int n,
+                                        ggml_backend_sched_t sched) {
+  if (n <= 0) return true;
+  if (n == 1) {
+    return RunHiFT(*states[0], sched);
+  }
+  const int mel_dim = 80;
+  const int Nbin = n_fft_ / 2 + 1;          // 9
+  const int up = scale_factor_ / 4;          // 120 (= prod of upsample rates)
+
+  // Per-slot dimensions + maxes.
+  std::vector<int> T_mel(n), T_post(n), T_stft(n);
+  int T_mel_max = 0, T_stft_max = 0, T_post_max = 0;
+  for (int i = 0; i < n; ++i) {
+    if (states[i]->mel_output.empty()) {
+      RS_LOG_ERR("HiFT-batch: slot %d empty mel", i);
+      return false;
+    }
+    T_mel[i] = (int)(states[i]->mel_output.size() / mel_dim);
+    T_post[i] = T_mel[i] * up;
+    T_stft[i] = T_mel[i] * up + 1;
+    T_mel_max = std::max(T_mel_max, T_mel[i]);
+    T_stft_max = std::max(T_stft_max, T_stft[i]);
+    T_post_max = std::max(T_post_max, T_post[i]);
+    states[i]->audio_output.clear();
+    states[i]->hift_done = false;
+  }
+
+  constexpr int HIFT_MAX_NODES = 8192;
+  constexpr size_t HIFT_CTX_BYTES =
+      HIFT_MAX_NODES * (sizeof(ggml_tensor) + 256);
+
+  // Padded mel batch [80, T_mel_max, N] (ne[0]=80 fastest).
+  std::vector<float> sf_host((size_t)mel_dim * T_mel_max * n, 0.f);
+  for (int i = 0; i < n; ++i) {
+    const size_t base = (size_t)i * mel_dim * T_mel_max;
+    const float *src = states[i]->mel_output.data();
+    for (int t = 0; t < T_mel[i]; ++t) {
+      std::memcpy(&sf_host[base + (size_t)t * mel_dim],
+                  src + (size_t)t * mel_dim, mel_dim * sizeof(float));
+    }
+  }
+
+  // (1) Batched F0 graph: sf [80, T_mel_max, N] -> f0 [T_mel_max, N].
+  std::vector<float> f0_host((size_t)T_mel_max * n, 0.f);
+  {
+    ggml_init_params ip = {HIFT_CTX_BYTES, nullptr, true};
+    ggml_context *ctx = ggml_init(ip);
+    ggml_cgraph *gf = ggml_new_graph_custom(ctx, HIFT_MAX_NODES, false);
+    ggml_tensor *sf = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, mel_dim, T_mel_max, n);
+    ggml_set_input(sf); ggml_set_name(sf, "speech_feat");
+    ggml_tensor *f0 = BuildF0Graph(ctx, sf);
+    ggml_set_output(f0);
+    ggml_build_forward_expand(gf, f0);
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+      RS_LOG_ERR("HiFT-batch: F0 alloc failed"); ggml_free(ctx); return false;
+    }
+    ggml_backend_tensor_set(sf, sf_host.data(), 0, sf_host.size() * sizeof(float));
+    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+      RS_LOG_ERR("HiFT-batch: F0 compute failed"); ggml_free(ctx); return false;
+    }
+    ggml_backend_tensor_get(f0, f0_host.data(), 0, f0_host.size() * sizeof(float));
+    ggml_free(ctx); ggml_backend_sched_reset(sched);
+  }
+
+  // (2) Per-slot CPU source + STFT -> padded s_stft batch [18, T_stft_max, N].
+  std::vector<float> st_host((size_t)18 * T_stft_max * n, 0.f);
+  for (int i = 0; i < n; ++i) {
+    const float *f0_i = f0_host.data() + (size_t)i * T_mel_max;  // [T_mel_max], first T_mel[i] valid
+    std::vector<float> sine_merge;
+    RunSourceCpu(f0_i, T_mel[i], sine_merge, states[i]->rng);
+    std::vector<float> s_real, s_imag;
+    int ts = 0;
+    StftCpu(sine_merge.data(), (int)sine_merge.size(), s_real, s_imag, ts);
+    const size_t base = (size_t)i * 18 * T_stft_max;
+    for (int t = 0; t < T_stft[i]; ++t) {
+      for (int k = 0; k < Nbin; ++k) {
+        st_host[base + (size_t)t * 18 + k]        = s_real[(size_t)t * Nbin + k];
+        st_host[base + (size_t)t * 18 + Nbin + k] = s_imag[(size_t)t * Nbin + k];
+      }
+    }
+  }
+
+  // (3) Batched main graph: sf [80, T_mel_max, N] + st [18, T_stft_max, N]
+  //     -> out [T_post_max, 18, N].
+  std::vector<float> out_host((size_t)T_post_max * 18 * n, 0.f);
+  {
+    ggml_init_params ip = {HIFT_CTX_BYTES, nullptr, true};
+    ggml_context *ctx = ggml_init(ip);
+    ggml_cgraph *gf = ggml_new_graph_custom(ctx, HIFT_MAX_NODES, false);
+    ggml_tensor *sf = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, mel_dim, T_mel_max, n);
+    ggml_set_input(sf); ggml_set_name(sf, "speech_feat");
+    ggml_tensor *st = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 18, T_stft_max, n);
+    ggml_set_input(st); ggml_set_name(st, "s_stft");
+    ggml_tensor *out = BuildMainGraph(ctx, sf, st);
+    ggml_set_output(out);
+    ggml_build_forward_expand(gf, out);
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+      RS_LOG_ERR("HiFT-batch: main alloc failed"); ggml_free(ctx); return false;
+    }
+    ggml_backend_tensor_set(sf, sf_host.data(), 0, sf_host.size() * sizeof(float));
+    ggml_backend_tensor_set(st, st_host.data(), 0, st_host.size() * sizeof(float));
+    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+      RS_LOG_ERR("HiFT-batch: main compute failed"); ggml_free(ctx); return false;
+    }
+    ggml_backend_tensor_get(out, out_host.data(), 0, out_host.size() * sizeof(float));
+    ggml_free(ctx); ggml_backend_sched_reset(sched);
+  }
+
+  // (4) Per-slot unpad + mag/phase split + iSTFT.
+  // out layout (t, c, i): t + c*T_post_max + i*18*T_post_max.
+  for (int i = 0; i < n; ++i) {
+    const size_t base = (size_t)i * 18 * T_post_max;
+    std::vector<float> mag((size_t)Nbin * T_post[i]);
+    std::vector<float> phase((size_t)Nbin * T_post[i]);
+    for (int t = 0; t < T_post[i]; ++t) {
+      for (int k = 0; k < Nbin; ++k) {
+        float lm = out_host[base + (size_t)k * T_post_max + t];
+        float m = std::exp(lm);
+        m = std::max(0.f, std::min(100.f, m));
+        float p_raw = out_host[base + (size_t)(Nbin + k) * T_post_max + t];
+        mag[(size_t)t * Nbin + k]   = m;
+        phase[(size_t)t * Nbin + k] = std::sin(p_raw);
+      }
+    }
+    std::vector<float> pcm;
+    IstftCpu(mag.data(), phase.data(), T_post[i], pcm);
+    for (auto &v : pcm) v = std::max(-audio_limit_, std::min(audio_limit_, v));
+    states[i]->audio_output = std::move(pcm);
+    states[i]->hift_done = true;
+  }
   return true;
 }
 

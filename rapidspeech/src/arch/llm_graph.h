@@ -171,9 +171,32 @@ struct llm_build_opts {
   uint32_t n_kv_max = 0;   // Max KV cache capacity (for GPU-persistent buffers)
   bool fixed_kv_cache_shape = false; // Use n_kv_max-wide decode attention views
 
+  // ── Continuous batching (vLLM-style multi-sequence decode) ──────────────
+  // When n_seq > 1, the forward processes n_seq independent sequences in ONE
+  // pass: n_tokens == n_seq (one query token per sequence), and the attention
+  // uses ggml_flash_attn_ext's 4th dim (ne3=n_seq) so each sequence attends
+  // only over its own KV slice (block isolation via the batch dim, no N^2).
+  // The gpu_kv_k/v buffers must then be the batched layout [kv_dim, n_kv_max,
+  // n_seq] (one shared buffer per layer, slot s owns slice s).
+  // n_seq==1 is the existing single-sequence path (unchanged behaviour).
+  uint32_t n_seq = 1;
+  // Per-sequence write row (column) for ggml_set_rows, length n_seq. nullptr
+  // falls back to the single-index path (set_kv_write_indices).
+  const uint32_t *kv_write_indices = nullptr;
+  // Per-sequence cached-KV length, length n_seq. Used to build the per-seq
+  // causal mask. nullptr falls back to the shared n_kv_cache mask.
+  const uint32_t *n_kv_cache_per_seq = nullptr;
+  // Row offset into the batched [kv_dim, n_kv_max*n_seq] buffer for a single-
+  // sequence prefill (n_seq==1) writing into slot s: s*n_kv_max. 0 for the
+  // non-batched path. Decode (n_seq>1) ignores this - its write_idx already
+  // encodes absolute rows.
+  uint32_t kv_slot_row_offset = 0;
+
   // GPU-persistent KV cache buffers (optional, for O3 optimisation)
   // When provided, build_kv_cache_concat will use a view into these
   // pre-allocated buffers instead of creating new input tensors each step.
+  // n_seq==1: [n_layer] of [kv_dim, n_kv_max].  n_seq>1: [n_layer] of
+  // [kv_dim, n_kv_max, n_seq] (batched, shared across sequences).
   ggml_tensor **gpu_kv_k = nullptr; // [n_layer] array of GPU KV key tensors
   ggml_tensor **gpu_kv_v = nullptr; // [n_layer] array of GPU KV value tensors
 
@@ -288,6 +311,16 @@ public:
                         uint32_t n_tokens);
   void set_causal_mask(ggml_tensor *mask, uint32_t n_tokens,
                        uint32_t n_kv_cache);
+  // Per-sequence causal mask for batched decode (n_seq sequences).
+  // mask shape [n_kv_max, 1, 1, n_seq]; slice s masks key columns
+  // > n_kv_cache_per_seq[s] to -1e4.
+  void set_batched_causal_mask(ggml_tensor *mask, uint32_t n_kv_max,
+                               const uint32_t *n_kv_cache_per_seq,
+                               uint32_t n_seq);
+  // Per-sequence write indices for batched decode (n_seq sequences).
+  // writes the i32 row indices into kv_write_idx_layer_<il> for all layers.
+  void set_kv_write_indices_batched(const uint32_t *indices, uint32_t n_seq,
+                                    uint32_t n_layers);
   void set_kv_write_indices(uint32_t index, uint32_t n_layers);
   void assign_kv_backend(ggml_backend_sched_t sched, ggml_backend_t backend,
                          uint32_t n_layers);
@@ -441,6 +474,13 @@ protected:
    */
   ggml_tensor *build_causal_mask(ggml_context *ctx, uint32_t n_tokens,
                                  uint32_t n_kv_cache = 0);
+
+  // Per-sequence causal mask for batched decode: 4D input tensor
+  // [n_kv_max, 1, 1, n_seq], runtime-filled by set_batched_causal_mask.
+  // ne3=n_seq isolates sequences for ggml_flash_attn_ext (each attends only
+  // over its own n_kv_max keys).
+  ggml_tensor *build_causal_mask_batched(ggml_context *ctx, uint32_t n_kv_max,
+                                         uint32_t n_seq);
 
   /**
    * Build attention bias for QK

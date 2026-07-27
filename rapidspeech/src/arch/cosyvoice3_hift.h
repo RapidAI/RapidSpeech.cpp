@@ -62,6 +62,17 @@ public:
   bool RunHiFT(CosyVoice3State &state, ggml_backend_sched_t sched);
 
   /**
+   * Batched vocoder: synthesize PCM for N states in one forward. Mels are
+   * padded to T_mel_max along the time axis (zero-pad after - safe because
+   * every HiFT conv is causal, so trailing pad doesn't affect real outputs)
+   * and run through the F0 + main graphs with ne[2]=N. The CPU NSF source /
+   * STFT / iSTFT bookends run per-slot (cheap, n_fft=16). Each state gets its
+   * own unpadded audio_output. No attention -> no cross-slot mask needed.
+   */
+  bool RunHiFT_Batch(CosyVoice3State **states, int n,
+                     ggml_backend_sched_t sched);
+
+  /**
    * Streaming variant used by `CosyVoice3LMModel::DecodeStream`. Synthesizes
    * PCM for `mel_chunk` (row-major `[mel_chunk_T, mel_dim_=80]`), carrying
    * over `state.hift_stream` between calls so chunk boundaries crossfade

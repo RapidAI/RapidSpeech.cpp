@@ -46,14 +46,14 @@ std::vector<float> project_speech_logits(ggml_backend_sched_t sched,
                                          ggml_tensor *speech_lm_head,
                                          float rms_eps,
                                          const float *hidden, int d_model,
-                                         int speech_vocab,
+                                         int speech_vocab, int n,
                                          std::function<void(struct ggml_tensor *)> *imatrix_cb) {
   ggml_init_params ip = {ggml_graph_overhead() + 8 * ggml_tensor_overhead(), nullptr,
                           true};
   ggml_context *ctx = ggml_init(ip);
   ggml_cgraph *gf = ggml_new_graph(ctx);
 
-  ggml_tensor *h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model, 1);
+  ggml_tensor *h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model, n);
   ggml_set_name(h, "cv3_hidden_in");
   ggml_set_input(h);
 
@@ -78,14 +78,14 @@ std::vector<float> project_speech_logits(ggml_backend_sched_t sched,
     ggml_free(ctx);
     return {};
   }
-  ggml_backend_tensor_set(h, hidden, 0, (size_t)d_model * sizeof(float));
+  ggml_backend_tensor_set(h, hidden, 0, (size_t)d_model * n * sizeof(float));
   if (cv3_sched_compute(sched, gf, imatrix_cb) != GGML_STATUS_SUCCESS) {
     RS_LOG_ERR("CosyVoice3-LLM: speech_lm_head compute failed");
     ggml_free(ctx);
     return {};
   }
 
-  std::vector<float> out((size_t)speech_vocab);
+  std::vector<float> out((size_t)speech_vocab * n);
   ggml_backend_tensor_get(logits, out.data(), 0, out.size() * sizeof(float));
 
   ggml_free(ctx);
@@ -444,7 +444,7 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
   // ----- Project last hidden → speech logits.
   std::vector<float> logits = project_speech_logits(
       sched, llm_model_->output_norm(), llm_model_->speech_lm_head(),
-      hp.f_norm_rms_eps, last_hidden.data(), d_model, speech_vocab_,
+      hp.f_norm_rms_eps, last_hidden.data(), d_model, speech_vocab_, 1,
       &imatrix_cb_);
   if ((int)logits.size() != speech_vocab_) {
     RS_LOG_ERR("CosyVoice3-LLM: empty step-0 logits");
@@ -671,7 +671,7 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
     // Project hidden → logits via speech_lm_head.
     std::vector<float> step_logits = project_speech_logits(
         sched, llm_model_->output_norm(), llm_model_->speech_lm_head(),
-        hp.f_norm_rms_eps, step_hidden.data(), d_model, speech_vocab_,
+        hp.f_norm_rms_eps, step_hidden.data(), d_model, speech_vocab_, 1,
         &imatrix_cb_);
     if ((int)step_logits.size() != speech_vocab_) {
       RS_LOG_ERR("CosyVoice3-LLM: AR step %d empty logits", step);
@@ -768,6 +768,474 @@ bool CosyVoice3LMModel::RunLM(CosyVoice3State &s, ggml_backend_sched_t sched) {
       std::fclose(fp);
       RS_LOG_INFO("CosyVoice3-LLM: dumped %zu speech tokens -> %s",
                   s.speech_token_ids.size(), p);
+    }
+  }
+  return true;
+}
+
+// =====================================================================
+// Continuous-batching interface — RunLM split into Prefill + Step so a
+// scheduler can interleave AR steps of several requests (see
+// cosyvoice3_batch.h). Mirrors RunLM exactly minus the debug dumps.
+// =====================================================================
+
+bool CosyVoice3LMModel::RunLM_Prefill(CosyVoice3State &s,
+                                      CosyVoice3LMSlot &slot,
+                                      ggml_backend_sched_t sched) {
+  if (!llm_model_) return false;
+  if (s.text_token_ids.empty()) {
+    RS_LOG_ERR("CosyVoice3-batch: empty text — call PushText first");
+    return false;
+  }
+
+  // Voice prep (same requirement as Decode(): the LM is OOD without a
+  // voice prior — see the comment there).
+  if (flow_ready_ && hift_ready_) {
+    if (!PrepareVoice(s, sched)) return false;
+  }
+
+  const auto &hp = llm_model_->hparams();
+  const int n_layer = (int)hp.n_layer;
+  const int d_model = (int)hp.n_embd;
+  const int n_head_kv = (int)(hp.n_head_kv > 0 ? hp.n_head_kv : hp.n_head);
+  const int head_dim = (int)hp.head_dim;
+  const int kv_dim = head_dim * n_head_kv;
+
+  s.speech_token_ids.clear();
+  s.n_cached = 0;
+
+  const int32_t sos_id  = speech_codebook_;
+  const int32_t task_id = speech_codebook_ + 2;
+  const int32_t eop_id  = 151646;
+
+  const bool instruct_mode = !s.instruct_text_token_ids.empty();
+  const std::vector<int32_t> &lm_prompt_text_ids =
+      instruct_mode ? s.instruct_text_token_ids : s.prompt_text_token_ids;
+
+  std::vector<int32_t> sys_prefix_ids = llm_model_->vocab().tokenize(
+      std::string("You are a helpful assistant."), false);
+
+  std::vector<int32_t> combined_text;
+  combined_text.reserve(sys_prefix_ids.size() + 1 + lm_prompt_text_ids.size() +
+                        s.text_token_ids.size());
+  combined_text.insert(combined_text.end(), sys_prefix_ids.begin(),
+                       sys_prefix_ids.end());
+  combined_text.push_back(eop_id);
+  combined_text.insert(combined_text.end(), lm_prompt_text_ids.begin(),
+                       lm_prompt_text_ids.end());
+  combined_text.insert(combined_text.end(), s.text_token_ids.begin(),
+                       s.text_token_ids.end());
+
+  const int n_text  = (int)combined_text.size();
+  const int n_pt    = instruct_mode ? 0 : (int)s.prompt_token.size();
+  const int total_T = 1 + n_text + 1 + n_pt;
+
+  // ── prefill embed buffer [total_T, d_model] ──────────────────────────────
+  std::vector<float> prefill_emb((size_t)total_T * d_model);
+  {
+    auto get_rows_f32 = [&](ggml_tensor *embd_w,
+                            const std::vector<int32_t> &ids) -> std::vector<float> {
+      ggml_init_params ip = {ggml_graph_overhead() + 4 * ggml_tensor_overhead(),
+                              nullptr, true};
+      ggml_context *c = ggml_init(ip);
+      ggml_tensor *id_t = ggml_new_tensor_1d(c, GGML_TYPE_I32, (int64_t)ids.size());
+      ggml_set_input(id_t);
+      ggml_tensor *out = ggml_get_rows(c, embd_w, id_t);
+      ggml_set_output(out);
+      ggml_cgraph *gf = ggml_new_graph(c);
+      ggml_build_forward_expand(gf, out);
+      if (!ggml_backend_sched_alloc_graph(sched, gf)) { ggml_free(c); return {}; }
+      ggml_backend_tensor_set(id_t, ids.data(), 0, ids.size() * sizeof(int32_t));
+      ggml_backend_sched_graph_compute(sched, gf);
+      std::vector<float> buf(ids.size() * (size_t)d_model);
+      ggml_backend_tensor_get(out, buf.data(), 0, buf.size() * sizeof(float));
+      ggml_free(c);
+      ggml_backend_sched_reset(sched);
+      return buf;
+    };
+
+    auto sos_emb = get_rows_f32(llm_model_->speech_embd(), {sos_id});
+    if (sos_emb.empty()) return false;
+    std::copy(sos_emb.begin(), sos_emb.end(), prefill_emb.begin());
+
+    if (!combined_text.empty()) {
+      auto text_emb = get_rows_f32(llm_model_->tok_embd(), combined_text);
+      if (text_emb.empty()) return false;
+      std::copy(text_emb.begin(), text_emb.end(), prefill_emb.begin() + d_model);
+    }
+
+    auto task_emb = get_rows_f32(llm_model_->speech_embd(), {task_id});
+    if (task_emb.empty()) return false;
+    std::copy(task_emb.begin(), task_emb.end(),
+              prefill_emb.begin() + (size_t)(1 + n_text) * d_model);
+
+    if (n_pt > 0) {
+      auto pt_emb = get_rows_f32(llm_model_->speech_embd(), s.prompt_token);
+      if (pt_emb.empty()) return false;
+      std::copy(pt_emb.begin(), pt_emb.end(),
+                prefill_emb.begin() + (size_t)(1 + n_text + 1) * d_model);
+    }
+  }
+
+  // ── builder + KV cache (shared batched buffer, slot owns a slice) ────────
+  // The batched KV buffer [kv_dim, n_kv_max * n_slots] per layer is allocated
+  // once by InitBatchKV; this prefill writes slot.slot_index's slice. n_kv_max
+  // is the shared batch capacity (same for all slots).
+  if (batch_n_slots_ <= 0 || !batch_kv_buf_) {
+    RS_LOG_ERR("CosyVoice3-batch: InitBatchKV not called before prefill");
+    return false;
+  }
+  if (slot.n_kv_max <= 0) slot.n_kv_max = batch_n_kv_max_;
+
+  llm_cparams cparams;
+  cparams.n_ctx = (uint32_t)(batch_n_kv_max_ + 32);
+  cparams.n_batch = (uint32_t)total_T;
+  cparams.n_ubatch = cparams.n_batch;
+  cparams.flash_attn = true;
+  slot.cparams = cparams;  // builder holds a ref to this - must outlive it
+  slot.builder = std::make_unique<llm_build_qwen2>(*llm_model_, slot.cparams, sched);
+
+  // Zero this slot's slice so unused KV columns don't leak across requests.
+  ggml_backend_t gpu_b = pick_gpu_backend(sched, backend_);
+  {
+    std::vector<float> zero_kv((size_t)kv_dim * slot.n_kv_max, 0.0f);
+    const size_t slot_off =
+        (size_t)slot.slot_index * (size_t)slot.n_kv_max * (size_t)kv_dim *
+        sizeof(float);
+    for (int il = 0; il < n_layer; ++il) {
+      ggml_backend_tensor_set(batch_kv_k_[(size_t)il], zero_kv.data(),
+                              slot_off, zero_kv.size() * sizeof(float));
+      ggml_backend_tensor_set(batch_kv_v_[(size_t)il], zero_kv.data(),
+                              slot_off, zero_kv.size() * sizeof(float));
+    }
+  }
+
+  // ── prefill forward ─────────────────────────────────────────────────────
+  std::vector<llm_pos> positions(total_T);
+  for (int i = 0; i < total_T; ++i) positions[i] = i;
+
+  ggml_init_params ep = {ggml_graph_overhead() + 4 * ggml_tensor_overhead(),
+                          nullptr, true};
+  ggml_context *ctx_emb = ggml_init(ep);
+  ggml_tensor *emb_in =
+      ggml_new_tensor_2d(ctx_emb, GGML_TYPE_F32, d_model, total_T);
+  ggml_set_name(emb_in, "cv3_prefill_emb");
+  ggml_set_input(emb_in);
+
+  llm_build_opts pf_opts;
+  pf_opts.output_mode = llm_output_mode::OUTPUT_EMBEDDINGS;
+  pf_opts.skip_embeddings = true;
+  pf_opts.skip_output_norm = false;
+  pf_opts.skip_lm_head = true;
+  pf_opts.use_kv_cache = true;
+  pf_opts.update_kv_cache = true;
+  pf_opts.n_kv_max = (uint32_t)slot.n_kv_max;
+  pf_opts.kv_slot_row_offset = (uint32_t)slot.slot_index * (uint32_t)slot.n_kv_max;
+  pf_opts.gpu_kv_k = batch_kv_k_.data();
+  pf_opts.gpu_kv_v = batch_kv_v_.data();
+  pf_opts.causal_mask = true;
+
+  auto pf = slot.builder->build_graph_from_embeds(
+      emb_in, (uint32_t)total_T, nullptr, positions.data(), &pf_opts);
+  if (!pf) {
+    ggml_free(ctx_emb);
+    return false;
+  }
+
+  pf->assign_kv_backend(sched, gpu_b, n_layer);
+  if (!ggml_backend_sched_alloc_graph(sched, pf->get_graph())) {
+    ggml_free(ctx_emb);
+    return false;
+  }
+
+  ggml_backend_tensor_set(emb_in, prefill_emb.data(), 0,
+                          prefill_emb.size() * sizeof(float));
+  if (auto *pt = pf->get_input_tensor("position_ids")) {
+    pf->set_position_ids(pt, positions.data(), (uint32_t)total_T);
+  }
+  if (auto *m = pf->get_input_tensor("causal_mask")) {
+    pf->set_causal_mask(m, (uint32_t)total_T, 0);
+  }
+
+  if (cv3_sched_compute(sched, pf->get_graph(), &imatrix_cb_) !=
+      GGML_STATUS_SUCCESS) {
+    ggml_free(ctx_emb);
+    return false;
+  }
+
+  ggml_tensor *embd = pf->get_embd();
+  if (!embd) {
+    ggml_free(ctx_emb);
+    return false;
+  }
+  std::vector<float> last_hidden((size_t)d_model);
+  {
+    const size_t row_bytes = (size_t)d_model * sizeof(float);
+    ggml_backend_tensor_get(embd, last_hidden.data(),
+                            (size_t)(total_T - 1) * row_bytes, row_bytes);
+  }
+  s.n_cached = (uint32_t)total_T;
+  ggml_free(ctx_emb);
+  ggml_backend_sched_reset(sched);
+
+  // ── first token ─────────────────────────────────────────────────────────
+  std::vector<float> logits = project_speech_logits(
+      sched, llm_model_->output_norm(), llm_model_->speech_lm_head(),
+      hp.f_norm_rms_eps, last_hidden.data(), d_model, speech_vocab_, 1,
+      &imatrix_cb_);
+  if ((int)logits.size() != speech_vocab_) {
+    return false;
+  }
+
+  const int n_tts_text = (int)s.text_token_ids.size();
+  slot.min_len = n_tts_text * 2;
+  slot.max_len = std::min(s.max_speech_tokens, n_tts_text * 20);
+  slot.step = 0;
+  slot.done = false;
+
+  if (0 < slot.min_len) {
+    for (int i = speech_codebook_; i < (int)logits.size(); ++i)
+      logits[i] = -std::numeric_limits<float>::infinity();
+  }
+
+  int32_t tok = cosyvoice3_sample_ras(logits.data(), speech_vocab_,
+                                      s.speech_token_ids, s.sampler, s.rng);
+  if (tok >= speech_codebook_) {
+    RS_LOG_INFO("CosyVoice3-batch: stop on first sample (id=%d)", tok);
+    slot.done = true;
+    return true;
+  }
+  s.speech_token_ids.push_back(tok);
+  slot.cur_tok = tok;
+  return true;
+}
+
+// ── Shared batched KV allocation ───────────────────────────────────────────
+bool CosyVoice3LMModel::InitBatchKV(int n_slots, int n_kv_max,
+                                    ggml_backend_sched_t sched) {
+  FreeBatchKV();
+  if (n_slots <= 0 || n_kv_max <= 0 || !llm_model_) return false;
+
+  const auto &hp = llm_model_->hparams();
+  const int n_layer = (int)hp.n_layer;
+  const int n_head_kv = (int)(hp.n_head_kv > 0 ? hp.n_head_kv : hp.n_head);
+  const int head_dim = (int)hp.head_dim;
+  const int kv_dim = head_dim * n_head_kv;
+
+  batch_n_slots_ = n_slots;
+  batch_n_kv_max_ = n_kv_max;
+  batch_kv_k_.assign((size_t)n_layer, nullptr);
+  batch_kv_v_.assign((size_t)n_layer, nullptr);
+
+  ggml_init_params kv_params = {
+      (size_t)(n_layer * 2 + 4) * ggml_tensor_overhead() + (1 << 16), nullptr,
+      true};
+  batch_kv_ctx_ = ggml_init(kv_params);
+  for (int il = 0; il < n_layer; ++il) {
+    // [kv_dim, n_kv_max * n_slots]: slot s owns rows [s*n_kv_max, ...].
+    batch_kv_k_[(size_t)il] = ggml_new_tensor_2d(batch_kv_ctx_, GGML_TYPE_F32,
+                                                  kv_dim, (int64_t)n_kv_max * n_slots);
+    batch_kv_v_[(size_t)il] = ggml_new_tensor_2d(batch_kv_ctx_, GGML_TYPE_F32,
+                                                  kv_dim, (int64_t)n_kv_max * n_slots);
+    ggml_set_name(batch_kv_k_[(size_t)il],
+                  ("cv3_batch_kv_k_" + std::to_string(il)).c_str());
+    ggml_set_name(batch_kv_v_[(size_t)il],
+                  ("cv3_batch_kv_v_" + std::to_string(il)).c_str());
+  }
+  ggml_backend_t gpu_b = pick_gpu_backend(sched, backend_);
+  batch_kv_buf_ = ggml_backend_alloc_ctx_tensors(batch_kv_ctx_, gpu_b);
+  if (!batch_kv_buf_) {
+    RS_LOG_ERR("CosyVoice3-batch: failed to alloc batched GPU KV cache");
+    FreeBatchKV();
+    return false;
+  }
+  std::vector<float> zero((size_t)kv_dim * n_kv_max * n_slots, 0.0f);
+  for (int il = 0; il < n_layer; ++il) {
+    ggml_backend_tensor_set(batch_kv_k_[(size_t)il], zero.data(), 0,
+                            zero.size() * sizeof(float));
+    ggml_backend_tensor_set(batch_kv_v_[(size_t)il], zero.data(), 0,
+                            zero.size() * sizeof(float));
+  }
+  RS_LOG_INFO("CosyVoice3-batch: alloc batched KV n_slots=%d n_kv_max=%d "
+              "(%.1f MiB)", n_slots, n_kv_max,
+              (double)(kv_dim * n_kv_max * n_slots * 2 * n_layer * 4) / 1048576.0);
+  return true;
+}
+
+void CosyVoice3LMModel::FreeBatchKV() {
+  if (batch_kv_buf_) { ggml_backend_buffer_free(batch_kv_buf_); batch_kv_buf_ = nullptr; }
+  if (batch_kv_ctx_) { ggml_free(batch_kv_ctx_); batch_kv_ctx_ = nullptr; }
+  batch_kv_k_.clear();
+  batch_kv_v_.clear();
+  batch_n_slots_ = 0;
+  batch_n_kv_max_ = 0;
+}
+
+void CosyVoice3LMModel::CopyBatchKVSlice(int src_slot, int dst_slot) {
+  if (src_slot == dst_slot || !batch_kv_buf_ || !llm_model_) return;
+  const auto &hp = llm_model_->hparams();
+  const int n_layer = (int)hp.n_layer;
+  const int n_head_kv = (int)(hp.n_head_kv > 0 ? hp.n_head_kv : hp.n_head);
+  const int kv_dim = (int)hp.head_dim * n_head_kv;
+  const size_t slice_f = (size_t)kv_dim * batch_n_kv_max_;
+  const size_t slice_bytes = slice_f * sizeof(float);
+  std::vector<float> buf(slice_f);
+  for (int il = 0; il < n_layer; ++il) {
+    const size_t so = (size_t)src_slot * slice_bytes;
+    const size_t doff = (size_t)dst_slot * slice_bytes;
+    ggml_backend_tensor_get(batch_kv_k_[(size_t)il], buf.data(), so, slice_bytes);
+    ggml_backend_tensor_set(batch_kv_k_[(size_t)il], buf.data(), doff, slice_bytes);
+    ggml_backend_tensor_get(batch_kv_v_[(size_t)il], buf.data(), so, slice_bytes);
+    ggml_backend_tensor_set(batch_kv_v_[(size_t)il], buf.data(), doff, slice_bytes);
+  }
+}
+
+// Single-slot step: delegate to the batched path with n=1.
+bool CosyVoice3LMModel::RunLM_Step(CosyVoice3State &s,
+                                   CosyVoice3LMSlot &slot,
+                                   ggml_backend_sched_t sched) {
+  CosyVoice3State *sp = &s;
+  CosyVoice3LMSlot *slp = &slot;
+  return RunLM_Step_Batch(&sp, &slp, 1, sched);
+}
+
+// ── Batched AR decode step (vLLM-style continuous batching) ────────────────
+// Runs n slots' current tokens through ONE forward pass. n=1 takes the
+// ordinary single-seq decode branch (n_seq==1); n>1 takes the ne3-batched
+// flash-attn path where each sequence attends only over its own KV slice.
+bool CosyVoice3LMModel::RunLM_Step_Batch(CosyVoice3State **states,
+                                         CosyVoice3LMSlot **slots, int n,
+                                         ggml_backend_sched_t sched) {
+  if (!llm_model_ || n <= 0) return false;
+  for (int i = 0; i < n; ++i) {
+    if (!slots[i]->builder || slots[i]->done) return false;
+  }
+  if (batch_n_slots_ <= 0 || !batch_kv_buf_) {
+    RS_LOG_ERR("CosyVoice3-batch: InitBatchKV not called before step");
+    return false;
+  }
+
+  const auto &hp = llm_model_->hparams();
+  const int n_layer = (int)hp.n_layer;
+  const int d_model = (int)hp.n_embd;
+  ggml_backend_t gpu_b = pick_gpu_backend(sched, backend_);
+
+  ggml_init_params sp = {128 * ggml_tensor_overhead() + (1 << 18), nullptr,
+                          true};
+  ggml_context *ctx_step = ggml_init(sp);
+
+  ggml_tensor *id_in = ggml_new_tensor_1d(ctx_step, GGML_TYPE_I32, n);
+  ggml_set_name(id_in, "cv3_speech_id");
+  ggml_set_input(id_in);
+  ggml_tensor *embed =
+      ggml_get_rows(ctx_step, llm_model_->speech_embd(), id_in); // [d_model, n]
+
+  llm_build_opts dec_opts;
+  dec_opts.output_mode = llm_output_mode::OUTPUT_EMBEDDINGS;
+  dec_opts.skip_embeddings = true;
+  dec_opts.skip_lm_head = true;
+  dec_opts.use_kv_cache = true;
+  dec_opts.is_decode_step = true;
+  dec_opts.causal_mask = true;
+  dec_opts.n_kv_max = (uint32_t)batch_n_kv_max_;
+  dec_opts.fixed_kv_cache_shape = true;
+  dec_opts.n_seq = (uint32_t)n;
+  dec_opts.gpu_kv_k = batch_kv_k_.data();
+  dec_opts.gpu_kv_v = batch_kv_v_.data();
+
+  std::vector<llm_pos> pos(n);
+  std::vector<uint32_t> write_idx(n);
+  std::vector<uint32_t> n_cached_per_seq(n);
+  for (int i = 0; i < n; ++i) {
+    pos[i] = (llm_pos)states[i]->n_cached;
+    n_cached_per_seq[i] = states[i]->n_cached;
+    write_idx[i] = (uint32_t)slots[i]->slot_index * (uint32_t)batch_n_kv_max_ +
+                   states[i]->n_cached;
+  }
+  if (n == 1) {
+    dec_opts.kv_slot_row_offset =
+        (uint32_t)slots[0]->slot_index * (uint32_t)batch_n_kv_max_;
+  }
+
+  auto dec = slots[0]->builder->build_graph_from_embeds(embed, (uint32_t)n,
+                                                        nullptr, pos.data(),
+                                                        &dec_opts);
+  if (!dec) { ggml_free(ctx_step); return false; }
+
+  dec->assign_kv_backend(sched, gpu_b, n_layer);
+  if (!ggml_backend_sched_alloc_graph(sched, dec->get_graph())) {
+    ggml_free(ctx_step);
+    return false;
+  }
+
+  {
+    std::vector<int32_t> toks(n);
+    for (int i = 0; i < n; ++i) toks[i] = slots[i]->cur_tok;
+    ggml_backend_tensor_set(id_in, toks.data(), 0, n * sizeof(int32_t));
+  }
+  if (auto *pt = dec->get_input_tensor("position_ids")) {
+    dec->set_position_ids(pt, pos.data(), (uint32_t)n);
+  }
+  if (auto *m = dec->get_input_tensor("causal_mask")) {
+    if (n > 1) {
+      dec->set_batched_causal_mask(m, (uint32_t)batch_n_kv_max_,
+                                   n_cached_per_seq.data(), (uint32_t)n);
+    } else {
+      dec->set_causal_mask(m, 1, states[0]->n_cached);
+    }
+  }
+  if (n > 1) {
+    dec->set_kv_write_indices_batched(write_idx.data(), (uint32_t)n, n_layer);
+  } else {
+    dec->set_kv_write_indices(write_idx[0], n_layer);
+  }
+
+  if (cv3_sched_compute(sched, dec->get_graph(), &imatrix_cb_) !=
+      GGML_STATUS_SUCCESS) {
+    ggml_free(ctx_step);
+    return false;
+  }
+
+  std::vector<float> step_hidden((size_t)d_model * n);
+  if (ggml_tensor *h = dec->get_embd()) {
+    ggml_backend_tensor_get(h, step_hidden.data(), 0,
+                            (size_t)d_model * n * sizeof(float));
+  }
+  for (int i = 0; i < n; ++i) states[i]->n_cached++;
+  ggml_free(ctx_step);
+  ggml_backend_sched_reset(sched);
+
+  std::vector<float> all_logits = project_speech_logits(
+      sched, llm_model_->output_norm(), llm_model_->speech_lm_head(),
+      hp.f_norm_rms_eps, step_hidden.data(), d_model, speech_vocab_, n,
+      &imatrix_cb_);
+  if ((int)all_logits.size() != speech_vocab_ * n) return false;
+
+  for (int i = 0; i < n; ++i) {
+    const float *lg = all_logits.data() + (size_t)i * speech_vocab_;
+    std::vector<float> lg_vec(lg, lg + speech_vocab_);
+    if (slots[i]->step + 1 < slots[i]->min_len) {
+      for (int t = speech_codebook_; t < speech_vocab_; ++t)
+        lg_vec[(size_t)t] = -std::numeric_limits<float>::infinity();
+    }
+    int32_t next = cosyvoice3_sample_ras(lg_vec.data(), speech_vocab_,
+                                         states[i]->speech_token_ids,
+                                         states[i]->sampler, states[i]->rng);
+    slots[i]->step++;
+
+    if (next >= speech_codebook_) {
+      RS_LOG_INFO("CosyVoice3-batch: slot %d EOS at step %d (%zu tokens)",
+                  slots[i]->slot_index, slots[i]->step,
+                  states[i]->speech_token_ids.size());
+      slots[i]->done = true;
+      continue;
+    }
+    states[i]->speech_token_ids.push_back(next);
+    slots[i]->cur_tok = next;
+    if (slots[i]->step >= slots[i]->max_len) {
+      RS_LOG_INFO("CosyVoice3-batch: slot %d max_len %d reached",
+                  slots[i]->slot_index, slots[i]->max_len);
+      slots[i]->done = true;
     }
   }
   return true;
