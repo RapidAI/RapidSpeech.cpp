@@ -375,11 +375,10 @@ bool VoxCPM2Model::LoadDiT(struct gguf_context *ctx_gguf)
         metadata_size += ggml_tensor_overhead();
     }
     metadata_size += 64 * 1024;
-    struct ggml_init_params params = {
-        .mem_size   = metadata_size,
-        .mem_buffer = nullptr,
-        .no_alloc   = true,
-    };
+    struct ggml_init_params params = {};
+    params.mem_size = metadata_size;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
     dit_fused_ctx_ = ggml_init(params);
     if (dit_fused_ctx_)
     {
@@ -1011,11 +1010,10 @@ bool VoxCPM2Model::RunTextEncoder(VoxCPM2State &state, ggml_backend_sched_t sche
         return false;
     }
 
-    struct ggml_init_params params = {
-        .mem_size   = 64 * 1024 * 1024,
-        .mem_buffer = nullptr,
-        .no_alloc   = true,
-    };
+    struct ggml_init_params params = {};
+    params.mem_size = 64 * 1024 * 1024;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
     struct ggml_context *ctx0 = ggml_init(params);
     if (!ctx0)
     {
@@ -1083,11 +1081,10 @@ bool VoxCPM2Model::RunBaseLM(VoxCPM2State &state, ggml_backend_sched_t sched)
     const int n_kv_heads = hparams_.lm_num_key_value_heads;
     const int head_dim = hidden_dim / n_heads;
 
-    struct ggml_init_params params = {
-        .mem_size   = 1024 * 1024 * 1024,
-        .mem_buffer = nullptr,
-        .no_alloc   = true,
-    };
+    struct ggml_init_params params = {};
+    params.mem_size = 1024 * 1024 * 1024;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
     struct ggml_context *ctx0 = ggml_init(params);
     if (!ctx0)
     {
@@ -1353,11 +1350,10 @@ bool VoxCPM2Model::RunScalarQuantization(VoxCPM2State &state, ggml_backend_sched
         fusion_w && fusion_b && res_to_dit_w && res_to_dit_b && ralm_norm_w &&
         get_tensor("residual_lm.layers.0.input_layernorm.weight");
 
-    struct ggml_init_params params = {
-        .mem_size   = 512 * 1024 * 1024,
-        .mem_buffer = nullptr,
-        .no_alloc   = true,
-    };
+    struct ggml_init_params params = {};
+    params.mem_size = 512 * 1024 * 1024;
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
     struct ggml_context *ctx0 = ggml_init(params);
     if (!ctx0)
     {
@@ -1713,11 +1709,10 @@ bool VoxCPM2Model::RunDiT(VoxCPM2State &state, ggml_backend_sched_t sched,
                          float dt_scalar) {
         if (!patch_ctx)
         {
-            struct ggml_init_params params = {
-                .mem_size   = 512 * 1024 * 1024,
-                .mem_buffer = nullptr,
-                .no_alloc   = true,
-            };
+            struct ggml_init_params params = {};
+            params.mem_size = 512 * 1024 * 1024;
+            params.mem_buffer = nullptr;
+            params.no_alloc = true;
             patch_ctx = ggml_init(params);
             if (!patch_ctx)
             {
@@ -2107,11 +2102,10 @@ bool VoxCPM2Model::RunDiT(VoxCPM2State &state, ggml_backend_sched_t sched,
             return std::vector<float>();
         }
 
-        struct ggml_init_params params = {
-            .mem_size   = 384 * 1024 * 1024,
-            .mem_buffer = nullptr,
-            .no_alloc   = true,
-        };
+        struct ggml_init_params params = {};
+        params.mem_size = 384 * 1024 * 1024;
+        params.mem_buffer = nullptr;
+        params.no_alloc = true;
         struct ggml_context *ctx0 = ggml_init(params);
         if (!ctx0)
         {
@@ -2257,11 +2251,10 @@ bool VoxCPM2Model::RunDiT(VoxCPM2State &state, ggml_backend_sched_t sched,
             return 0.0f;
         }
         const int hidden_dim = hparams_.lm_hidden_size;
-        struct ggml_init_params params = {
-            .mem_size   = 16 * 1024 * 1024,
-            .mem_buffer = nullptr,
-            .no_alloc   = true,
-        };
+        struct ggml_init_params params = {};
+        params.mem_size = 16 * 1024 * 1024;
+        params.mem_buffer = nullptr;
+        params.no_alloc = true;
         struct ggml_context *ctx0 = ggml_init(params);
         if (!ctx0)
         {
@@ -2315,11 +2308,10 @@ bool VoxCPM2Model::RunDiT(VoxCPM2State &state, ggml_backend_sched_t sched,
             return false;
         }
 
-        struct ggml_init_params params = {
-            .mem_size   = 1024 * 1024 * 1024,
-            .mem_buffer = nullptr,
-            .no_alloc   = true,
-        };
+        struct ggml_init_params params = {};
+        params.mem_size = 1024 * 1024 * 1024;
+        params.mem_buffer = nullptr;
+        params.no_alloc = true;
         struct ggml_context *ctx0 = ggml_init(params);
         if (!ctx0)
         {
@@ -2567,11 +2559,10 @@ bool VoxCPM2Model::RunDiT(VoxCPM2State &state, ggml_backend_sched_t sched,
             return false;
         }
 
-        struct ggml_init_params params = {
-            .mem_size   = 768 * 1024 * 1024,
-            .mem_buffer = nullptr,
-            .no_alloc   = true,
-        };
+        struct ggml_init_params params = {};
+        params.mem_size = 768 * 1024 * 1024;
+        params.mem_buffer = nullptr;
+        params.no_alloc = true;
         struct ggml_context *ctx0 = ggml_init(params);
         if (!ctx0)
         {
@@ -3341,11 +3332,10 @@ bool VoxCPM2Model::RunAudioVAE(VoxCPM2State &state, ggml_backend_sched_t sched)
     }
 
     auto run_ggml_decoder = [&]() {
-        struct ggml_init_params params = {
-            .mem_size   = 32 * 1024 * 1024,
-            .mem_buffer = nullptr,
-            .no_alloc   = true,
-        };
+        struct ggml_init_params params = {};
+        params.mem_size = 32 * 1024 * 1024;
+        params.mem_buffer = nullptr;
+        params.no_alloc = true;
         struct ggml_context *ctx0 = ggml_init(params);
         if (!ctx0)
         {
