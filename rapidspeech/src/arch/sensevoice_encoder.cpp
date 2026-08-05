@@ -6,6 +6,8 @@
 #include "utils/debug_utils.h"
 #include "utils/rs_log.h"
 #include "utils/rs_wav.h"
+#include <algorithm>
+#include <cstdint>
 #include <functional>
 
 // Increased node limit to handle deep SenseVoice graphs (50+ layers)
@@ -114,14 +116,24 @@ model_layer_sanm_forward(const SenseVoiceHParams &hparams,
   // 3. FSMN Block (Memory Block) using depth-wise convolution logic
   int padding = (hparams.fsmn_kernel_size - 1) / 2; // Kernel size 31
   struct ggml_tensor *fsmn_in = ggml_cont(ctx, ggml_transpose(ctx, V));
-  struct ggml_tensor *im2col = ggml_im2col(
-      ctx, layer.e_attn_fsmn_w,
-      ggml_reshape_4d(ctx, fsmn_in, fsmn_in->ne[0], 1, fsmn_in->ne[1],
-                      fsmn_in->ne[2] * fsmn_in->ne[3]),
-      1, 0, padding, 0, 1, 0, false, GGML_TYPE_F32);
-  struct ggml_tensor *fsmn_out = ggml_mul_mat(ctx, layer.e_attn_fsmn_w, im2col);
-  fsmn_out = ggml_reshape_3d(ctx, fsmn_out, im2col->ne[1], im2col->ne[2],
-                             im2col->ne[3]);
+  const int64_t fsmn_time = fsmn_in->ne[0];
+  const int64_t fsmn_channels = fsmn_in->ne[1];
+  const int64_t fsmn_batch = fsmn_in->ne[2] * fsmn_in->ne[3];
+  struct ggml_tensor *fsmn_w = layer.e_attn_fsmn_w;
+  if (fsmn_w->type != GGML_TYPE_F32) {
+    fsmn_w = ggml_cast(ctx, fsmn_w, GGML_TYPE_F32);
+  }
+  fsmn_w = ggml_reshape_4d(ctx, fsmn_w, fsmn_w->ne[0], fsmn_w->ne[1], 1,
+                           fsmn_w->ne[2] * fsmn_w->ne[3]);
+  struct ggml_tensor *fsmn_conv_in =
+      ggml_reshape_4d(ctx, fsmn_in, fsmn_time, 1,
+                      fsmn_channels, fsmn_batch);
+  struct ggml_tensor *fsmn_out =
+      ggml_conv_2d_dw_direct(ctx, fsmn_w, fsmn_conv_in, 1, 1, padding, 0, 1,
+                             1);
+  fsmn_out =
+      ggml_reshape_3d(ctx, fsmn_out, fsmn_out->ne[0], fsmn_out->ne[2],
+                      fsmn_out->ne[3]);
   fsmn_out = ggml_cont(ctx, ggml_transpose(ctx, fsmn_out));
   fsmn_out = ggml_add(ctx, fsmn_out, V);
   ggml_set_name(fsmn_out, "fsmn_memory");
@@ -477,5 +489,175 @@ bool SenseVoiceEncoderModel::Encode(const std::vector<float> &input_frames,
   cached_ctx_ = nullptr;
   cached_gf_ = nullptr;
 
+  return true;
+}
+
+bool SenseVoiceEncoderModel::EncodeBatch(
+    const std::vector<const std::vector<float> *> &inputs,
+    const std::vector<RSState *> &states, ggml_backend_sched_t sched) {
+  if (inputs.empty()) return true;
+  if (inputs.size() != states.size()) return false;
+  if (inputs.size() == 1) return Encode(*inputs[0], *states[0], sched);
+
+  const int n_batch = (int)inputs.size();
+  const int feats_dim = hparams_.feats_dim;
+  const int n_len = (int)(inputs[0]->size() / feats_dim);
+  if (n_len <= 0 || (int)inputs[0]->size() != n_len * feats_dim)
+    return false;
+  for (int b = 0; b < n_batch; ++b) {
+    if (!inputs[b] || !states[b]) return false;
+    if ((int)inputs[b]->size() != n_len * feats_dim) return false;
+  }
+
+  const int hidden = hparams_.n_encoder_hidden_state;
+  const int required_pos_len = model_->embedding ? n_len + 4 : n_len;
+  ensure_pos_encoding_size(required_pos_len, feats_dim);
+
+  if (cached_ctx_) {
+    ggml_free(cached_ctx_);
+    cached_ctx_ = nullptr;
+    cached_gf_ = nullptr;
+  }
+  if (!init_compute_ctx(&cached_ctx_, &cached_gf_,
+                        SENSE_VOICE_model_MAX_NODES)) {
+    return false;
+  }
+
+  struct ggml_tensor *feature = ggml_new_tensor_3d(
+      cached_ctx_, GGML_TYPE_F32, feats_dim, n_len, n_batch);
+  struct ggml_tensor *prompt_ids =
+      ggml_new_tensor_1d(cached_ctx_, GGML_TYPE_I32, 4 * n_batch);
+  struct ggml_tensor *position = ggml_new_tensor_3d(
+      cached_ctx_, GGML_TYPE_F32, feats_dim, required_pos_len, n_batch);
+
+  ggml_set_name(feature, "feats_batch");
+  ggml_set_name(prompt_ids, "prompt_ids_batch");
+  ggml_set_name(position, "position_batch");
+  ggml_set_input(feature);
+  ggml_set_input(prompt_ids);
+  ggml_set_input(position);
+
+  struct ggml_tensor *cur = feature;
+  if (model_->embedding) {
+    struct ggml_tensor *emb =
+        ggml_get_rows(cached_ctx_, model_->embedding, prompt_ids);
+    ggml_set_name(emb, "embedding_batch");
+    emb = ggml_reshape_3d(cached_ctx_, emb, emb->ne[0], 4, n_batch);
+    cur = ggml_concat(cached_ctx_, emb, feature, 1);
+  }
+
+  cur = ggml_scale(cached_ctx_, cur, sqrtf(hidden));
+  cur = ggml_add(cached_ctx_, position, cur);
+
+  cur = model_layer_sanm_forward(hparams_, cached_ctx_, cur, model_->encoder0);
+  for (int i = 0; i < hparams_.n_encoder_layers - 1; ++i) {
+    cur = model_layer_sanm_forward(hparams_, cached_ctx_, cur,
+                                   model_->encoders_layer[i]);
+  }
+
+  cur = ggml_norm(cached_ctx_, cur, hparams_.eps);
+  cur = ggml_add(cached_ctx_,
+                 ggml_mul(cached_ctx_, cur, model_->e_after_norm_w),
+                 model_->e_after_norm_b);
+
+  for (int i = 0; i < hparams_.n_tp_encoder_layers; ++i) {
+    cur = model_layer_sanm_forward(hparams_, cached_ctx_, cur,
+                                   model_->tp_encoders_layer[i]);
+  }
+
+  cur = ggml_norm(cached_ctx_, cur, hparams_.eps);
+  cur = ggml_add(cached_ctx_, ggml_mul(cached_ctx_, cur, model_->e_tp_norm_w),
+                 model_->e_tp_norm_b);
+  ggml_set_name(cur, "encoder_out_batch");
+  ggml_set_output(cur);
+  ggml_build_forward_expand(cached_gf_, cur);
+
+  if (!ggml_backend_sched_alloc_graph(sched, cached_gf_)) {
+    ggml_free(cached_ctx_);
+    cached_ctx_ = nullptr;
+    cached_gf_ = nullptr;
+    return false;
+  }
+
+  std::vector<float> batch_features((size_t)n_batch * inputs[0]->size());
+  for (int b = 0; b < n_batch; ++b) {
+    std::copy(inputs[b]->begin(), inputs[b]->end(),
+              batch_features.begin() + (size_t)b * inputs[b]->size());
+  }
+  ggml_backend_tensor_set(feature, batch_features.data(), 0,
+                          batch_features.size() * sizeof(float));
+
+  if (model_->embedding) {
+    std::vector<int> p_tokens((size_t)n_batch * 4);
+    for (int b = 0; b < n_batch; ++b) {
+      auto &sv_state = static_cast<SenseVoiceState &>(*states[b]);
+      p_tokens[(size_t)b * 4 + 0] = sv_state.language_id;
+      p_tokens[(size_t)b * 4 + 1] = 1;
+      p_tokens[(size_t)b * 4 + 2] = 2;
+      p_tokens[(size_t)b * 4 + 3] = sv_state.use_itn ? 14 : 15;
+    }
+    ggml_backend_tensor_set(prompt_ids, p_tokens.data(), 0,
+                            p_tokens.size() * sizeof(int));
+  }
+
+  const size_t bytes_per_pos = (size_t)required_pos_len * feats_dim *
+                               sizeof(float);
+  for (int b = 0; b < n_batch; ++b) {
+    ggml_backend_tensor_set(position, cached_pos_encoding_.data(),
+                            (size_t)b * bytes_per_pos, bytes_per_pos);
+  }
+
+  if (imatrix_cb_) {
+    auto trampoline = [](struct ggml_tensor *t, bool ask, void *ud) -> bool {
+      if (ask) return true;
+      auto *cb = static_cast<std::function<void(struct ggml_tensor *)> *>(ud);
+      (*cb)(t);
+      return true;
+    };
+    ggml_backend_sched_set_eval_callback(sched, trampoline, &imatrix_cb_);
+  }
+
+  enum ggml_status compute_status =
+      ggml_backend_sched_graph_compute(sched, cached_gf_);
+
+  if (imatrix_cb_) {
+    ggml_backend_sched_set_eval_callback(sched, nullptr, nullptr);
+  }
+  if (compute_status != GGML_STATUS_SUCCESS) {
+    ggml_free(cached_ctx_);
+    cached_ctx_ = nullptr;
+    cached_gf_ = nullptr;
+    return false;
+  }
+
+  const size_t bytes_per_state =
+      ggml_row_size(cur->type, cur->ne[0]) * (size_t)cur->ne[1];
+  std::vector<uint8_t> tmp(bytes_per_state);
+  ggml_backend_t primary_backend = ggml_backend_sched_get_backend(sched, 0);
+  for (int b = 0; b < n_batch; ++b) {
+    auto &sv_state = static_cast<SenseVoiceState &>(*states[b]);
+    if (sv_state.encoder_out == nullptr ||
+        sv_state.encoder_out->ne[0] != cur->ne[0] ||
+        sv_state.encoder_out->ne[1] != cur->ne[1]) {
+      if (sv_state.buffer_persistent) {
+        ggml_backend_buffer_free(sv_state.buffer_persistent);
+      }
+      sv_state.encoder_out = ggml_new_tensor_2d(
+          sv_state.ctx_persistent, cur->type, cur->ne[0], cur->ne[1]);
+      sv_state.buffer_persistent = ggml_backend_alloc_buffer(
+          primary_backend, ggml_nbytes(sv_state.encoder_out));
+      void *base_addr = ggml_backend_buffer_get_base(sv_state.buffer_persistent);
+      ggml_backend_tensor_alloc(sv_state.buffer_persistent,
+                                sv_state.encoder_out, base_addr);
+    }
+    ggml_backend_tensor_get(cur, tmp.data(), (size_t)b * cur->nb[2],
+                            bytes_per_state);
+    ggml_backend_tensor_set(sv_state.encoder_out, tmp.data(), 0,
+                            bytes_per_state);
+  }
+
+  ggml_free(cached_ctx_);
+  cached_ctx_ = nullptr;
+  cached_gf_ = nullptr;
   return true;
 }

@@ -1,17 +1,16 @@
 /**
- * rs-tts-online.cpp — Streaming Text-to-Speech (CosyVoice3).
+ * rs-tts-online.cpp — Streaming Text-to-Speech.
  *
- * Drives the chunk-level streaming pipeline (see
- * `CosyVoice3LMModel::DecodeStream`): the LM emits speech tokens, and every
- * `token_hop_len` tokens (25 → 100, doubling) trigger one Flow + HiFT chunk
- * that comes out as PCM. First-chunk latency is roughly (LM × hop +
- * Flow + HiFT) instead of the full-utterance cost.
+ * Drives the model's chunk-level streaming pipeline. The first call to
+ * `rs_process()` starts a worker thread; subsequent calls drain produced
+ * chunks, so audio is available before the full utterance completes.
  *
  * Usage:
- *   rs-tts-online -m <cv3.gguf> -t "text" [options]
+ *   rs-tts-online -m <model.gguf> -t "text" [options]
  *
  * Options mirror rs-tts-offline; output is either a streaming WAV (default,
- * 24 kHz 16-bit, header patched on close) or raw f32 PCM on stdout (`-o -`).
+ * 16-bit at the model sample rate, header patched on close) or raw f32 PCM
+ * on stdout (`-o -`).
  */
 
 #include "rapidspeech.h"
@@ -79,12 +78,12 @@ static bool parse_bool(const std::string &v) {
 static void print_usage(const char *prog) {
   std::cerr
       << "Usage:\n"
-      << "  " << prog << " -m <cv3.gguf> -t \"text\" [options]\n\n"
+      << "  " << prog << " -m <model.gguf> -t \"text\" [options]\n\n"
       << "Options:\n"
-      << "  -m, --model <path>       CosyVoice3 model path (required)\n"
+      << "  -m, --model <path>       Streaming TTS model path (required)\n"
       << "  -t, --text <text>        Text to synthesize (required)\n"
       << "  -o, --output <path>      Output WAV file (default: output.wav).\n"
-      << "                           Pass `-` to stream raw float32 LE 24 kHz\n"
+      << "                           Pass `-` to stream raw float32 LE PCM\n"
       << "                           mono PCM on stdout (pipeable to e.g.\n"
       << "                           `play -t raw -r 24000 -e float -b 32 -c 1 -`).\n"
       << "      --ref <path>         Reference audio WAV (voice cloning)\n"
@@ -410,8 +409,9 @@ int main(int argc, char **argv) {
 
   rs_model_meta_t meta = rs_get_model_meta(ctx);
   const std::string arch = meta.arch_name;
-  if (arch != "cosyvoice3" && arch != "cosyvoice3-llm") {
-    LOG_ERROR("rs-tts-online only supports CosyVoice3 (got arch=%s).",
+  if (arch != "cosyvoice3" && arch != "cosyvoice3-llm" &&
+      arch != "voxcpm2") {
+    LOG_ERROR("Model does not support rs-tts-online (got arch=%s).",
               arch.c_str());
     rs_free(ctx);
     return 1;

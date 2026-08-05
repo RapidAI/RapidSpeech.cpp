@@ -26,26 +26,34 @@
 #include "rs_ws.h"
 
 #include "core/rs_context.h"
+#include "frontend/audio_processor.h"
 #include "rapidspeech.h"
 #include "utils/rs_log.h"
 #include "utils/rs_wav.h"
 #include "../common/rs_cli_utf8.h"
 
-// TTS continuous batching (CosyVoice3 only; other archs fall back to the
-// mutex-serialized path).
+// TTS request schedulers. CosyVoice3 uses token-interleaved continuous
+// batching; VoxCPM2 uses independent request states and backend schedulers.
 #include "arch/cosyvoice3.h"
 #include "arch/cosyvoice3_batch.h"
+#include "arch/voxcpm2.h"
 #include "arch/xasr.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <cstdarg>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <iterator>
 #include <memory>
@@ -158,33 +166,247 @@ static bool g_model_gpu = true;
 static int g_asr_reload_every = 0; // 0 = disabled
 static int g_asr_final_segments_since_reload = 0;
 static bool g_mem_log = false;
+static int g_asr_slots = 4;
+static int g_asr_max_queued = 256;
+static int g_asr_batch_wait_ms = 3;
+static int g_asr_min_batch = 0;
+static int g_asr_max_batch_wait_ms = -1;
+static int g_asr_frontend_threads = 1;
+static int g_asr_frontend_workers = 0;
+static bool g_ws_log = false;
+static std::atomic<uint64_t> g_asr_cmvn_version{0};
+static std::vector<float> g_asr_cmvn_means;
+static std::vector<float> g_asr_cmvn_vars;
 
-// TTS continuous-batching scheduler (CosyVoice3 only). When non-null, HTTP
-// and WS TTS handlers Submit() to it instead of locking g_tts.mu, so up to
-// --tts-slots requests decode concurrently (token-interleaved).
+// CosyVoice3 continuous-batching scheduler. VoxCPM2 has a separate queued
+// scheduler below because its diffusion/AR pipeline is request-oriented.
 static std::unique_ptr<TtsBatchScheduler> g_tts_batch;
+class VoxCPM2ServerScheduler {
+public:
+    using Result = std::pair<std::vector<float>, std::string>;
+    using ChunkCallback = VoxCPM2Model::AudioChunkCallback;
+
+    VoxCPM2ServerScheduler(VoxCPM2Model *model,
+                           std::vector<ggml_backend_sched_t> scheds,
+                           int slots)
+        : model_(model), scheds_(std::move(scheds)), slots_(slots) {}
+
+    ~VoxCPM2ServerScheduler() { Stop(); }
+
+    void Start() {
+        for (auto sched : scheds_) {
+            workers_.emplace_back([this, sched] { Run(sched); });
+        }
+    }
+
+    void Stop() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        for (auto &worker : workers_) {
+            if (worker.joinable()) worker.join();
+        }
+        workers_.clear();
+    }
+
+    std::future<Result> Submit(const std::string &text,
+                               const std::string &voice,
+                               const std::string &language, int32_t seed,
+                               int steps = 8) {
+        return Enqueue(text, voice, language, seed, steps, {});
+    }
+
+    std::future<Result> SubmitStream(const std::string &text,
+                                     const std::string &voice,
+                                     const std::string &language,
+                                     int32_t seed, int steps,
+                                     ChunkCallback callback) {
+        return Enqueue(text, voice, language, seed, steps,
+                       std::move(callback));
+    }
+
+    int n_slots() const { return slots_; }
+    int n_workers() const { return static_cast<int>(scheds_.size()); }
+    int n_active() const { return active_.load(); }
+    int n_queued() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return static_cast<int>(queue_.size());
+    }
+
+private:
+    struct Job {
+        std::string text;
+        std::string voice;
+        std::string language;
+        int32_t seed = 42;
+        int steps = 8;
+        ChunkCallback callback;
+        std::promise<Result> promise;
+    };
+
+    std::future<Result> Enqueue(const std::string &text,
+                                const std::string &voice,
+                                const std::string &language, int32_t seed,
+                                int steps, ChunkCallback callback) {
+        auto job = std::make_shared<Job>();
+        job->text = text;
+        job->voice = voice;
+        job->language = language;
+        job->seed = seed;
+        job->steps = steps > 0 ? steps : 8;
+        job->callback = std::move(callback);
+        auto future = job->promise.get_future();
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (stopping_) {
+                job->promise.set_value({{}, "TTS scheduler is stopping"});
+                return future;
+            }
+            queue_.push_back(job);
+        }
+        cv_.notify_one();
+        return future;
+    }
+
+    void Run(ggml_backend_sched_t sched) {
+        while (true) {
+            std::shared_ptr<Job> job;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [&] { return stopping_ || !queue_.empty(); });
+                if (stopping_ && queue_.empty()) return;
+                job = std::move(queue_.front());
+                queue_.pop_front();
+                active_.fetch_add(1);
+            }
+
+            Result result;
+            try {
+                auto state = std::dynamic_pointer_cast<VoxCPM2State>(
+                    model_->CreateState());
+                if (!state || !model_->PushText(
+                        *state, job->text.c_str(), job->language.c_str(),
+                        job->voice.c_str())) {
+                    result.second = "VoxCPM2 request initialization failed";
+                } else {
+                    model_->ConfigureState(
+                        *state, static_cast<uint64_t>(
+                            static_cast<uint32_t>(job->seed)), job->steps);
+                    ggml_backend_sched_reset(sched);
+                    const bool ok = job->callback
+                        ? model_->DecodeStream(*state, sched, job->callback)
+                        : model_->Decode(*state, sched);
+                    if (!ok) {
+                        result.second = "VoxCPM2 inference failed";
+                    } else {
+                        result.first = std::move(state->audio_output);
+                    }
+                }
+            } catch (const std::exception &e) {
+                result.second = e.what();
+            } catch (...) {
+                result.second = "VoxCPM2 inference failed";
+            }
+            job->promise.set_value(std::move(result));
+            active_.fetch_sub(1);
+        }
+    }
+
+    VoxCPM2Model *model_ = nullptr;
+    std::vector<ggml_backend_sched_t> scheds_;
+    int slots_ = 1;
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+    std::deque<std::shared_ptr<Job>> queue_;
+    std::vector<std::thread> workers_;
+    std::atomic<int> active_{0};
+    bool stopping_ = false;
+};
+
+static std::unique_ptr<VoxCPM2ServerScheduler> g_voxcpm2_batch;
 static int g_tts_slots = 2;
 static int g_tts_voc_workers = 1;
+static std::string g_tts_stream_mode = "true";
+static int g_tts_segment_max_chars = 80;
 
 struct AsrServerConfig {
     bool two_pass = false;
     bool ctc_precheck = false;
+    bool ctc_only = false;
 };
 static AsrServerConfig g_asr_cfg;
+
+static bool same_asr_config(const AsrServerConfig &a,
+                            const AsrServerConfig &b) {
+    return a.two_pass == b.two_pass &&
+           a.ctc_precheck == b.ctc_precheck &&
+           a.ctc_only == b.ctc_only;
+}
 
 // VAD is a separate handle (rs_vad_t), used by /asr/vad and HTTP VAD mode.
 static rs_vad_t *g_vad = nullptr;
 static std::mutex g_vad_mu;
 static bool g_have_vad = false;
+static int g_vad_workers = 1;
+static std::vector<rs_vad_t *> g_vad_ws_pool;
+static std::vector<bool> g_vad_ws_busy;
+static std::mutex g_vad_ws_pool_mu;
 
 struct VadServerConfig {
     float threshold = 0.5f;
     int end_silence_ms = 600;
-    int partial_ms = 600;
+    int partial_ms = 1500;
     int min_segment_ms = 500;
     int max_segment_ms = 0; // 0 = disabled
 };
 static VadServerConfig g_vad_cfg;
+
+static void ws_logf(const char *fmt, ...) {
+    if (!g_ws_log) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+
+static void release_vad_ws_worker(int index) {
+    std::lock_guard<std::mutex> lk(g_vad_ws_pool_mu);
+    if (index >= 0 && index < (int)g_vad_ws_busy.size()) {
+        g_vad_ws_busy[index] = false;
+    }
+}
+
+struct VadWorkerLease {
+    rs_vad_t *vad = nullptr;
+    int index = -1;
+
+    VadWorkerLease() = default;
+    VadWorkerLease(rs_vad_t *v, int i) : vad(v), index(i) {}
+    VadWorkerLease(const VadWorkerLease &) = delete;
+    VadWorkerLease &operator=(const VadWorkerLease &) = delete;
+    VadWorkerLease(VadWorkerLease &&other) noexcept {
+        vad = other.vad;
+        index = other.index;
+        other.vad = nullptr;
+        other.index = -1;
+    }
+    ~VadWorkerLease() {
+        if (vad) release_vad_ws_worker(index);
+    }
+};
+
+static VadWorkerLease acquire_vad_ws_worker() {
+    std::lock_guard<std::mutex> lk(g_vad_ws_pool_mu);
+    for (int i = 0; i < (int)g_vad_ws_pool.size(); ++i) {
+        if (!g_vad_ws_busy[i]) {
+            g_vad_ws_busy[i] = true;
+            return VadWorkerLease(g_vad_ws_pool[i], i);
+        }
+    }
+    return {};
+}
 
 struct AsrSegment {
     int index = 0;
@@ -225,6 +447,11 @@ static void note_asr_final_segment_locked(const char *label) {
         g_have_asr = false;
         fprintf(stderr, "[server] ASR reload failed; ASR is now unavailable\n");
         return;
+    }
+    if (g_asr.ctx && g_asr.ctx->ctx_gguf) {
+        load_cmvn_params(g_asr.ctx->ctx_gguf, g_asr_cmvn_means,
+                         g_asr_cmvn_vars);
+        g_asr_cmvn_version++;
     }
     g_have_asr = true;
     fprintf(stderr, "[server] ASR reloaded: %s @ %d Hz\n",
@@ -285,6 +512,575 @@ static bool transcribe_pcm_locked(const float *pcm, int n, std::string &text,
     return true;
 }
 
+static bool compute_asr_features(const std::vector<float> &pcm,
+                                 std::vector<float> &features,
+                                 std::string &err) {
+    if (!g_have_asr || !g_asr.ctx || !g_asr.ctx->model) {
+        err = "no ASR model loaded";
+        return false;
+    }
+
+    RSModelMeta meta;
+    {
+        std::lock_guard<std::mutex> lk(g_asr.mu);
+        if (!g_asr.ctx || !g_asr.ctx->model) {
+            err = "no ASR model loaded";
+            return false;
+        }
+        meta = g_asr.ctx->model->GetMeta();
+    }
+
+    if (meta.use_external_frontend) {
+        features = pcm;
+        return true;
+    }
+
+    STFTConfig config;
+    config.sample_rate = meta.audio_sample_rate;
+    config.n_mels = meta.n_mels;
+    config.window_type = meta.window_type;
+    config.use_lfr = true;
+    config.lfr_m = 7;
+    config.lfr_n = 6;
+    config.fbank_num_threads = g_asr_frontend_threads;
+
+    struct FrontendCache {
+        STFTConfig config;
+        uint64_t cmvn_version = 0;
+        std::unique_ptr<AudioProcessor> proc;
+    };
+    thread_local FrontendCache cache;
+
+    const uint64_t cmvn_version = g_asr_cmvn_version.load();
+    auto same_config = [](const STFTConfig &a, const STFTConfig &b) {
+        return a.sample_rate == b.sample_rate &&
+               a.frame_size == b.frame_size &&
+               a.frame_step == b.frame_step &&
+               a.n_fft == b.n_fft &&
+               a.n_mels == b.n_mels &&
+               a.f_min == b.f_min &&
+               a.f_max == b.f_max &&
+               a.window_type == b.window_type &&
+               a.snip_edges == b.snip_edges &&
+               a.mel_low_hz == b.mel_low_hz &&
+               a.mel_high_hz == b.mel_high_hz &&
+               a.use_lfr == b.use_lfr &&
+               a.lfr_m == b.lfr_m &&
+               a.lfr_n == b.lfr_n &&
+               a.use_cmvn == b.use_cmvn &&
+               a.fbank_num_threads == b.fbank_num_threads;
+    };
+    if (!cache.proc || !same_config(cache.config, config) ||
+        cache.cmvn_version != cmvn_version) {
+        cache.config = config;
+        cache.cmvn_version = cmvn_version;
+        cache.proc = std::make_unique<AudioProcessor>(config);
+        if (!g_asr_cmvn_means.empty() && !g_asr_cmvn_vars.empty()) {
+            cache.proc->SetCMVN(g_asr_cmvn_means, g_asr_cmvn_vars);
+        }
+    }
+
+    cache.proc->Compute(pcm, features);
+    if (features.empty()) {
+        err = "ASR frontend produced no features";
+        return false;
+    }
+    return true;
+}
+
+static bool transcribe_encoded_state_locked(RSState &state,
+                                            const AsrServerConfig &cfg,
+                                            std::string &text,
+                                            std::string &err) {
+    if (!g_asr.ctx || !g_asr.ctx->model || !g_asr.ctx->sched) {
+        err = "no ASR model loaded";
+        return false;
+    }
+
+    auto &model = *g_asr.ctx->model;
+    ggml_backend_sched_t sched = g_asr.ctx->sched;
+    model.SetCTCPrecheck(cfg.ctc_precheck);
+    model.SetUseLLM(!(cfg.two_pass || cfg.ctc_only));
+
+    ggml_backend_sched_reset(sched);
+    if (!model.Decode(state, sched)) {
+        err = "model decode failed";
+        return false;
+    }
+    std::string first_pass = model.GetTranscription(state);
+
+    if (cfg.two_pass && !cfg.ctc_only) {
+        model.SetUseLLM(true);
+        ggml_backend_sched_reset(sched);
+        if (!model.Decode(state, sched)) {
+            err = "model re-decode failed";
+            return false;
+        }
+        std::string second_pass = model.GetTranscription(state);
+        text = second_pass.empty() ? first_pass : second_pass;
+    } else {
+        text = first_pass;
+    }
+    return true;
+}
+
+class AsrBatchScheduler {
+public:
+    struct Stats {
+        int slots = 0;
+        int max_queued = 0;
+        int queued = 0;
+        int raw_queued = 0;
+        int preparing = 0;
+        int frontend_workers = 0;
+        int batch_wait_ms = 0;
+        int min_batch = 0;
+        int max_batch_wait_ms = 0;
+        uint64_t submitted = 0;
+        uint64_t completed = 0;
+        uint64_t failed = 0;
+        uint64_t rejected = 0;
+        uint64_t batches = 0;
+        uint64_t batched_requests = 0;
+        uint64_t max_batch = 0;
+        std::vector<uint64_t> batch_size_hist;
+        uint64_t frontend_ms = 0;
+        uint64_t queue_wait_ms = 0;
+        uint64_t encode_ms = 0;
+        uint64_t decode_ms = 0;
+        uint64_t e2e_ms = 0;
+    };
+
+    AsrBatchScheduler(int n_slots, int max_queued, int batch_wait_ms,
+                      int min_batch, int max_batch_wait_ms,
+                      int frontend_workers)
+        : n_slots_(std::max(1, n_slots)),
+          max_queued_(std::max(1, max_queued)),
+          batch_wait_ms_(std::max(0, batch_wait_ms)),
+          min_batch_(std::max(1, min_batch)),
+          max_batch_wait_ms_(std::max(batch_wait_ms_,
+                                      max_batch_wait_ms < 0
+                                          ? batch_wait_ms_
+                                          : max_batch_wait_ms)),
+          n_frontend_workers_(std::max(1, frontend_workers)) {
+        min_batch_ = min_batch <= 0 ? n_slots_ : std::min(min_batch_, n_slots_);
+        batch_size_hist_.resize((size_t)n_slots_ + 1, 0);
+    }
+    ~AsrBatchScheduler() { Stop(); }
+
+    void Start() {
+        stop_ = false;
+        for (int i = 0; i < n_frontend_workers_; ++i) {
+            frontend_workers_.emplace_back(&AsrBatchScheduler::FrontendLoop,
+                                           this);
+        }
+        worker_ = std::thread(&AsrBatchScheduler::RunLoop, this);
+    }
+
+    void Stop() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        frontend_cv_.notify_all();
+        for (auto &t : frontend_workers_) {
+            if (t.joinable()) t.join();
+        }
+        frontend_workers_.clear();
+        if (worker_.joinable()) worker_.join();
+        std::lock_guard<std::mutex> lk(mu_);
+        while (!raw_pending_.empty()) {
+            raw_pending_.front().promise.set_value({"", "server shutting down"});
+            raw_pending_.pop_front();
+        }
+        while (!pending_.empty()) {
+            pending_.front().promise.set_value({"", "server shutting down"});
+            pending_.pop_front();
+        }
+    }
+
+    std::future<std::pair<std::string, std::string>>
+    Submit(std::vector<float> pcm, AsrServerConfig cfg) {
+        PendingReq req;
+        req.pcm = std::move(pcm);
+        req.cfg = cfg;
+        req.enqueue_time = std::chrono::steady_clock::now();
+        auto fut = req.promise.get_future();
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            submitted_++;
+            if ((int)raw_pending_.size() + (int)pending_.size() +
+                    preparing_ >=
+                max_queued_) {
+                rejected_++;
+                failed_++;
+                completed_++;
+                req.promise.set_value({"", "ASR queue full"});
+                return fut;
+            }
+            raw_pending_.push_back(std::move(req));
+        }
+        frontend_cv_.notify_one();
+        return fut;
+    }
+
+    int n_queued() {
+        std::lock_guard<std::mutex> lk(mu_);
+        return (int)raw_pending_.size() + (int)pending_.size() + preparing_;
+    }
+
+    Stats snapshot() {
+        std::lock_guard<std::mutex> lk(mu_);
+        Stats s;
+        s.slots = n_slots_;
+        s.max_queued = max_queued_;
+        s.queued = (int)pending_.size();
+        s.raw_queued = (int)raw_pending_.size();
+        s.preparing = preparing_;
+        s.frontend_workers = n_frontend_workers_;
+        s.batch_wait_ms = batch_wait_ms_;
+        s.min_batch = min_batch_;
+        s.max_batch_wait_ms = max_batch_wait_ms_;
+        s.submitted = submitted_;
+        s.completed = completed_;
+        s.failed = failed_;
+        s.rejected = rejected_;
+        s.batches = batches_;
+        s.batched_requests = batched_requests_;
+        s.max_batch = max_batch_;
+        s.batch_size_hist = batch_size_hist_;
+        s.frontend_ms = frontend_ms_;
+        s.queue_wait_ms = queue_wait_ms_;
+        s.encode_ms = encode_ms_;
+        s.decode_ms = decode_ms_;
+        s.e2e_ms = e2e_ms_;
+        return s;
+    }
+
+private:
+    struct PendingReq {
+        std::vector<float> pcm;
+        std::vector<float> features;
+        AsrServerConfig cfg;
+        std::chrono::steady_clock::time_point enqueue_time;
+        std::chrono::steady_clock::time_point ready_time;
+        std::promise<std::pair<std::string, std::string>> promise;
+    };
+
+    static uint64_t elapsed_ms(std::chrono::steady_clock::time_point start,
+                               std::chrono::steady_clock::time_point end) {
+        return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                   end - start).count();
+    }
+
+    bool Prepare(PendingReq &req) {
+        if (!req.features.empty()) return true;
+        std::string err;
+        if (!compute_asr_features(req.pcm, req.features, err)) {
+            req.promise.set_value({"", err});
+            std::lock_guard<std::mutex> lk(mu_);
+            failed_++;
+            completed_++;
+            e2e_ms_ += elapsed_ms(req.enqueue_time,
+                                  std::chrono::steady_clock::now());
+            return false;
+        }
+        req.ready_time = std::chrono::steady_clock::now();
+        return true;
+    }
+
+    bool CompatibleWith(const PendingReq &req,
+                        const PendingReq &first) const {
+        return req.features.size() == first.features.size() &&
+               same_asr_config(req.cfg, first.cfg);
+    }
+
+    void restore_skipped(std::deque<PendingReq> &skipped) {
+        if (skipped.empty()) return;
+        std::lock_guard<std::mutex> lk(mu_);
+        while (!skipped.empty()) {
+            pending_.push_front(std::move(skipped.back()));
+            skipped.pop_back();
+        }
+    }
+
+    void FrontendLoop() {
+        for (;;) {
+            PendingReq req;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                frontend_cv_.wait(lk, [&] {
+                    return stop_.load() || !raw_pending_.empty();
+                });
+                if (stop_ && raw_pending_.empty()) break;
+                req = std::move(raw_pending_.front());
+                raw_pending_.pop_front();
+                preparing_++;
+            }
+
+            std::string err;
+            auto frontend_start = std::chrono::steady_clock::now();
+            bool prepared = compute_asr_features(req.pcm, req.features, err);
+            auto frontend_end = std::chrono::steady_clock::now();
+            req.ready_time = frontend_end;
+
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                preparing_--;
+                frontend_ms_ += elapsed_ms(frontend_start, frontend_end);
+                if (stop_) {
+                    failed_++;
+                    completed_++;
+                    e2e_ms_ += elapsed_ms(req.enqueue_time, frontend_end);
+                    req.promise.set_value({"", "server shutting down"});
+                } else if (!prepared) {
+                    failed_++;
+                    completed_++;
+                    e2e_ms_ += elapsed_ms(req.enqueue_time, frontend_end);
+                    req.promise.set_value({"", err});
+                } else {
+                    pending_.push_back(std::move(req));
+                }
+            }
+            cv_.notify_one();
+            frontend_cv_.notify_one();
+        }
+    }
+
+    void RunBatch(std::vector<PendingReq> &batch) {
+        auto batch_start = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            batches_++;
+            batched_requests_ += batch.size();
+            max_batch_ = std::max<uint64_t>(max_batch_, batch.size());
+            if (batch.size() < batch_size_hist_.size()) {
+                batch_size_hist_[batch.size()]++;
+            }
+            for (auto &req : batch) {
+                queue_wait_ms_ += elapsed_ms(req.ready_time, batch_start);
+            }
+        }
+
+        std::vector<std::shared_ptr<RSState>> owned_states;
+        std::vector<RSState *> states;
+        std::vector<const std::vector<float> *> inputs;
+        owned_states.reserve(batch.size());
+        states.reserve(batch.size());
+        inputs.reserve(batch.size());
+
+        int successful = 0;
+        std::vector<std::pair<std::string, std::string>> results(batch.size());
+        {
+            std::lock_guard<std::mutex> lk(g_asr.mu);
+            if (!g_asr.ctx || !g_asr.ctx->model || !g_asr.ctx->sched) {
+                for (auto &r : results) r.second = "no ASR model loaded";
+            } else {
+                for (auto &req : batch) {
+                    auto st = g_asr.ctx->model->CreateState();
+                    states.push_back(st.get());
+                    inputs.push_back(&req.features);
+                    owned_states.push_back(std::move(st));
+                }
+                ggml_backend_sched_reset(g_asr.ctx->sched);
+                auto encode_start = std::chrono::steady_clock::now();
+                bool ok = g_asr.ctx->model->EncodeBatch(inputs, states,
+                                                        g_asr.ctx->sched);
+                auto encode_end = std::chrono::steady_clock::now();
+                {
+                    std::lock_guard<std::mutex> mlk(mu_);
+                    encode_ms_ += elapsed_ms(encode_start, encode_end);
+                }
+                if (!ok) {
+                    for (auto &r : results) r.second = "model encode batch failed";
+                } else {
+                    auto &model = *g_asr.ctx->model;
+                    const AsrServerConfig cfg = batch.front().cfg;
+                    model.SetCTCPrecheck(cfg.ctc_precheck);
+                    model.SetUseLLM(!(cfg.two_pass || cfg.ctc_only));
+
+                    ggml_backend_sched_reset(g_asr.ctx->sched);
+                    auto decode_start = std::chrono::steady_clock::now();
+                    ok = model.DecodeBatch(states, g_asr.ctx->sched);
+                    if (!ok) {
+                        for (auto &r : results) r.second = "model decode batch failed";
+                    } else {
+                        for (size_t i = 0; i < batch.size(); ++i) {
+                            std::string first_pass = model.GetTranscription(*states[i]);
+                            if (cfg.two_pass && !cfg.ctc_only) {
+                                model.SetUseLLM(true);
+                                ggml_backend_sched_reset(g_asr.ctx->sched);
+                                if (!model.Decode(*states[i], g_asr.ctx->sched)) {
+                                    results[i].second = "model re-decode failed";
+                                    continue;
+                                }
+                                std::string second_pass =
+                                    model.GetTranscription(*states[i]);
+                                results[i].first = second_pass.empty()
+                                                       ? first_pass
+                                                       : second_pass;
+                            } else {
+                                results[i].first = first_pass;
+                            }
+                            successful++;
+                        }
+                    }
+                    auto decode_end = std::chrono::steady_clock::now();
+                    {
+                        std::lock_guard<std::mutex> mlk(mu_);
+                        decode_ms_ += elapsed_ms(decode_start, decode_end);
+                    }
+                }
+                for (int i = 0; i < successful; ++i) {
+                    note_asr_final_segment_locked("asr-batch-final");
+                }
+            }
+        }
+
+        auto finish_time = std::chrono::steady_clock::now();
+        uint64_t failed = 0;
+        for (const auto &r : results) {
+            if (!r.second.empty()) failed++;
+        }
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            completed_ += batch.size();
+            failed_ += failed;
+            for (auto &req : batch) {
+                e2e_ms_ += elapsed_ms(req.enqueue_time, finish_time);
+            }
+        }
+        for (size_t i = 0; i < batch.size(); ++i) {
+            batch[i].promise.set_value(std::move(results[i]));
+        }
+    }
+
+    void RunLoop() {
+        while (!stop_) {
+            PendingReq first;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [&] { return stop_.load() || !pending_.empty(); });
+                if (stop_) break;
+                first = std::move(pending_.front());
+                pending_.pop_front();
+            }
+            if (!Prepare(first)) continue;
+
+            std::vector<PendingReq> batch;
+            batch.push_back(std::move(first));
+
+            auto batch_open = std::chrono::steady_clock::now();
+            auto soft_deadline = batch_open +
+                                 std::chrono::milliseconds(batch_wait_ms_);
+            auto hard_deadline = batch_open +
+                                 std::chrono::milliseconds(max_batch_wait_ms_);
+            std::deque<PendingReq> skipped;
+            const int scan_budget = std::max(n_slots_, n_slots_ * 4);
+            int scanned = 0;
+            while ((int)batch.size() < n_slots_ && scanned < scan_budget) {
+                PendingReq cand;
+                bool have = false;
+                {
+                    std::unique_lock<std::mutex> lk(mu_);
+                    if (pending_.empty()) {
+                        auto now = std::chrono::steady_clock::now();
+                        const int known_demand =
+                            (int)batch.size() + (int)pending_.size() +
+                            preparing_ + (int)raw_pending_.size();
+                        const bool can_fill_batch = known_demand >= n_slots_;
+                        const bool below_target = (int)batch.size() < min_batch_;
+                        auto deadline =
+                            (below_target || (preparing_ > 0 && can_fill_batch))
+                                ? hard_deadline
+                                : soft_deadline;
+                        if (now >= deadline) break;
+                        cv_.wait_until(lk, deadline, [&] {
+                            return stop_.load() || !pending_.empty();
+                        });
+                    }
+                    if (stop_ || pending_.empty()) break;
+                    cand = std::move(pending_.front());
+                    pending_.pop_front();
+                    have = true;
+                }
+                if (!have) break;
+                scanned++;
+                if (!Prepare(cand)) continue;
+                if (CompatibleWith(cand, batch.front())) {
+                    batch.push_back(std::move(cand));
+                } else {
+                    skipped.push_back(std::move(cand));
+                }
+                auto now = std::chrono::steady_clock::now();
+                if (now >= hard_deadline) break;
+                if (now >= soft_deadline && (int)batch.size() >= min_batch_) {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    const int known_demand =
+                        (int)batch.size() + (int)pending_.size() +
+                        preparing_ + (int)raw_pending_.size();
+                    if (pending_.empty() && known_demand < n_slots_) break;
+                }
+            }
+            restore_skipped(skipped);
+
+            RunBatch(batch);
+        }
+    }
+
+    int n_slots_;
+    int max_queued_;
+    int batch_wait_ms_;
+    int min_batch_;
+    int max_batch_wait_ms_;
+    int n_frontend_workers_;
+    std::deque<PendingReq> raw_pending_;
+    std::deque<PendingReq> pending_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::condition_variable frontend_cv_;
+    std::thread worker_;
+    std::vector<std::thread> frontend_workers_;
+    std::atomic<bool> stop_{false};
+    int preparing_ = 0;
+    uint64_t submitted_ = 0;
+    uint64_t completed_ = 0;
+    uint64_t failed_ = 0;
+    uint64_t rejected_ = 0;
+    uint64_t batches_ = 0;
+    uint64_t batched_requests_ = 0;
+    uint64_t max_batch_ = 0;
+    std::vector<uint64_t> batch_size_hist_;
+    uint64_t frontend_ms_ = 0;
+    uint64_t queue_wait_ms_ = 0;
+    uint64_t encode_ms_ = 0;
+    uint64_t decode_ms_ = 0;
+    uint64_t e2e_ms_ = 0;
+};
+
+static std::unique_ptr<AsrBatchScheduler> g_asr_batch;
+
+static bool transcribe_pcm_server(const float *pcm, int n,
+                                  const AsrServerConfig &cfg,
+                                  std::string &text, std::string &err) {
+    if (g_asr_batch) {
+        std::vector<float> owned(pcm, pcm + n);
+        auto fut = g_asr_batch->Submit(std::move(owned), cfg);
+        auto result = fut.get();
+        text = std::move(result.first);
+        err = std::move(result.second);
+        return err.empty();
+    }
+
+    std::lock_guard<std::mutex> lk(g_asr.mu);
+    bool ok = transcribe_pcm_locked(pcm, n, text, err,
+                                    cfg.two_pass, cfg.ctc_precheck,
+                                    cfg.ctc_only);
+    if (ok) note_asr_final_segment_locked("http-final");
+    return ok;
+}
+
 // Caller holds g_vad_mu for the stateful VAD handle. ASR is locked only while
 // a finalized segment is actually transcribed, so VAD scanning does not block
 // unrelated ASR requests.
@@ -324,13 +1120,9 @@ static bool transcribe_pcm_vad_locked(const std::vector<float> &pcm,
         if ((int)seg.size() < min_samples) return true;
 
         std::string seg_text;
-        {
-            std::lock_guard<std::mutex> alk(g_asr.mu);
-            if (!transcribe_pcm_locked(seg.data(), (int)seg.size(), seg_text, err,
-                                      asr_cfg.two_pass, asr_cfg.ctc_precheck)) {
-                return false;
-            }
-            note_asr_final_segment_locked("http-vad-final");
+        if (!transcribe_pcm_server(seg.data(), (int)seg.size(), asr_cfg,
+                                   seg_text, err)) {
+            return false;
         }
         if (!seg_text.empty()) {
             AsrSegment out;
@@ -428,12 +1220,7 @@ static bool do_transcribe_with_config(const std::string &audio_bytes,
         err = "could not decode audio (expected WAV)";
         return false;
     }
-    std::lock_guard<std::mutex> lk(g_asr.mu);
-    bool ok = transcribe_pcm_locked(pcm.data(), (int)pcm.size(), text, err,
-                                    cfg.two_pass,
-                                    cfg.ctc_precheck);
-    if (ok) note_asr_final_segment_locked("http-final");
-    return ok;
+    return transcribe_pcm_server(pcm.data(), (int)pcm.size(), cfg, text, err);
 }
 
 // Transcribe WAV bytes → text (HTTP/MCP path). Decodes then locks + transcribes.
@@ -463,6 +1250,15 @@ static bool do_synthesize(const std::string &text, const std::string &instruct,
                           const std::string &language, int seed, int steps,
                           std::vector<float> &pcm, std::string &err) {
     if (!g_have_tts) { err = "no TTS model loaded"; return false; }
+
+    if (g_voxcpm2_batch) {
+        auto fut = g_voxcpm2_batch->Submit(
+            text, instruct, language, seed, steps > 0 ? steps : 8);
+        auto result = fut.get();
+        if (!result.second.empty()) { err = result.second; return false; }
+        pcm = std::move(result.first);
+        return true;
+    }
 
     // CosyVoice3 with --tts-slots > 1: route through the continuous-batching
     // scheduler so N requests decode concurrently (token-interleaved).
@@ -549,6 +1345,7 @@ static AsrServerConfig request_asr_config(const httplib::Request &req) {
     AsrServerConfig cfg = g_asr_cfg;
     cfg.two_pass = request_bool(req, "two_pass", cfg.two_pass);
     cfg.ctc_precheck = request_bool(req, "ctc_precheck", cfg.ctc_precheck);
+    cfg.ctc_only = request_bool(req, "ctc_only", cfg.ctc_only);
     return cfg;
 }
 
@@ -858,15 +1655,15 @@ static std::string float_to_pcm16(const float *pcm, size_t n) {
     return b;
 }
 
-static void ws_send_json(rsws::Conn &c, const rsjson::Value &v) {
-    c.send_text(v.dump());
+static bool ws_send_json(rsws::Conn &c, const rsjson::Value &v) {
+    return c.send_text(v.dump());
 }
-static void ws_msg(rsws::Conn &c, const char *type, const std::string &key = "",
+static bool ws_msg(rsws::Conn &c, const char *type, const std::string &key = "",
                    const std::string &val = "") {
     rsjson::Value o = rsjson::Value::object();
     o["type"] = type;
     if (!key.empty()) o[key] = val;
-    ws_send_json(c, o);
+    return ws_send_json(c, o);
 }
 
 static bool query_get(const std::string &query, const std::string &key,
@@ -923,6 +1720,103 @@ static bool query_bool(const std::string &query, const char *key, bool current) 
     return parse_bool_value(v.empty() ? "1" : v, current);
 }
 
+static std::string lower_ascii(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s;
+}
+
+static std::string normalize_tts_stream_mode(const std::string &mode) {
+    std::string m = lower_ascii(mode);
+    if (m == "hybrid" || m == "mixed") return "hybrid";
+    if (m == "auto") return "auto";
+    return "true";
+}
+
+static size_t utf8_char_bytes(const std::string &s, size_t pos) {
+    if (pos >= s.size()) return 0;
+    const unsigned char c = static_cast<unsigned char>(s[pos]);
+    if ((c & 0x80) == 0) return 1;
+    if ((c & 0xE0) == 0xC0 && pos + 1 < s.size()) return 2;
+    if ((c & 0xF0) == 0xE0 && pos + 2 < s.size()) return 3;
+    if ((c & 0xF8) == 0xF0 && pos + 3 < s.size()) return 4;
+    return 1;
+}
+
+static std::string trim_copy(const std::string &s) {
+    const size_t begin = s.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) return {};
+    const size_t end = s.find_last_not_of(" \t\r\n");
+    return s.substr(begin, end - begin + 1);
+}
+
+static bool starts_with_at(const std::string &s, size_t pos,
+                           const char *needle) {
+    const size_t n = std::strlen(needle);
+    return pos + n <= s.size() && s.compare(pos, n, needle) == 0;
+}
+
+static bool is_soft_segment_break(const std::string &s, size_t pos,
+                                  size_t *break_end) {
+    const char c = s[pos];
+    if (c == ',' || c == ':' || c == ' ' || c == '\t') {
+        *break_end = pos + 1;
+        return true;
+    }
+    static const char *breaks[] = {"，", "、", "：", "——"};
+    for (const char *b : breaks) {
+        if (starts_with_at(s, pos, b)) {
+            *break_end = pos + std::strlen(b);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void append_bounded_segment(std::vector<std::string> &out,
+                                   const std::string &segment,
+                                   int max_chars) {
+    const std::string text = trim_copy(segment);
+    if (text.empty()) return;
+    if (max_chars <= 0) {
+        out.push_back(text);
+        return;
+    }
+
+    size_t start = 0;
+    while (start < text.size()) {
+        while (start < text.size() &&
+               std::isspace(static_cast<unsigned char>(text[start]))) {
+            ++start;
+        }
+        if (start >= text.size()) break;
+
+        size_t pos = start;
+        size_t last_break = std::string::npos;
+        int chars = 0;
+        while (pos < text.size() && chars < max_chars) {
+            size_t soft_end = 0;
+            if (is_soft_segment_break(text, pos, &soft_end)) {
+                last_break = soft_end;
+            }
+            const size_t step = utf8_char_bytes(text, pos);
+            if (step == 0) break;
+            pos += step;
+            ++chars;
+        }
+
+        size_t cut = pos;
+        if (pos < text.size() && last_break != std::string::npos &&
+            last_break > start) {
+            cut = last_break;
+        }
+        std::string part = trim_copy(text.substr(start, cut - start));
+        if (!part.empty()) out.push_back(std::move(part));
+        start = cut;
+    }
+}
+
 // Split text into synthesis segments at sentence-ending punctuation (CJK + ASCII).
 static std::vector<std::string> split_sentences(const std::string &text) {
     std::vector<std::string> segs;
@@ -951,6 +1845,222 @@ static std::vector<std::string> split_sentences(const std::string &text) {
     flush();
     if (segs.empty() && !text.empty()) segs.push_back(text);
     return segs;
+}
+
+static std::vector<std::string> split_sentences_bounded(
+    const std::string &text, int max_chars) {
+    std::vector<std::string> out;
+    for (const std::string &segment : split_sentences(text)) {
+        append_bounded_segment(out, segment, max_chars);
+    }
+    if (out.empty() && !text.empty()) out.push_back(text);
+    return out;
+}
+
+static bool ws_emit_pcm(rsws::Conn &c, const float *pcm, size_t n) {
+    if (!pcm || n == 0) return true;
+    std::string bytes = float_to_pcm16(pcm, n);
+    return c.send_binary(bytes.data(), bytes.size());
+}
+
+static bool ws_emit_pcm(rsws::Conn &c, const std::vector<float> &pcm) {
+    return ws_emit_pcm(c, pcm.data(), pcm.size());
+}
+
+// Independent hybrid segments can contain decoder padding at their edges.
+// Keep a short natural attack/release, but avoid concatenating long silent
+// tails/heads between sentences.
+static void trim_tts_boundary_silence(std::vector<float> &pcm) {
+    const int sample_rate = std::max(1, g_tts.sample_rate);
+    if (pcm.size() < static_cast<size_t>(sample_rate / 4)) return;
+
+    float peak = 0.0f;
+    for (float sample : pcm) peak = std::max(peak, std::fabs(sample));
+    if (peak < 0.02f) return;
+    const float threshold = std::max(0.008f, peak * 0.02f);
+
+    size_t first = 0;
+    while (first < pcm.size() && std::fabs(pcm[first]) <= threshold) ++first;
+    size_t last = pcm.size();
+    while (last > first && std::fabs(pcm[last - 1]) <= threshold) --last;
+    if (first == 0 && last == pcm.size()) return;
+
+    const size_t keep_head = static_cast<size_t>(sample_rate * 15 / 1000);
+    const size_t keep_tail = static_cast<size_t>(sample_rate * 45 / 1000);
+    const size_t begin = first > keep_head ? first - keep_head : 0;
+    const size_t end = std::min(pcm.size(), last + keep_tail);
+    if (begin < end && (begin > 0 || end < pcm.size()))
+    {
+        pcm.erase(pcm.begin(), pcm.begin() + static_cast<ptrdiff_t>(begin));
+        pcm.erase(pcm.begin() + static_cast<ptrdiff_t>(end - begin), pcm.end());
+    }
+}
+
+static bool stream_tts_context(rsws::Conn &c, const std::string &text,
+                               const std::string &voice,
+                               const std::string &lang, int seed, int steps,
+                               std::string &err) {
+    std::lock_guard<std::mutex> lk(g_tts.mu);
+    rs_reset(g_tts.ctx);
+    rs_set_tts_params(g_tts.ctx, voice.c_str(), lang.c_str(), seed);
+    if (steps > 0) rs_set_tts_diffusion_steps(g_tts.ctx, steps);
+    if (rs_push_text(g_tts.ctx, text.c_str()) != RS_OK) {
+        err = "rs_push_text failed";
+        return false;
+    }
+    int32_t ret;
+    while ((ret = rs_process(g_tts.ctx)) >= 0) {
+        float *chunk = nullptr;
+        int n = rs_get_audio_output(g_tts.ctx, &chunk);
+        if (n > 0 && chunk && !ws_emit_pcm(c, chunk, static_cast<size_t>(n))) {
+            err = "WebSocket send failed";
+            return false;
+        }
+        if (ret == 0) break;
+    }
+    if (ret < 0) {
+        err = rs_get_last_error().message;
+        return false;
+    }
+    return true;
+}
+
+static bool ws_wait_emit(std::future<std::pair<std::vector<float>, std::string>> &future,
+                         rsws::Conn &c, std::string &err) {
+    auto result = future.get();
+    if (!result.second.empty()) {
+        err = result.second;
+        return false;
+    }
+    trim_tts_boundary_silence(result.first);
+    if (!ws_emit_pcm(c, result.first)) {
+        err = "WebSocket send failed";
+        return false;
+    }
+    return true;
+}
+
+static bool ws_tts_stream_true_impl(rsws::Conn &c, const std::string &text,
+                                    const std::string &voice,
+                                    const std::string &lang, int seed,
+                                    int steps, std::string &err) {
+    auto callback = [&c](const float *pcm, size_t n) {
+        (void)ws_emit_pcm(c, pcm, n);
+    };
+
+    if (g_voxcpm2_batch) {
+        auto future = g_voxcpm2_batch->SubmitStream(
+            text, voice, lang, seed, steps, callback);
+        auto result = future.get();
+        if (!result.second.empty()) {
+            err = result.second;
+            return false;
+        }
+        return true;
+    }
+
+    if (g_tts_batch && g_tts_batch->CanStreamFirstSentence()) {
+        if (!g_tts_batch->StreamFirstSentence(text, voice, lang, seed,
+                                              callback)) {
+            err = "CosyVoice3 streaming failed";
+            return false;
+        }
+        return true;
+    }
+    if (g_tts_batch) {
+        auto future = g_tts_batch->Submit(text, voice, lang, seed);
+        return ws_wait_emit(future, c, err);
+    }
+
+    return stream_tts_context(c, text, voice, lang, seed, steps, err);
+}
+
+static bool ws_tts_stream_hybrid_impl(rsws::Conn &c, const std::string &text,
+                                      const std::string &voice,
+                                      const std::string &lang, int seed,
+                                      int steps, int segment_max_chars,
+                                      uint64_t session_id, std::string &err) {
+    std::vector<std::string> segs =
+        split_sentences_bounded(text, segment_max_chars);
+    if (segs.empty()) return true;
+    if (segs.size() == 1) {
+        return ws_tts_stream_true_impl(c, segs.front(), voice, lang, seed,
+                                       steps, err);
+    }
+
+    auto callback = [&c](const float *pcm, size_t n) {
+        (void)ws_emit_pcm(c, pcm, n);
+    };
+
+    if (g_voxcpm2_batch) {
+        auto first = g_voxcpm2_batch->SubmitStream(
+            segs[0], voice, lang, seed, steps, callback);
+        std::vector<std::future<VoxCPM2ServerScheduler::Result>> tail;
+        tail.reserve(segs.size() - 1);
+        for (size_t i = 1; i < segs.size(); ++i) {
+            tail.push_back(g_voxcpm2_batch->Submit(
+                segs[i], voice, lang, seed, steps));
+        }
+        auto first_result = first.get();
+        if (!first_result.second.empty()) {
+            err = first_result.second;
+            return false;
+        }
+        for (auto &future : tail) {
+            if (!ws_wait_emit(future, c, err)) return false;
+        }
+        return true;
+    }
+
+    if (g_tts_batch && g_tts_batch->CanStreamFirstSentence()) {
+        std::vector<std::future<std::pair<std::vector<float>, std::string>>>
+            tail;
+        tail.reserve(segs.size() - 1);
+        for (size_t i = 1; i < segs.size(); ++i) {
+            tail.push_back(g_tts_batch->Submit(
+                segs[i], voice, lang, seed, session_id));
+        }
+        if (!g_tts_batch->StreamFirstSentence(segs[0], voice, lang, seed,
+                                              callback)) {
+            err = "CosyVoice3 first-segment streaming failed";
+            return false;
+        }
+        for (auto &future : tail) {
+            if (!ws_wait_emit(future, c, err)) return false;
+        }
+        return true;
+    }
+    if (g_tts_batch) {
+        std::vector<std::future<std::pair<std::vector<float>, std::string>>>
+            futures;
+        futures.reserve(segs.size());
+        for (size_t i = 0; i < segs.size(); ++i) {
+            futures.push_back(g_tts_batch->Submit(
+                segs[i], voice, lang, seed, session_id));
+        }
+        for (auto &future : futures) {
+            if (!ws_wait_emit(future, c, err)) return false;
+        }
+        return true;
+    }
+
+    // No independent streaming scheduler is available. Keep correctness and
+    // bounded per-segment synthesis; only the first segment is true-streamed.
+    if (!stream_tts_context(c, segs[0], voice, lang, seed, steps, err)) {
+        return false;
+    }
+    for (size_t i = 1; i < segs.size(); ++i) {
+        std::vector<float> pcm;
+        if (!do_synthesize(segs[i], voice, lang, seed, steps, pcm, err)) {
+            return false;
+        }
+        trim_tts_boundary_silence(pcm);
+        if (!ws_emit_pcm(c, pcm)) {
+            err = "WebSocket send failed";
+            return false;
+        }
+    }
+    return true;
 }
 
 // (1) Pure streaming ASR (X-ASR). Client streams PCM; server emits partials as
@@ -1027,14 +2137,30 @@ static void ws_asr_stream(rsws::Conn &c) {
 // (2) VAD + offline ASR. Client streams PCM; VAD segments it, each segment gets
 // interim partials (transcribing the growing buffer) and a final on segment end.
 static void ws_asr_vad(rsws::Conn &c) {
-    if (!g_have_asr) { ws_msg(c, "error", "error", "no ASR model loaded"); return; }
-    if (!g_have_vad) { ws_msg(c, "error", "error", "no VAD model (use --vad-model)"); return; }
-    std::unique_lock<std::mutex> vlk(g_vad_mu);
+    const uint64_t conn_id =
+        (uint64_t)(uintptr_t)&c ^ (uint64_t)std::chrono::steady_clock::now()
+                                        .time_since_epoch()
+                                        .count();
+    ws_logf("[ws/asr/vad:%llx] enter query='%s'\n",
+            (unsigned long long)conn_id, c.query().c_str());
+    if (!g_have_asr) {
+        ws_logf("[ws/asr/vad:%llx] reject: no ASR\n",
+                (unsigned long long)conn_id);
+        ws_msg(c, "error", "error", "no ASR model loaded");
+        return;
+    }
+    if (!g_have_vad) {
+        ws_logf("[ws/asr/vad:%llx] reject: no VAD\n",
+                (unsigned long long)conn_id);
+        ws_msg(c, "error", "error", "no VAD model (use --vad-model)");
+        return;
+    }
     AsrServerConfig asr_cfg = g_asr_cfg;
     VadServerConfig cfg = g_vad_cfg;
     const std::string &q = c.query();
     asr_cfg.two_pass = query_bool(q, "two_pass", asr_cfg.two_pass);
     asr_cfg.ctc_precheck = query_bool(q, "ctc_precheck", asr_cfg.ctc_precheck);
+    asr_cfg.ctc_only = query_bool(q, "ctc_only", asr_cfg.ctc_only);
     cfg.threshold = query_float(q, "vad_threshold", cfg.threshold, 0.0f, 1.0f);
     cfg.threshold = query_float(q, "threshold", cfg.threshold, 0.0f, 1.0f);
     cfg.end_silence_ms = query_int(q, "vad_end_silence_ms", cfg.end_silence_ms, 0, 60000);
@@ -1047,8 +2173,27 @@ static void ws_asr_vad(rsws::Conn &c) {
     cfg.max_segment_ms = query_int(q, "vad_max_segment_ms", cfg.max_segment_ms, 0, 3600000);
     cfg.max_segment_ms = query_int(q, "max_segment_ms", cfg.max_segment_ms, 0, 3600000);
 
-    rs_vad_reset(g_vad);
-    rs_vad_set_threshold(g_vad, cfg.threshold);
+    auto vad_worker = acquire_vad_ws_worker();
+    if (!vad_worker.vad) {
+        ws_logf("[ws/asr/vad:%llx] reject: VAD busy\n",
+                (unsigned long long)conn_id);
+        ws_msg(c, "error", "error", "VAD busy");
+        return;
+    }
+    ws_logf("[ws/asr/vad:%llx] acquired worker=%d\n",
+            (unsigned long long)conn_id, vad_worker.index);
+    if (rs_vad_reset(vad_worker.vad) != RS_OK) {
+        ws_logf("[ws/asr/vad:%llx] rs_vad_reset failed\n",
+                (unsigned long long)conn_id);
+        ws_msg(c, "error", "error", "rs_vad_reset failed");
+        return;
+    }
+    if (rs_vad_set_threshold(vad_worker.vad, cfg.threshold) != RS_OK) {
+        ws_logf("[ws/asr/vad:%llx] rs_vad_set_threshold failed\n",
+                (unsigned long long)conn_id);
+        ws_msg(c, "error", "error", "rs_vad_set_threshold failed");
+        return;
+    }
 
     rsjson::Value ready = rsjson::Value::object();
     ready["type"] = "ready";
@@ -1059,7 +2204,16 @@ static void ws_asr_vad(rsws::Conn &c) {
     ready["vad_max_segment_ms"] = cfg.max_segment_ms;
     ready["two_pass"] = asr_cfg.two_pass;
     ready["ctc_precheck"] = asr_cfg.ctc_precheck;
-    ws_send_json(c, ready);
+    ready["ctc_only"] = asr_cfg.ctc_only;
+    if (!ws_send_json(c, ready)) {
+        ws_logf("[ws/asr/vad:%llx] send ready failed\n",
+                (unsigned long long)conn_id);
+        return;
+    }
+    ws_logf("[ws/asr/vad:%llx] ready sent worker=%d threshold=%.3f "
+            "silence=%dms partial=%dms\n",
+            (unsigned long long)conn_id, vad_worker.index, cfg.threshold,
+            cfg.end_silence_ms, cfg.partial_ms);
 
     const int sr = g_asr.sample_rate;
     std::vector<float> seg;       // current speech segment
@@ -1069,55 +2223,65 @@ static void ws_asr_vad(rsws::Conn &c) {
     int seg_index = 0;
     size_t last_partial_len = 0;  // samples at last partial
 
-    auto transcribe_seg = [&](const char *kind) {
-        if (seg.empty()) return;
+    auto transcribe_seg = [&](const char *kind) -> bool {
+        if (seg.empty()) return true;
         int min_samples = (sr * cfg.min_segment_ms) / 1000;
-        if ((int)seg.size() < min_samples) return;
+        if ((int)seg.size() < min_samples) return true;
         std::string text, err;
         bool is_partial = strcmp(kind, "partial") == 0;
-        bool ok = false;
-        {
-            std::lock_guard<std::mutex> alk(g_asr.mu);
-            ok = transcribe_pcm_locked(seg.data(), (int)seg.size(), text, err,
-                                       asr_cfg.two_pass && !is_partial,
-                                       asr_cfg.ctc_precheck,
-                                       asr_cfg.two_pass && is_partial);
-            if (ok && !is_partial) note_asr_final_segment_locked("ws-vad-final");
+        AsrServerConfig seg_cfg = asr_cfg;
+        if (is_partial) {
+            seg_cfg.two_pass = false;
+            seg_cfg.ctc_precheck = false;
+            seg_cfg.ctc_only = true;
         }
+        bool ok = transcribe_pcm_server(seg.data(), (int)seg.size(), seg_cfg,
+                                        text, err);
         if (!ok) {
+            ws_logf("[ws/asr/vad:%llx] %s ASR failed: %s\n",
+                    (unsigned long long)conn_id, kind,
+                    err.empty() ? "ASR transcribe failed" : err.c_str());
             ws_msg(c, "error", "error", err.empty() ? "ASR transcribe failed" : err);
-            return;
+            return false;
         }
-        if (is_partial || !text.empty()) {
+        if (!text.empty()) {
             rsjson::Value o = rsjson::Value::object();
             o["type"] = kind; o["segment"] = seg_index; o["text"] = text;
-            o["two_pass"] = asr_cfg.two_pass && !is_partial;
-            o["ctc_only"] = asr_cfg.two_pass && is_partial;
+            o["two_pass"] = seg_cfg.two_pass && !seg_cfg.ctc_only;
+            o["ctc_only"] = seg_cfg.ctc_only;
             ws_send_json(c, o);
+            ws_logf("[ws/asr/vad:%llx] sent %s segment=%d samples=%zu "
+                    "text_len=%zu\n",
+                    (unsigned long long)conn_id, kind, seg_index, seg.size(),
+                    text.size());
         }
+        return true;
     };
 
-    auto finalize_seg = [&]() {
-        transcribe_seg("final");
+    auto finalize_seg = [&]() -> bool {
+        if (!transcribe_seg("final")) return false;
         in_speech = false;
         pending_end = false;
         pending_silence_samples = 0;
         seg_index++;
         seg.clear();
         last_partial_len = 0;
+        return true;
     };
 
-    auto force_split_seg = [&]() {
-        finalize_seg();
+    auto force_split_seg = [&]() -> bool {
+        if (!finalize_seg()) return false;
         in_speech = true;
+        return true;
     };
 
     std::vector<float> pcm;
     int op; std::string msg;
+    bool saw_binary = false;
     auto handle_frames = [&]() {
         rs_vad_frame_t frames[64];
         int nf;
-        while ((nf = rs_vad_drain_frames(g_vad, frames, 64)) > 0) {
+        while ((nf = rs_vad_drain_frames(vad_worker.vad, frames, 64)) > 0) {
             for (int i = 0; i < nf; i++) {
                 if (frames[i].is_speech_start) {
                     if (pending_end) {
@@ -1143,7 +2307,18 @@ static void ws_asr_vad(rsws::Conn &c) {
     while (c.recv(op, msg)) {
         if (op == rsws::OP_BINARY) {
             pcm16_to_float(msg, pcm);
-            rs_vad_push_audio(g_vad, pcm.data(), (int)pcm.size());
+            if (!saw_binary) {
+                saw_binary = true;
+                ws_logf("[ws/asr/vad:%llx] first binary frame samples=%zu\n",
+                        (unsigned long long)conn_id, pcm.size());
+            }
+            if (rs_vad_push_audio(vad_worker.vad, pcm.data(),
+                                  (int)pcm.size()) != RS_OK) {
+                ws_logf("[ws/asr/vad:%llx] rs_vad_push_audio failed\n",
+                        (unsigned long long)conn_id);
+                ws_msg(c, "error", "error", "rs_vad_push_audio failed");
+                return;
+            }
             handle_frames();
             if (in_speech) {
                 seg.insert(seg.end(), pcm.begin(), pcm.end());
@@ -1153,24 +2328,33 @@ static void ws_asr_vad(rsws::Conn &c) {
             if (in_speech && !pending_end && cfg.partial_ms > 0 &&
                 seg.size() - last_partial_len >= (size_t)((sr * cfg.partial_ms) / 1000)) {
                 last_partial_len = seg.size();
-                transcribe_seg("partial");
+                if (!transcribe_seg("partial")) return;
             }
             if (pending_end &&
                 pending_silence_samples >= (sr * cfg.end_silence_ms) / 1000) {
-                finalize_seg();
+                if (!finalize_seg()) return;
             }
             if (in_speech && cfg.max_segment_ms > 0 &&
                 seg.size() >= (size_t)((sr * cfg.max_segment_ms) / 1000)) {
-                if (pending_end) finalize_seg();
-                else force_split_seg();
+                if (pending_end) {
+                    if (!finalize_seg()) return;
+                } else if (!force_split_seg()) {
+                    return;
+                }
             }
         } else if (op == rsws::OP_TEXT) {
             rsjson::Value j;
             try { j = rsjson::parse(msg); } catch (...) { continue; }
-            if (j["type"].as_string() == "eos") break;
+            if (j["type"].as_string() == "eos") {
+                ws_logf("[ws/asr/vad:%llx] eos received\n",
+                        (unsigned long long)conn_id);
+                break;
+            }
         }
     }
-    if (in_speech) transcribe_seg("final");
+    if (in_speech && !transcribe_seg("final")) return;
+    ws_logf("[ws/asr/vad:%llx] done segments=%d\n",
+            (unsigned long long)conn_id, seg_index + (in_speech ? 1 : 0));
     ws_msg(c, "done");
 }
 
@@ -1197,12 +2381,21 @@ static void ws_tts_segmented(rsws::Conn &c) {
     ws_send_json(c, info);
 
     std::unique_lock<std::mutex> lk(g_tts.mu, std::defer_lock);
-    if (!g_tts_batch) lk.lock();
+    if (!g_tts_batch && !g_voxcpm2_batch) lk.lock();
 
     auto segs = split_sentences(text);
     for (size_t i = 0; i < segs.size(); i++) {
         std::vector<float> pcm;
-        if (g_tts_batch) {
+        if (g_voxcpm2_batch) {
+            auto fut = g_voxcpm2_batch->Submit(
+                segs[i], voice, lang, 42, 8);
+            auto result = fut.get();
+            if (!result.second.empty()) {
+                ws_msg(c, "error", "error", result.second);
+                continue;
+            }
+            pcm = std::move(result.first);
+        } else if (g_tts_batch) {
             auto fut = g_tts_batch->Submit(segs[i], voice, lang, 42, sid);
             auto result = fut.get();
             if (!result.second.empty()) {
@@ -1231,11 +2424,9 @@ static void ws_tts_segmented(rsws::Conn &c) {
     ws_msg(c, "final");
 }
 
-// (4) Pure streaming TTS: drive rs_process and emit each audio chunk immediately
-// (low first-chunk latency for CosyVoice3; one big chunk for offline-only models).
-// Batch mode: sentence-level pipelining — sentence N+1 decodes in the scheduler
-// while sentence N streams to the client, and multiple connections interleave
-// at token granularity instead of getting "TTS model busy".
+// (4) Streaming TTS. stream_mode=true preserves model-native streaming over the
+// full text. stream_mode=hybrid streams segment 0 and queues later segments for
+// bounded, concurrent synthesis while preserving output order.
 static void ws_tts_stream(rsws::Conn &c) {
     if (!g_have_tts) { ws_msg(c, "error", "error", "no TTS model loaded"); return; }
 
@@ -1248,71 +2439,48 @@ static void ws_tts_stream(rsws::Conn &c) {
     if (text.empty()) { ws_msg(c, "error", "error", "missing 'text'"); return; }
     std::string voice = req["voice"].as_string("male");
     std::string lang = req["language"].as_string("English");
+    int seed = req.contains("seed") ? req["seed"].as_int(42) : 42;
+    int steps = req.contains("n_steps") ? req["n_steps"].as_int(8) : 8;
+    std::string stream_mode = g_tts_stream_mode;
+    if (req.contains("stream_mode")) {
+        stream_mode = req["stream_mode"].as_string(stream_mode);
+    } else if (req.contains("tts_stream_mode")) {
+        stream_mode = req["tts_stream_mode"].as_string(stream_mode);
+    }
+    stream_mode = normalize_tts_stream_mode(stream_mode);
+    int segment_max_chars = g_tts_segment_max_chars;
+    if (req.contains("segment_max_chars")) {
+        segment_max_chars = req["segment_max_chars"].as_int(segment_max_chars);
+    } else if (req.contains("tts_segment_max_chars")) {
+        segment_max_chars = req["tts_segment_max_chars"].as_int(segment_max_chars);
+    }
+    segment_max_chars = std::max(16, std::min(512, segment_max_chars));
+
+    if (stream_mode == "auto") {
+        stream_mode = split_sentences_bounded(text, segment_max_chars).size() > 1
+            ? "hybrid" : "true";
+    }
 
     rsjson::Value info = rsjson::Value::object();
     info["type"] = "audio_info"; info["sample_rate"] = g_tts.sample_rate;
     info["format"] = "pcm_s16le";
+    info["stream_mode"] = stream_mode;
+    if (stream_mode == "hybrid") {
+        info["segment_max_chars"] = segment_max_chars;
+    }
     ws_send_json(c, info);
 
-    std::unique_lock<std::mutex> lk(g_tts.mu, std::defer_lock);
-    if (!g_tts_batch) lk.lock();
-
-    if (g_tts_batch) {
-        auto segs = split_sentences(text);
-        if (segs.empty()) { ws_msg(c, "final"); return; }
-
-        // First sentence: true streaming via DecodeStream (chunk-level audio,
-        // first chunk ~350 ms — under 500 ms target). Runs on the vocoder sched
-        // so the main LM thread can continue batched decode of other sessions.
-        if (!segs.empty()) {
-            struct ChunkState { rsws::Conn *c; std::string pcm16; };
-            ChunkState cs{&c, {}};
-            bool ok = g_tts_batch->StreamFirstSentence(
-                segs[0], voice, lang, 42,
-                [&cs](const float *pcm, size_t n) {
-                    cs.c->send_binary(float_to_pcm16(pcm, n).data(), n * 2);
-                });
-            if (!ok) {
-                ws_msg(c, "error", "error", "stream first sentence failed");
-                return;
-            }
-        }
-
-        // Remaining sentences: normal batch Submit (batched decode + flow/hift,
-        // concurrent with other sessions' work on the main LM sched).
-        if (segs.size() > 1) {
-            std::vector<std::future<std::pair<std::vector<float>, std::string>>> futs;
-            futs.reserve(segs.size() - 1);
-            for (size_t i = 1; i < segs.size(); ++i)
-                futs.push_back(g_tts_batch->Submit(segs[i], voice, lang, 42, sid));
-            for (auto &fut : futs) {
-                auto result = fut.get();
-                if (!result.second.empty()) {
-                    ws_msg(c, "error", "error", result.second);
-                    continue;
-                }
-                std::string b = float_to_pcm16(result.first.data(), result.first.size());
-                c.send_binary(b.data(), b.size());
-            }
-        }
-        ws_msg(c, "final");
-        return;
+    std::string err;
+    bool ok = false;
+    if (stream_mode == "hybrid") {
+        ok = ws_tts_stream_hybrid_impl(c, text, voice, lang, seed, steps,
+                                       segment_max_chars, sid, err);
+    } else {
+        ok = ws_tts_stream_true_impl(c, text, voice, lang, seed, steps, err);
     }
-
-    rs_reset(g_tts.ctx);
-    rs_set_tts_params(g_tts.ctx, voice.c_str(), lang.c_str(), 42);
-    if (rs_push_text(g_tts.ctx, text.c_str()) != RS_OK) {
-        ws_msg(c, "error", "error", "rs_push_text failed");
+    if (!ok) {
+        ws_msg(c, "error", "error", err.empty() ? "TTS streaming failed" : err);
         return;
-    }
-    int32_t ret;
-    while ((ret = rs_process(g_tts.ctx)) >= 0) {
-        float *ch = nullptr; int n = rs_get_audio_output(g_tts.ctx, &ch);
-        if (n > 0 && ch) {
-            std::string b = float_to_pcm16(ch, n);
-            c.send_binary(b.data(), b.size());
-        }
-        if (ret == 0) break;
     }
     ws_msg(c, "final");
 }
@@ -1326,18 +2494,29 @@ static void usage(const char *argv0) {
         "  --asr-model PATH   ASR GGUF (enables /v1/audio/transcriptions + transcribe tool)"
         "  --tts-model PATH   TTS GGUF (enables /v1/audio/speech + synthesize tool)"
         "  --vad-model PATH   VAD GGUF (enables the /asr/vad WebSocket)"
+        "  --vad-workers N    Independent /asr/vad WebSocket VAD workers (default 1)"
         "  --vad-threshold F  VAD speech threshold (default 0.5)"
         "  --vad-end-silence-ms N  Silence before finalizing segment (default 600)"
-        "  --vad-partial-ms N Partial ASR interval for /asr/vad (default 600, 0=off)"
+        "  --vad-partial-ms N Partial ASR interval for /asr/vad (default 1500, 0=off)"
         "  --vad-min-segment-ms N  Minimum segment to transcribe (default 500)"
         "  --vad-max-segment-ms N  Force-finalize long speech (default 0=off)"
         "  --two-pass        FunASR-Nano: CTC first pass + LLM final re-decode"
         "  --ctc-precheck    FunASR-Nano: skip LLM on CTC-empty silence/noise"
-        "  --tts-slots N     TTS concurrent requests via continuous batching"
+        "  --asr-slots N     ASR shape-bucketed batch slots (default 4, 1=off)"
+        "  --asr-max-queued N  Maximum queued ASR requests (default 256)"
+        "  --asr-batch-wait-ms N  ASR microbatch wait window (default 3)"
+        "  --asr-min-batch N Prefer waiting for at least N ASR requests (default=asr-slots)"
+        "  --asr-max-batch-wait-ms N  Hard ASR microbatch wait cap (default=4x batch-wait)"
+        "  --asr-frontend-threads N  CPU fbank threads per ASR request (default 1)"
+        "  --asr-frontend-workers N  Concurrent ASR frontend jobs (default=asr-slots)"
+        "  --tts-slots N     TTS concurrent requests via scheduler/batching"
         "  --tts-voc-workers N  Flow/HiFT worker threads (CUDA streams, default 1)"
-        "                    (CosyVoice3 only; default 2, 1=serialized)"
+        "                    (CosyVoice3/VoxCPM2; default 2, 1=serialized)"
+        "  --tts-stream-mode MODE  /tts/stream mode: true, hybrid, auto"
+        "  --tts-segment-max-chars N  Max chars per hybrid TTS segment (default 80)"
         "  --mem-log         Log ASR scheduler compute-buffer high-water marks"
         "  --asr-reload-every N  Reload ASR after N final segments to release GPU buffers (0=off)"
+        "  --ws-log          Log WebSocket connection lifecycle events"
         "  --host HOST        HTTP bind host (default 127.0.0.1)"
         "  --port PORT        HTTP port (default 8080)"
         "  --ws-port PORT     WebSocket port (default HTTP port + 1)"
@@ -1352,7 +2531,7 @@ static void usage(const char *argv0) {
         "                   query overrides: vad_threshold, vad_end_silence_ms,"
         "                   vad_partial_ms,"
         "                   vad_min_segment_ms, vad_max_segment_ms,"
-        "                   two_pass, ctc_precheck"
+        "                   two_pass, ctc_precheck, ctc_only"
         "  /tts/segmented   sentence-by-sentence TTS       audio per segment"
         "  /tts/stream      pure streaming TTS             audio chunks as generated\n"
         "At least one of --asr-model / --tts-model is required.\n",
@@ -1372,6 +2551,12 @@ int main(int argc_raw, char **argv_raw) {
     std::string asr_model, tts_model, vad_model, host = "127.0.0.1", web_dir;
     int port = 8080, ws_port = -1, threads = 4;
     bool gpu = true, mcp_stdio = false;
+    if (const char *p = std::getenv("RS_TTS_STREAM_MODE")) {
+        g_tts_stream_mode = normalize_tts_stream_mode(p);
+    }
+    if (const char *p = std::getenv("RS_TTS_SEGMENT_MAX_CHARS")) {
+        g_tts_segment_max_chars = std::max(16, std::min(512, std::atoi(p)));
+    }
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -1382,6 +2567,9 @@ int main(int argc_raw, char **argv_raw) {
         if (a == "--asr-model") asr_model = next("--asr-model");
         else if (a == "--tts-model") tts_model = next("--tts-model");
         else if (a == "--vad-model") vad_model = next("--vad-model");
+        else if (a == "--vad-workers") {
+            g_vad_workers = std::max(1, atoi(next("--vad-workers")));
+        }
         else if (a == "--vad-threshold") {
             g_vad_cfg.threshold = std::max(0.0f, std::min(1.0f, (float)atof(next("--vad-threshold"))));
         }
@@ -1399,13 +2587,46 @@ int main(int argc_raw, char **argv_raw) {
         }
         else if (a == "--two-pass") g_asr_cfg.two_pass = true;
         else if (a == "--ctc-precheck") g_asr_cfg.ctc_precheck = true;
+        else if (a == "--asr-slots") {
+            g_asr_slots = std::max(1, atoi(next("--asr-slots")));
+        }
+        else if (a == "--asr-max-queued") {
+            g_asr_max_queued = std::max(1, atoi(next("--asr-max-queued")));
+        }
+        else if (a == "--asr-batch-wait-ms") {
+            g_asr_batch_wait_ms = std::max(0, atoi(next("--asr-batch-wait-ms")));
+        }
+        else if (a == "--asr-min-batch") {
+            g_asr_min_batch = std::max(1, atoi(next("--asr-min-batch")));
+        }
+        else if (a == "--asr-max-batch-wait-ms") {
+            g_asr_max_batch_wait_ms =
+                std::max(0, atoi(next("--asr-max-batch-wait-ms")));
+        }
+        else if (a == "--asr-frontend-threads") {
+            g_asr_frontend_threads =
+                std::max(1, atoi(next("--asr-frontend-threads")));
+        }
+        else if (a == "--asr-frontend-workers") {
+            g_asr_frontend_workers =
+                std::max(1, atoi(next("--asr-frontend-workers")));
+        }
         else if (a == "--tts-slots") {
             g_tts_slots = std::max(1, atoi(next("--tts-slots")));
         }
         else if (a == "--tts-voc-workers" || a == "--voc-workers") {
             g_tts_voc_workers = std::max(1, atoi(next("--tts-voc-workers")));
         }
+        else if (a == "--tts-stream-mode") {
+            g_tts_stream_mode = normalize_tts_stream_mode(
+                next("--tts-stream-mode"));
+        }
+        else if (a == "--tts-segment-max-chars") {
+            g_tts_segment_max_chars = std::max(
+                16, std::min(512, atoi(next("--tts-segment-max-chars"))));
+        }
         else if (a == "--mem-log") g_mem_log = true;
+        else if (a == "--ws-log") g_ws_log = true;
         else if (a == "--asr-reload-every") {
             g_asr_reload_every = std::max(0, atoi(next("--asr-reload-every")));
         }
@@ -1447,6 +2668,11 @@ int main(int argc_raw, char **argv_raw) {
             return 1;
         }
         g_have_asr = true;
+        if (g_asr.ctx && g_asr.ctx->ctx_gguf) {
+            load_cmvn_params(g_asr.ctx->ctx_gguf, g_asr_cmvn_means,
+                             g_asr_cmvn_vars);
+            g_asr_cmvn_version++;
+        }
         fprintf(stderr, "[server] ASR ready: %s @ %d Hz\n", g_asr.arch.c_str(), g_asr.sample_rate);
         fprintf(stderr, "[server] ASR decode: two-pass=%s ctc-precheck=%s\n",
                 g_asr_cfg.two_pass ? "on" : "off",
@@ -1459,11 +2685,43 @@ int main(int argc_raw, char **argv_raw) {
             fprintf(stderr, "[server] ASR auto-reload enabled: every %d final segment(s)\n",
                     g_asr_reload_every);
         }
+        if (g_asr_slots > 1 &&
+            (g_asr.arch == "SenseVoiceSmall" || g_asr.arch == "FunASRNano")) {
+            const int asr_max_batch_wait_ms =
+                g_asr_max_batch_wait_ms < 0
+                    ? std::max(g_asr_batch_wait_ms,
+                               g_asr_batch_wait_ms * 4)
+                    : g_asr_max_batch_wait_ms;
+            const int asr_frontend_workers =
+                g_asr_frontend_workers > 0
+                    ? g_asr_frontend_workers
+                    : g_asr_slots;
+            const int asr_min_batch =
+                g_asr_min_batch <= 0
+                    ? g_asr_slots
+                    : std::min(g_asr_min_batch, g_asr_slots);
+            g_asr_batch = std::make_unique<AsrBatchScheduler>(
+                g_asr_slots, g_asr_max_queued, g_asr_batch_wait_ms,
+                g_asr_min_batch, asr_max_batch_wait_ms,
+                asr_frontend_workers);
+            g_asr_batch->Start();
+            fprintf(stderr,
+                    "[server] ASR scheduler: slots=%d max_queued=%d "
+                    "batch_wait=%dms min_batch=%d max_wait=%dms "
+                    "frontend_workers=%d frontend_threads=%d\n",
+                    g_asr_slots, g_asr_max_queued, g_asr_batch_wait_ms,
+                    asr_min_batch, asr_max_batch_wait_ms,
+                    asr_frontend_workers, g_asr_frontend_threads);
+        } else if (g_asr_slots > 1) {
+            fprintf(stderr,
+                    "[server] ASR batching unavailable for arch=%s; using serialized path\n",
+                    g_asr.arch.c_str());
+        }
     }
     if (!tts_model.empty()) {
         fprintf(stderr, "[server] loading TTS: %s\n", tts_model.c_str());
         // Load as TTS_ONLINE so rs_process streams per-chunk where the model
-        // supports it (CosyVoice3); other TTS models fall back to offline but
+        // supports it; other TTS models fall back to offline but
         // still work through the same collect loop.
         if (!g_tts.load(tts_model, threads, gpu, RS_TASK_TTS_ONLINE)) {
             fprintf(stderr, "[server] failed to load TTS model\n");
@@ -1472,9 +2730,8 @@ int main(int argc_raw, char **argv_raw) {
         g_have_tts = true;
         fprintf(stderr, "[server] TTS ready: %s @ %d Hz\n", g_tts.arch.c_str(), g_tts.sample_rate);
 
-        // Continuous batching: CosyVoice3 only (its LM decode is split into
-        // per-token steps the scheduler can interleave). Other archs keep the
-        // mutex-serialized path.
+        // CosyVoice3 uses continuous LM batching. VoxCPM2 is initialized below
+        // with independent per-request states and backend schedulers.
         if (g_tts_slots > 1 && g_tts.arch == "cosyvoice3") {
             auto *cv3 = dynamic_cast<CosyVoice3LMModel *>(g_tts.ctx->model.get());
             if (cv3) {
@@ -1494,6 +2751,32 @@ int main(int argc_raw, char **argv_raw) {
                         "using serialized path\n");
             }
         }
+        if (g_tts_slots > 1 && g_tts.arch == "voxcpm2") {
+            auto *voxcpm2 =
+                dynamic_cast<VoxCPM2Model *>(g_tts.ctx->model.get());
+            if (voxcpm2) {
+                auto extra = g_tts.ctx->create_extra_gpu_scheds(
+                    g_tts_slots - 1);
+                std::vector<ggml_backend_sched_t> scheds;
+                scheds.push_back(g_tts.ctx->sched);
+                scheds.insert(scheds.end(), extra.begin(), extra.end());
+                g_voxcpm2_batch =
+                    std::make_unique<VoxCPM2ServerScheduler>(
+                        voxcpm2, std::move(scheds), g_tts_slots);
+                g_voxcpm2_batch->Start();
+                fprintf(stderr,
+                        "[server] VoxCPM2 TTS scheduler: %d slots, %d "
+                        "compute worker(s)%s\n",
+                        g_tts_slots, g_voxcpm2_batch->n_workers(),
+                        g_voxcpm2_batch->n_workers() > 1
+                            ? " (parallel CUDA schedulers)"
+                            : " (serialized backend queue)");
+            } else {
+                fprintf(stderr,
+                        "[server] VoxCPM2 batching unavailable "
+                        "(model cast failed)\n");
+            }
+        }
     }
     if (!vad_model.empty()) {
         fprintf(stderr, "[server] loading VAD: %s\n", vad_model.c_str());
@@ -1503,13 +2786,26 @@ int main(int argc_raw, char **argv_raw) {
             return 1;
         }
         rs_vad_set_threshold(g_vad, g_vad_cfg.threshold);
+        for (int i = 0; i < g_vad_workers; ++i) {
+            rs_vad_t *worker =
+                rs_vad_init_from_file(vad_model.c_str(), threads, gpu);
+            if (!worker) {
+                fprintf(stderr,
+                        "[server] failed to load VAD worker %d/%d\n",
+                        i + 1, g_vad_workers);
+                return 1;
+            }
+            rs_vad_set_threshold(worker, g_vad_cfg.threshold);
+            g_vad_ws_pool.push_back(worker);
+            g_vad_ws_busy.push_back(false);
+        }
         g_have_vad = true;
         fprintf(stderr,
                 "[server] VAD ready: %s  threshold=%.2f silence=%dms partial=%dms "
-                "min-seg=%dms max-seg=%dms\n",
+                "min-seg=%dms max-seg=%dms ws-workers=%d\n",
                 rs_vad_get_arch(g_vad), g_vad_cfg.threshold,
                 g_vad_cfg.end_silence_ms, g_vad_cfg.partial_ms, g_vad_cfg.min_segment_ms,
-                g_vad_cfg.max_segment_ms);
+                g_vad_cfg.max_segment_ms, g_vad_workers);
     }
 
     if (mcp_stdio) {
@@ -1537,6 +2833,74 @@ int main(int argc_raw, char **argv_raw) {
     srv.Get("/health", [](const httplib::Request &, httplib::Response &res) {
         rsjson::Value o = rsjson::Value::object();
         o["status"] = "ok";
+        if (g_asr_batch) {
+            auto s = g_asr_batch->snapshot();
+            rsjson::Value b = rsjson::Value::object();
+            b["slots"] = s.slots;
+            b["queued"] = s.queued;
+            b["raw_queued"] = s.raw_queued;
+            b["preparing"] = s.preparing;
+            b["max_queued"] = s.max_queued;
+            b["batch_wait_ms"] = s.batch_wait_ms;
+            b["min_batch"] = s.min_batch;
+            b["max_batch_wait_ms"] = s.max_batch_wait_ms;
+            b["frontend_threads"] = g_asr_frontend_threads;
+            b["frontend_workers"] = s.frontend_workers;
+            b["submitted"] = (int64_t)s.submitted;
+            b["completed"] = (int64_t)s.completed;
+            b["failed"] = (int64_t)s.failed;
+            b["rejected"] = (int64_t)s.rejected;
+            b["batches"] = (int64_t)s.batches;
+            b["batched_requests"] = (int64_t)s.batched_requests;
+            b["max_batch"] = (int64_t)s.max_batch;
+            rsjson::Value hist = rsjson::Value::array();
+            for (uint64_t v : s.batch_size_hist) {
+                hist.push_back((int64_t)v);
+            }
+            b["batch_size_hist"] = hist;
+            b["avg_batch"] = s.batches
+                                 ? (double)s.batched_requests / (double)s.batches
+                                 : 0.0;
+            b["avg_queue_wait_ms"] = s.completed
+                                         ? (double)s.queue_wait_ms /
+                                               (double)s.completed
+                                         : 0.0;
+            b["avg_frontend_ms"] = s.completed
+                                       ? (double)s.frontend_ms /
+                                             (double)s.completed
+                                       : 0.0;
+            b["avg_e2e_ms"] = s.completed
+                                  ? (double)s.e2e_ms / (double)s.completed
+                                  : 0.0;
+            b["avg_encode_ms_per_batch"] = s.batches
+                                               ? (double)s.encode_ms /
+                                                     (double)s.batches
+                                               : 0.0;
+            b["avg_decode_ms_per_batch"] = s.batches
+                                               ? (double)s.decode_ms /
+                                                     (double)s.batches
+                                               : 0.0;
+            o["asr_batch"] = b;
+        }
+        if (g_tts_batch) {
+            o["tts_batch"]["slots"] = g_tts_batch->n_slots();
+            o["tts_batch"]["active"] = g_tts_batch->n_active();
+            o["tts_batch"]["queued"] = g_tts_batch->n_queued();
+        } else if (g_voxcpm2_batch) {
+            o["tts_batch"]["slots"] = g_voxcpm2_batch->n_slots();
+            o["tts_batch"]["workers"] = g_voxcpm2_batch->n_workers();
+            o["tts_batch"]["active"] = g_voxcpm2_batch->n_active();
+            o["tts_batch"]["queued"] = g_voxcpm2_batch->n_queued();
+        }
+        if (g_have_vad) {
+            std::lock_guard<std::mutex> lk(g_vad_ws_pool_mu);
+            int busy = 0;
+            for (bool v : g_vad_ws_busy) {
+                if (v) busy++;
+            }
+            o["vad_workers"]["slots"] = (int)g_vad_ws_pool.size();
+            o["vad_workers"]["busy"] = busy;
+        }
         send_json(res, 200, o);
     });
     srv.Get("/v1/models", handle_models);

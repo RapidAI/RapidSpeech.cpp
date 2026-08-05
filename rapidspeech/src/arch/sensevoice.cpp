@@ -5,6 +5,7 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "utils/rs_log.h"
+#include <cstdint>
 #include <cmath>
 #include <cstring>
 #include <functional>
@@ -147,6 +148,12 @@ bool SenseVoiceModel::Encode(const std::vector<float> &input_frames,
   return encoder_->Encode(input_frames, state, sched);
 }
 
+bool SenseVoiceModel::EncodeBatch(
+    const std::vector<const std::vector<float> *> &inputs,
+    const std::vector<RSState *> &states, ggml_backend_sched_t sched) {
+  return encoder_->EncodeBatch(inputs, states, sched);
+}
+
 /**
  * Enhanced Decode function supporting Greedy and Beam Search.
  */
@@ -229,6 +236,93 @@ bool SenseVoiceModel::Decode(RSState &state, ggml_backend_sched_t sched) {
         CTCDecoder::BeamSearchDecode(host_log_probs.data(), T, V, beam_size);
   }
   if (!sv_state.kws_mode) {
+    for (auto id : sv_state.ids) {
+      sv_state.tokens.push_back(this->vocab_.id_to_token[id]);
+    }
+  }
+
+  ggml_free(ctx0);
+  return true;
+}
+
+bool SenseVoiceModel::DecodeBatch(const std::vector<RSState *> &states,
+                                  ggml_backend_sched_t sched) {
+  if (states.empty()) return true;
+  if (states.size() == 1) return Decode(*states[0], sched);
+
+  const int n_batch = (int)states.size();
+  auto &first = static_cast<SenseVoiceState &>(*states[0]);
+  if (!first.encoder_out || first.kws_mode) return false;
+  const int C = first.encoder_out->ne[0];
+  const int T = first.encoder_out->ne[1];
+  const int V = hparams_.n_vocab;
+  for (auto *state : states) {
+    if (!state) return false;
+    auto &sv_state = static_cast<SenseVoiceState &>(*state);
+    if (!sv_state.encoder_out || sv_state.kws_mode ||
+        sv_state.encoder_out->ne[0] != C || sv_state.encoder_out->ne[1] != T) {
+      return false;
+    }
+  }
+
+  struct ggml_context *ctx0 =
+      ggml_init({512 * ggml_tensor_overhead(), nullptr, true});
+  struct ggml_cgraph *gf =
+      ggml_new_graph_custom(ctx0, SENSE_VOICE_DECODER_MAX_NODES, false);
+
+  struct ggml_tensor *encoder_in =
+      ggml_new_tensor_3d(ctx0, first.encoder_out->type, C, T, n_batch);
+  ggml_set_input(encoder_in);
+
+  struct ggml_tensor *logits =
+      ggml_mul_mat(ctx0, decoder_->ctc_out_linear_weight, encoder_in);
+  logits = ggml_add(ctx0, logits, decoder_->ctc_out_linear_bias);
+  ggml_set_name(logits, "ctc_logits_batch");
+  ggml_set_output(logits);
+  ggml_build_forward_expand(gf, logits);
+
+  if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+    ggml_free(ctx0);
+    return false;
+  }
+
+  const size_t bytes_per_state =
+      ggml_row_size(first.encoder_out->type, C) * (size_t)T;
+  std::vector<uint8_t> enc_tmp(bytes_per_state);
+  for (int b = 0; b < n_batch; ++b) {
+    auto &sv_state = static_cast<SenseVoiceState &>(*states[b]);
+    ggml_backend_tensor_get(sv_state.encoder_out, enc_tmp.data(), 0,
+                            bytes_per_state);
+    ggml_backend_tensor_set(encoder_in, enc_tmp.data(), (size_t)b * encoder_in->nb[2],
+                            bytes_per_state);
+  }
+
+  if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+    ggml_free(ctx0);
+    return false;
+  }
+
+  const size_t logits_bytes_per_state = (size_t)V * T * sizeof(float);
+  std::vector<float> logits_host((size_t)V * T);
+  std::vector<int32_t> raw_ids(T);
+  for (int b = 0; b < n_batch; ++b) {
+    auto &sv_state = static_cast<SenseVoiceState &>(*states[b]);
+    ggml_backend_tensor_get(logits, logits_host.data(), (size_t)b * logits->nb[2],
+                            logits_bytes_per_state);
+    for (int t = 0; t < T; ++t) {
+      const float *row = logits_host.data() + (size_t)t * V;
+      int best = 0;
+      float best_v = row[0];
+      for (int v = 1; v < V; ++v) {
+        if (row[v] > best_v) {
+          best_v = row[v];
+          best = v;
+        }
+      }
+      raw_ids[t] = best;
+    }
+    sv_state.ids = CTCDecoder::GreedyDecode(raw_ids.data(), T);
+    sv_state.tokens.clear();
     for (auto id : sv_state.ids) {
       sv_state.tokens.push_back(this->vocab_.id_to_token[id]);
     }

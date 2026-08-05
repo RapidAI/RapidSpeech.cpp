@@ -2,6 +2,7 @@
 #include "ggml.h"
 #include "gguf.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <regex>
@@ -82,6 +83,13 @@ static bool rs_model_quantize(const std::string &fname_inp,
   const int n_tensors = gguf_get_n_tensors(gguf_ctx);
   RS_QUANTIZE_LOG_INFO("Number of tensors: %d", n_tensors);
 
+  std::string architecture;
+  const int64_t arch_key =
+      gguf_find_key(gguf_ctx, "general.architecture");
+  if (arch_key >= 0) {
+    architecture = gguf_get_val_str(gguf_ctx, arch_key);
+  }
+
   // Regexes of tensor names to NOT quantize (keep original precision)
   // For Q2_K_M / Q3_K_M / Q4_K_M / Q5_K_M and the IQ_M variants:
   // embed/output/ctc_lo are bumped to higher-precision types by
@@ -115,6 +123,11 @@ static bool rs_model_quantize(const std::string &fname_inp,
       // generation; Q4_K quantization produces incorrect tokens (silence)
       "audio_embeddings.weight",
       "audio_heads.weight",
+      // VoxCPM2 AudioVAE is precision-sensitive and already dominated by
+      // weight-normalized Conv1d tensors (weight_v/weight_g). Keep the small
+      // sample-rate conditioning embeddings at source precision as well so a
+      // quantized Transformer model preserves the F16 vocoder exactly.
+      "audio_vae\\..*",
       // RVQ codec projection weights — quantization breaks the decode path,
       // causing constant (saturated) output from DAC vocoder
       "quantizer.*.project_in.weight",
@@ -192,7 +205,58 @@ static bool rs_model_quantize(const std::string &fname_inp,
       // Stateless predictor tables are read back to the host (F16/F32 only) and
       // drive greedy decoding; quantizing them corrupts the host read.
       "decoder\\.embedding\\.weight",
-      "decoder\\.conv\\.weight"};
+      "decoder\\.conv\\.weight",
+      // ---- MOSS-Transcribe-Diarize (also Qwen3-ASR audio tower) ----
+      // Conv1d stem kernels: k=3 (ne[0]=3, never block-aligned) and tiny;
+      // keep at source precision.
+      "a\\.conv1d\\..*",
+      // Learned position embedding: consumed by ggml_add on Metal, which
+      // requires an F32 src1 — quantizing it aborts the encoder graph.
+      "a\\.position_embd\\.weight",
+      // VQAdaptor bridge (Linear 4096->1024 -> SiLU -> Linear 1024->1024 ->
+      // LayerNorm): ~10 MB total, and every audio token flows through it
+      // before reaching the LLM — the single most precision-critical spot in
+      // the pipeline. Keep at source precision.
+      "mm\\.a\\..*"};
+
+  if (architecture == "voxcpm2") {
+    if (cli_opts.voxcpm2_aggressive) {
+      to_skip.erase(
+          std::remove(to_skip.begin(), to_skip.end(), "audio_vae\\..*"),
+          to_skip.end());
+    }
+    // VoxCPM2 uses these comparatively small projections at the boundaries
+    // of its autoregressive and diffusion stages. Quantizing them perturbs
+    // the denoised latent scale enough for the F16 AudioVAE to overflow in an
+    // early upsampling block, producing a constant +/-1 waveform after tanh.
+    // Keep the large Transformer bodies quantized and preserve only the
+    // precision-critical bridge, time-conditioning and output tensors.
+    const std::vector<std::string> voxcpm2_sensitive = {
+        "enc_to_lm_proj\\..*",
+        "fusion_concat_proj\\..*",
+        "fsq_layer\\..*",
+        "lm_to_dit_proj\\..*",
+        "res_to_dit_proj\\..*",
+        "stop_head\\..*",
+        "stop_proj\\..*",
+        "feat_encoder\\.in_proj\\..*",
+        "feat_decoder\\.estimator\\.in_proj\\..*",
+        "feat_decoder\\.estimator\\.cond_proj\\..*",
+        "feat_decoder\\.estimator\\.time_mlp\\..*",
+        "feat_decoder\\.estimator\\.delta_time_mlp\\..*",
+        "feat_decoder\\.estimator\\.out_proj\\..*",
+        "audio_vae\\.decoder\\.sr_cond_model\\..*",
+    };
+    to_skip.insert(to_skip.end(), voxcpm2_sensitive.begin(),
+                   voxcpm2_sensitive.end());
+    if (cli_opts.voxcpm2_aggressive) {
+      RS_QUANTIZE_LOG_INFO(
+          "VoxCPM2 aggressive: acoustic path Q8, packed AudioVAE Q4");
+    } else {
+      RS_QUANTIZE_LOG_INFO(
+          "VoxCPM2 mixed precision: preserving acoustic path and boundary tensors");
+    }
+  }
 
   // For non-mixed strategies (bare Q*_K / IQ*): default policy is to keep
   // embed/lm_head/ctc at source precision (F32/F16) because the GPU F16
@@ -210,6 +274,7 @@ static bool rs_model_quantize(const std::string &fname_inp,
 
   // Build the full options for the underlying quantize call.
   rs_quantize_options opts = cli_opts;
+  opts.model_arch = architecture;
   opts.to_quant = {".*"};
   opts.to_skip = to_skip;
 
@@ -230,6 +295,8 @@ static void rs_print_usage(const char *argv0) {
   std::fprintf(stderr, "  --pure                         Disable mixed-precision bumps; quantize every weight\n");
   std::fprintf(stderr, "                                 (including embed/lm_head/ctc) with the chosen ftype.\n");
   std::fprintf(stderr, "                                 Use for minimum-size experiments.\n");
+  std::fprintf(stderr, "  --voxcpm2-aggressive           VoxCPM2 only: use Q8 acoustic feedback and packed\n");
+  std::fprintf(stderr, "                                 Q4 AudioVAE weights for a smaller model.\n");
   std::fprintf(stderr, "  --token-embedding-type <type>  Force embed_tokens.weight to this type (overrides\n");
   std::fprintf(stderr, "                                 both --pure and K_M / IQ_M bumps).\n");
   std::fprintf(stderr, "  --output-tensor-type <type>    Force lm_head / ctc_lo / ctc_out_linear to this type.\n");
@@ -270,6 +337,8 @@ int main(int argc, char **argv) {
       cli_opts.imatrix_file = argv[++i];
     } else if (strcmp(argv[i], "--pure") == 0) {
       cli_opts.pure = true;
+    } else if (strcmp(argv[i], "--voxcpm2-aggressive") == 0) {
+      cli_opts.voxcpm2_aggressive = true;
     } else if (strcmp(argv[i], "--token-embedding-type") == 0 && i + 1 < argc) {
       ggml_type t = parse_qtype_name(argv[++i]);
       if (t == GGML_TYPE_COUNT) {
@@ -306,6 +375,9 @@ int main(int argc, char **argv) {
                        : ggml_type_name(ggml_ftype_to_ggml_type(ftype)));
   if (cli_opts.pure) {
     RS_QUANTIZE_LOG_INFO("--pure: embed/lm_head/ctc will be quantized too");
+  }
+  if (cli_opts.voxcpm2_aggressive) {
+    RS_QUANTIZE_LOG_INFO("--voxcpm2-aggressive enabled");
   }
   if (cli_opts.token_embedding_type != GGML_TYPE_COUNT) {
     RS_QUANTIZE_LOG_INFO("--token-embedding-type %s",

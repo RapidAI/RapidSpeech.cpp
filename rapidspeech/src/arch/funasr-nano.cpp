@@ -9,6 +9,7 @@
 #include "utils/debug_utils.h"
 #include "utils/rs_log.h"
 #include "utils/rs_wav.h"
+#include <cstdint>
 #include <cstdlib>
 #include <functional>
 #include <unordered_set>
@@ -19,29 +20,7 @@
 #define FUNASR_NANO_ENCODER_MAX_NODES 6144
 #define FUNASR_NANO_DECODER_MAX_NODES 1024
 
-struct FunASRNanoState : public RSState {
-  struct ggml_context *ctx_persistent = nullptr;
-  ggml_backend_buffer_t buffer_persistent = nullptr;
-  struct ggml_tensor *encoder_out = nullptr;
-
-  std::vector<int32_t> ids;
-  std::vector<std::string> tokens;
-  int language_id = 0;
-
-  FunASRNanoState() {
-    // Increase persistent context to ensure enough room for tensor metadata
-    struct ggml_init_params params = {512 * ggml_tensor_overhead(), nullptr,
-                                      true};
-    ctx_persistent = ggml_init(params);
-  }
-
-  ~FunASRNanoState() {
-    if (buffer_persistent)
-      ggml_backend_buffer_free(buffer_persistent);
-    if (ctx_persistent)
-      ggml_free(ctx_persistent);
-  }
-};
+struct FunASRNanoState : public SenseVoiceState {};
 
 static int funasr_utf8_decode(const char *p, size_t avail, uint32_t *cp) {
   if (avail == 0)
@@ -381,6 +360,12 @@ std::shared_ptr<RSState> FunASRNanoModel::CreateState() {
 bool FunASRNanoModel::Encode(const std::vector<float> &input_frames,
                              RSState &state, ggml_backend_sched_t sched) {
   return encoder_->Encode(input_frames, state, sched);
+}
+
+bool FunASRNanoModel::EncodeBatch(
+    const std::vector<const std::vector<float> *> &inputs,
+    const std::vector<RSState *> &states, ggml_backend_sched_t sched) {
+  return encoder_->EncodeBatch(inputs, states, sched);
 }
 
 void FunASRNanoModel::set_imatrix_callback(
@@ -1208,6 +1193,115 @@ void FunASRNanoModel::SetHotwords(const std::vector<std::string> &hotwords) {
   }
   hotword_retriever_->SetHotwords(hotwords_);
   RS_LOG_INFO("Hotword config: tau=%.3f topk=%d", hotword_tau_, hotword_topk_);
+}
+
+bool FunASRNanoModel::DecodeBatch(const std::vector<RSState *> &states,
+                                  ggml_backend_sched_t sched) {
+  if (states.empty()) return true;
+  if (states.size() == 1) return Decode(*states[0], sched);
+
+  // LLM/hotword/precheck paths have per-request prompt/KV decisions. Batched
+  // CTC covers --two-pass first pass and no-LLM serving.
+  const bool want_hotwords = hotword_retriever_ &&
+                             !hotword_retriever_->Empty() &&
+                             runtime_use_llm_ && llm_model_;
+  if (runtime_use_llm_ || want_hotwords) {
+    return ISpeechModel::DecodeBatch(states, sched);
+  }
+
+  const int n_batch = (int)states.size();
+  auto &first = static_cast<SenseVoiceState &>(*states[0]);
+  if (!first.encoder_out) return false;
+  const int C = first.encoder_out->ne[0];
+  const int T = first.encoder_out->ne[1];
+  const int V = hparams_.n_vocab;
+  for (auto *state : states) {
+    if (!state) return false;
+    auto &sv_state = static_cast<SenseVoiceState &>(*state);
+    if (!sv_state.encoder_out ||
+        sv_state.encoder_out->ne[0] != C ||
+        sv_state.encoder_out->ne[1] != T) {
+      return false;
+    }
+  }
+
+  struct ggml_context *ctx0 =
+      ggml_init({4 * 1024 * ggml_tensor_overhead(), nullptr, true});
+  struct ggml_cgraph *gf =
+      ggml_new_graph_custom(ctx0, FUNASR_NANO_DECODER_MAX_NODES, false);
+
+  struct ggml_tensor *encoder_in =
+      ggml_new_tensor_3d(ctx0, first.encoder_out->type, C, T, n_batch);
+  ggml_set_input(encoder_in);
+
+  struct ggml_tensor *cur =
+      decoder_forward(hparams_, ctx0, encoder_in, *ctc_decoder_);
+  cur = ggml_mul_mat(ctx0, ctc_decoder_->ctc_out_linear_weight, cur);
+  cur = ggml_add(ctx0, cur, ctc_decoder_->ctc_out_linear_bias);
+  ggml_set_name(cur, "funasr_ctc_logits_batch");
+  ggml_set_output(cur);
+  ggml_build_forward_expand(gf, cur);
+
+  if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+    ggml_free(ctx0);
+    return false;
+  }
+
+  const size_t bytes_per_state =
+      ggml_row_size(first.encoder_out->type, C) * (size_t)T;
+  std::vector<uint8_t> enc_tmp(bytes_per_state);
+  for (int b = 0; b < n_batch; ++b) {
+    auto &sv_state = static_cast<SenseVoiceState &>(*states[b]);
+    ggml_backend_tensor_get(sv_state.encoder_out, enc_tmp.data(), 0,
+                            bytes_per_state);
+    ggml_backend_tensor_set(encoder_in, enc_tmp.data(),
+                            (size_t)b * encoder_in->nb[2], bytes_per_state);
+  }
+
+  ggml_status status;
+  {
+    ImatrixHookGuard hook(sched, &imatrix_cb_);
+    status = ggml_backend_sched_graph_compute(sched, gf);
+  }
+  if (status != GGML_STATUS_SUCCESS) {
+    ggml_free(ctx0);
+    return false;
+  }
+
+  const int T_out = (int)cur->ne[1];
+  const size_t logits_bytes_per_state = (size_t)V * T_out * sizeof(float);
+  std::vector<float> logits_host((size_t)V * T_out);
+  std::vector<int32_t> raw_ids(T_out);
+  for (int b = 0; b < n_batch; ++b) {
+    auto &sv_state = static_cast<SenseVoiceState &>(*states[b]);
+    ggml_backend_tensor_get(cur, logits_host.data(), (size_t)b * cur->nb[2],
+                            logits_bytes_per_state);
+    for (int t = 0; t < T_out; ++t) {
+      const float *row = logits_host.data() + (size_t)t * V;
+      int best = 0;
+      float best_v = row[0];
+      for (int v = 1; v < V; ++v) {
+        if (row[v] > best_v) {
+          best_v = row[v];
+          best = v;
+        }
+      }
+      raw_ids[t] = best;
+    }
+    sv_state.ids = CTCDecoder::GreedyDecode(raw_ids.data(), T_out);
+    sv_state.tokens.clear();
+    if (vocab_.has_ctc_tokens) {
+      for (auto id : sv_state.ids) {
+        auto it = vocab_.id_to_token.find(id);
+        if (it != vocab_.id_to_token.end()) {
+          sv_state.tokens.push_back(decode_ctc_token_bytes(it->second));
+        }
+      }
+    }
+  }
+
+  ggml_free(ctx0);
+  return true;
 }
 
 std::string FunASRNanoModel::BuildHotwordPrompt(

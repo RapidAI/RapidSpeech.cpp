@@ -93,6 +93,9 @@ public:
 
   bool Encode(const std::vector<float> &input_frames, RSState &state,
               ggml_backend_sched_t sched);
+  bool EncodeBatch(const std::vector<const std::vector<float> *> &inputs,
+                   const std::vector<RSState *> &states,
+                   ggml_backend_sched_t sched);
   virtual bool MapTensors(std::map<std::string, struct ggml_tensor *> &tensors);
 
   // Imatrix activation collection: fires per MUL_MAT node during graph

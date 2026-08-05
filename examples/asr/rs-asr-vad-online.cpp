@@ -25,7 +25,7 @@
  *
  * Options:
  *   -m, --model <path>       ASR model path  (required)
- *   -v, --vad <path>         Silero-VAD GGUF path  (required)
+ *   -v, --vad <path>         VAD GGUF path (silero-vad / firered-vad / ten-vad)  (required)
  *   -w, --wav <path>         WAV file to process (simulate streaming)
  *       --mic                Use microphone input (live mode)
  *       --mic-device <n>     Audio device index (default: auto)
@@ -42,6 +42,7 @@
 
 #include "arch/silero_vad.h"
 #include "arch/fireredvad.h"
+#include "arch/tenvad.h"
 #include "rapidspeech.h"
 #include "utils/rs_log.h"
 #include "utils/rs_wav.h"
@@ -530,7 +531,7 @@ static bool parse_args(int argc, char **argv, OnlineArgs &args) {
              "\n"
              "Required:\n"
              "  -m, --model <path>       ASR model path\n"
-             "  -v, --vad <path>         Silero-VAD model path\n"
+             "  -v, --vad <path>         VAD model path (silero/firered/ten)\n"
              "\n"
              "Options:\n"
              "  -t, --threads <n>        CPU threads (default: 4)\n"
@@ -1060,10 +1061,14 @@ static void flush_firered_tail(FireRedVadModel & /*vad_model*/,
 //      recent segment durations to match the speaker's pace.
 //   C. EMA probability smoothing — reduces jitter / fragmentation
 //      from single-frame probability spikes or dips.
+//
+// Shared by Silero (512-sample window) and TEN-VAD (256-sample hop,
+// internally buffered) — both expose Encode + GetSpeechProbability.
 // ─────────────────────────────────────────────────────
+template <typename VadModelT, typename VadStateT>
 static bool
 process_vad_chunk(const float *chunk, int chunk_samples,
-                  SileroVadModel &vad_model, SileroVadState &vad_state,
+                  VadModelT &vad_model, VadStateT &vad_state,
                   ggml_backend_sched_t vad_sched, StreamState &state,
                   const OnlineArgs &args,
                   SpeechSegmentQueue &queue, std::atomic<int> &seg_counter) {
@@ -1381,10 +1386,12 @@ int main(int argc, char **argv) {
     return 1;
 
   // Detect VAD architecture from GGUF metadata.
-  // Silero VAD: "silero-vad"  ·  FireRedVAD: "firered-vad"
+  // Silero VAD: "silero-vad" · FireRedVAD: "firered-vad" · TEN VAD: "ten-vad"
   const std::string vad_arch = read_gguf_arch(vad_gguf);
   const bool use_firered =
       (vad_arch == "firered-vad" || vad_arch == "firered_vad");
+  const bool use_tenvad =
+      (vad_arch == "ten-vad" || vad_arch == "ten_vad");
   LOG_INFO("VAD arch: %s",
            vad_arch.empty() ? "<unknown, defaulting to silero-vad>"
                             : vad_arch.c_str());
@@ -1393,6 +1400,8 @@ int main(int argc, char **argv) {
   std::shared_ptr<SileroVadState> silero_state;
   std::shared_ptr<FireRedVadModel> firered_model;
   std::shared_ptr<FireRedVadState> firered_state;
+  std::shared_ptr<TenVadModel> tenvad_model;
+  std::shared_ptr<TenVadState> tenvad_state;
 
   if (use_firered) {
     firered_model = std::make_shared<FireRedVadModel>();
@@ -1406,6 +1415,20 @@ int main(int argc, char **argv) {
         firered_model->CreateState());
     if (!firered_state) {
       LOG_ERROR("Failed to create FireRedVAD state");
+      return 1;
+    }
+  } else if (use_tenvad) {
+    tenvad_model = std::make_shared<TenVadModel>();
+    if (!tenvad_model->LoadDirect(vad_data, vad_gguf, vad_backend.backend)) {
+      LOG_ERROR("Failed to load TEN VAD weights");
+      return 1;
+    }
+    tenvad_model->SetThreshold(args.vad_threshold);
+    LOG_INFO("VAD threshold set to: %.2f", args.vad_threshold);
+    tenvad_state = std::dynamic_pointer_cast<TenVadState>(
+        tenvad_model->CreateState());
+    if (!tenvad_state) {
+      LOG_ERROR("Failed to create TEN VAD state");
       return 1;
     }
   } else {
@@ -1431,6 +1454,10 @@ int main(int argc, char **argv) {
     std::vector<float> warmup_silent(5120, 0.0f);
     firered_model->DetectStreamingChunk(warmup_silent, *firered_state);
     firered_model->Reset(*firered_state);
+  } else if (use_tenvad) {
+    std::vector<float> warmup_silent(256 * 4, 0.0f);
+    tenvad_model->Encode(warmup_silent, *tenvad_state, vad_backend.sched);
+    tenvad_model->ResetState(*tenvad_state);
   } else {
     std::vector<float> warmup_silent(VAD_WINDOW, 0.0f);
     for (int i = 0; i < 3; ++i) {
@@ -1499,6 +1526,25 @@ int main(int argc, char **argv) {
     };
     vad_total_samples = [&]() {
       return firered_stream_state.total_samples_read;
+    };
+  } else if (use_tenvad) {
+    vad_step = [&](const float *chunk, int n) {
+      process_vad_chunk(chunk, n, *tenvad_model, *tenvad_state,
+                        vad_backend.sched, state, args, seg_queue, seg_counter);
+    };
+    vad_flush = [&]() {
+      if (state.speech_buf.empty()) return;
+      int idx = ++seg_counter;
+      float start_s = (float)state.speech_start_offset / SAMPLE_RATE;
+      float end_s = (float)state.total_samples_read / SAMPLE_RATE;
+      if (g_verbose) {
+        std::cout << "\n[EOF] Flushing remaining speech ("
+                  << state.speech_buf.size() << " samples)";
+      }
+      seg_queue.push({std::move(state.speech_buf), start_s, end_s, idx});
+    };
+    vad_total_samples = [&]() {
+      return (int64_t)state.total_samples_read;
     };
   } else {
     vad_step = [&](const float *chunk, int n) {

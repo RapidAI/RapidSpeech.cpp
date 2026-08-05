@@ -79,6 +79,7 @@ struct TtsArgs {
   float gain = 1.0f;                             // extra linear gain
   int seed = 42;
   int n_steps = 32;
+  bool n_steps_explicit = false;
   int n_threads = 4;
   bool use_gpu = true;
   bool phonemes_input = false;                 // Kokoro: --phonemes (treat -t as IPA)
@@ -191,6 +192,7 @@ static bool parse_args(int argc, char **argv, TtsArgs &args) {
       args.seed = std::stoi(argv[++i]);
     } else if (a == "--n-steps" && i + 1 < argc) {
       args.n_steps = std::stoi(argv[++i]);
+      args.n_steps_explicit = true;
     } else if (a == "--threads" && i + 1 < argc) {
       args.n_threads = std::stoi(argv[++i]);
     } else if (a == "--gpu" && i + 1 < argc) {
@@ -422,8 +424,12 @@ int main(int argc, char **argv) {
     LOG_INFO("Kokoro length_scale: %.3f", args.length_scale);
   }
   rs_set_tts_params(tts_ctx, args.instruct, effective_lang, args.seed);
-  rs_set_tts_diffusion_steps(tts_ctx, args.n_steps);
-  LOG_INFO("Instruct: %s  Language: %s  Seed: %d  Steps: %d", args.instruct, effective_lang, args.seed, args.n_steps);
+  int effective_steps = args.n_steps;
+  if (!args.n_steps_explicit && std::strcmp(meta.arch_name, "voxcpm2") == 0) {
+    effective_steps = 8;
+  }
+  rs_set_tts_diffusion_steps(tts_ctx, effective_steps);
+  LOG_INFO("Instruct: %s  Language: %s  Seed: %d  Steps: %d", args.instruct, effective_lang, args.seed, effective_steps);
 
   // Request timing starts before any per-input work. This includes optional
   // reference voice preparation, text ingestion, synthesis, and output fetch.
