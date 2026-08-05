@@ -60,8 +60,7 @@ python scripts/convert_hf_to_gguf.py \
 
 ## 6. 热词（RAG 上下文偏置）
 
-热词让识别更倾向于你指定的专有名词/术语，尤其能纠正**中文同音字/谐音**错误
-（例如音频里是「虢总」，模型默认写成「郭总」）。
+热词让识别更倾向于你指定的专有名词/术语，尤其能纠正**中文同音字/谐音**错误 。
 
 ### 6.1 用法
 
@@ -92,7 +91,7 @@ python scripts/convert_hf_to_gguf.py \
 C API：
 
 ```c
-const char *words[] = {"虢总", "阿里巴巴"};
+const char *words[] = {"阿里巴巴"};
 rs_set_hotwords(ctx, words, 2);   // 传 NULL/0 清空
 ```
 

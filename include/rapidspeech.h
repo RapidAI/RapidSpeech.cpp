@@ -333,7 +333,8 @@ RS_API rs_error_t rs_asr_stream_reset(rs_context_t* ctx);
 // ============================================
 // Voice Activity Detection (VAD)
 // Independent handle (separate from rs_context_t). Auto-dispatches on the
-// GGUF `general.architecture` field, currently {"silero-vad", "firered-vad"}.
+// GGUF `general.architecture` field, currently {"silero-vad", "firered-vad",
+// "ten-vad"}.
 // ============================================
 
 typedef struct rs_vad_t rs_vad_t;
@@ -347,10 +348,11 @@ typedef struct {
 // Per-frame postprocessor output. Frame rate depends on the backend:
 //   silero-vad : ~31.25 fps (512-sample window @ 16 kHz)
 //   firered-vad: 100 fps (10 ms shift)
+//   ten-vad    : 62.5 fps (256-sample hop @ 16 kHz)
 typedef struct {
     int32_t frame_idx;       // 1-based monotonic frame counter
     float   raw_prob;        // model output, [0..1]
-    float   smoothed_prob;   // FireRed only; equals raw_prob on Silero
+    float   smoothed_prob;   // FireRed only; equals raw_prob on Silero/TEN
     int32_t is_speech;       // postprocessor decision (1=speech)
     int32_t is_speech_start; // 1 on the frame that begins a segment
     int32_t is_speech_end;   // 1 on the frame that ends a segment

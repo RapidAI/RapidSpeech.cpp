@@ -17,6 +17,9 @@ option(RS_WEBGPU "Enable WebGPU acceleration (Dawn native / emdawnwebgpu for WAS
 option(RS_ENABLE_PYTHON "Enable Python bindings via pybind11" OFF)
 option(RS_BUILD_CLI "Build command-line example executables" ON)
 option(RS_STATIC_EXE "Build fully self-contained executables (no DLL dependencies)" OFF)
+option(RS_ENABLE_XQUIC "Enable the optional XQUIC transport adapter" OFF)
+option(RS_ENABLE_LIBDATACHANNEL
+       "Enable the optional libdatachannel WebRTC adapter" OFF)
 
 # RS_STATIC_EXE implies static linkage everywhere: static ggml + static
 # rapidspeech-core so the CLIs carry no runtime DLL/.so dependency.
@@ -98,6 +101,9 @@ if (RS_ENABLE_PYTHON)
 
     # Python wheels keep all shared libraries next to the extension module.
     set(RS_RPATH "${RS_LIBRARY_INSTALL_RPATH}")
+    # Python wheels install CLI executables below rapidspeech/bin while shared
+    # libraries live in rapidspeech/. Keep those executables self-contained.
+    set(RS_EXECUTABLE_INSTALL_RPATH "${RS_LIBRARY_INSTALL_RPATH}/..")
 endif()
 
 add_compile_definitions(GGML_MAX_NAME=128)
@@ -153,6 +159,8 @@ set(RS_SOURCES
         rapidspeech/src/core/rs_context.cpp
         rapidspeech/src/core/rs_processor.cpp
         rapidspeech/src/core/rs_kws.cpp
+        rapidspeech/src/realtime/rs_realtime_protocol.cpp
+        rapidspeech/src/realtime/rs_webrtc_transport.cpp
         rapidspeech/src/frontend/audio_processor.cpp
         rapidspeech/src/frontend/fftsg.c
         rapidspeech/src/utils/rs_log.cpp
@@ -207,6 +215,8 @@ set(RS_SOURCES
         rapidspeech/src/frontend/kokoro_g2p_en.cpp
         rapidspeech/src/frontend/wetext_normalizer.cpp
         rapidspeech/src/arch/omnivoice.cpp
+        rapidspeech/src/arch/voxcpm2.h
+        rapidspeech/src/arch/voxcpm2.cpp
         rapidspeech/src/arch/stable_audio3.h
         rapidspeech/src/arch/stable_audio3.cpp
         rapidspeech/src/arch/indextts2.h
@@ -330,6 +340,55 @@ if (NOT RS_STATIC_EXE)
 endif()
 
 target_link_libraries(rapidspeech-core PRIVATE ggml Threads::Threads)
+
+if (RS_ENABLE_XQUIC)
+    find_path(RS_XQUIC_INCLUDE_DIR
+        NAMES xquic/xquic.h
+        DOC "XQUIC include directory"
+    )
+    find_library(RS_XQUIC_LIBRARY
+        NAMES xquic
+        DOC "XQUIC library"
+    )
+    if (NOT RS_XQUIC_INCLUDE_DIR OR NOT RS_XQUIC_LIBRARY)
+        message(FATAL_ERROR
+            "RS_ENABLE_XQUIC requires XQUIC. Set RS_XQUIC_INCLUDE_DIR and "
+            "RS_XQUIC_LIBRARY, or install XQUIC in a standard prefix."
+        )
+    endif()
+    target_sources(rapidspeech-core PRIVATE
+        rapidspeech/src/realtime/rs_xquic_transport.cpp
+    )
+    target_include_directories(rapidspeech-core PUBLIC ${RS_XQUIC_INCLUDE_DIR})
+    target_link_libraries(rapidspeech-core PRIVATE ${RS_XQUIC_LIBRARY})
+    target_compile_definitions(rapidspeech-core PUBLIC RS_ENABLE_XQUIC)
+endif()
+
+if (RS_ENABLE_LIBDATACHANNEL)
+    find_path(RS_LIBDATACHANNEL_INCLUDE_DIR
+        NAMES rtc/rtc.h
+        DOC "libdatachannel include directory"
+    )
+    find_library(RS_LIBDATACHANNEL_LIBRARY
+        NAMES datachannel
+        DOC "libdatachannel library"
+    )
+    if (NOT RS_LIBDATACHANNEL_INCLUDE_DIR OR NOT RS_LIBDATACHANNEL_LIBRARY)
+        message(FATAL_ERROR
+            "RS_ENABLE_LIBDATACHANNEL requires libdatachannel. Set "
+            "RS_LIBDATACHANNEL_INCLUDE_DIR and RS_LIBDATACHANNEL_LIBRARY, "
+            "or install libdatachannel in a standard prefix."
+        )
+    endif()
+    target_sources(rapidspeech-core PRIVATE
+        rapidspeech/src/realtime/rs_libdatachannel_peer.cpp
+    )
+    target_include_directories(rapidspeech-core PUBLIC
+        ${RS_LIBDATACHANNEL_INCLUDE_DIR}
+    )
+    target_link_libraries(rapidspeech-core PRIVATE ${RS_LIBDATACHANNEL_LIBRARY})
+    target_compile_definitions(rapidspeech-core PUBLIC RS_ENABLE_LIBDATACHANNEL)
+endif()
 
 # --- WeTextProcessing (text normalization for ZH TTS) ---
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/openfst.cmake)
@@ -548,6 +607,9 @@ if (RS_BUILD_CLI)
     add_executable(rs-server
             examples/server/rs-server.cpp
     )
+    add_executable(rs-aoq-sim
+            examples/aoq/rs-aoq-sim.cpp
+    )
     set(RS_CLI_TARGETS
             rs-asr-offline
             rs-asr-vad-online
@@ -560,6 +622,7 @@ if (RS_BUILD_CLI)
             rs-speaker-id
             rs-kws
             rs-server
+            rs-aoq-sim
     )
 
     if (NOT WIN32)
@@ -588,6 +651,7 @@ if (RS_BUILD_CLI)
     target_link_libraries(rs-imatrix PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-speaker-id  PRIVATE rapidspeech-core ggml)
     target_link_libraries(rs-kws PRIVATE rapidspeech-core ggml Threads::Threads)
+    target_link_libraries(rs-aoq-sim PRIVATE Threads::Threads)
 
     # rs-server: cpp-httplib needs threads; Windows needs Winsock.
     target_link_libraries(rs-server PRIVATE rapidspeech-core ggml Threads::Threads)
@@ -718,6 +782,9 @@ if (RS_BUILD_CLI)
     install(TARGETS rs-server
             RUNTIME DESTINATION bin
     )
+    install(TARGETS rs-aoq-sim
+            RUNTIME DESTINATION bin
+    )
 
     # Runtime data (G2P dictionaries, WeText FSTs, cppjieba dict).
     # Installed into share/rapidspeech/ to match the FHS layout the runtime
@@ -728,6 +795,11 @@ if (RS_BUILD_CLI)
             PATTERN "*"
             PATTERN ".*" EXCLUDE
     )
+    if (RS_ENABLE_PYTHON)
+        install(FILES examples/server/webui.html
+                DESTINATION server
+        )
+    endif()
     if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cppjieba/dict)
         install(DIRECTORY third_party/cppjieba/dict/
                 DESTINATION share/rapidspeech/cppjieba/dict
@@ -747,7 +819,9 @@ if (RS_BUILD_TESTS)
             cosyvoice3_e2e
             kokoro_metal_convt
             kokoro_en_g2p
+            voxcpm2_deconv
             wetext_normalizer
+            realtime_protocol
     )
 
     foreach(module ${TEST_MODULES})
@@ -796,6 +870,16 @@ if (RS_BUILD_TESTS)
                 target_sources(${test_target} PRIVATE
                     rapidspeech/src/frontend/audio_processor.cpp
                     rapidspeech/src/frontend/fftsg.c)
+            endif()
+
+            if (module STREQUAL "realtime_protocol")
+                target_include_directories(${test_target} PRIVATE
+                    ${CMAKE_CURRENT_SOURCE_DIR}/rapidspeech/src
+                )
+                target_sources(${test_target} PRIVATE
+                    rapidspeech/src/realtime/rs_realtime_protocol.cpp
+                    rapidspeech/src/realtime/rs_webrtc_transport.cpp
+                )
             endif()
 
             add_test(NAME ${test_target} COMMAND ${test_target})

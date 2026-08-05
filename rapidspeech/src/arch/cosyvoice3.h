@@ -191,10 +191,10 @@ public:
   // upstream pre-lookahead / overlap-add carry semantics. The pcm buffer
   // passed to `emit` is owned by `state.audio_output` and remains valid
   // only until the next chunk is produced.
-  using AudioChunkCallback =
-      std::function<void(const float *pcm, size_t n)>;
+  using AudioChunkCallback = ISpeechModel::AudioChunkCallback;
+  bool SupportsTTSStreaming() const override { return true; }
   bool DecodeStream(RSState &state, ggml_backend_sched_t sched,
-                    AudioChunkCallback emit);
+                    AudioChunkCallback emit) override;
 
   // Per-token observer fired inside the LM AR loop right after each newly
   // sampled speech token is appended to `state.speech_token_ids`. Returning

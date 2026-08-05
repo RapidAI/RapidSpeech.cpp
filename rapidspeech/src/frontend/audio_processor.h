@@ -1,5 +1,7 @@
 #pragma once
 
+#include "rapidspeech.h"
+
 #include <cstddef>
 #include <vector>
 
@@ -52,7 +54,7 @@ struct CMVNData {
   std::vector<float> vars;
 };
 
-class AudioProcessor {
+class RS_API AudioProcessor {
 public:
   AudioProcessor(const STFTConfig &config);
   ~AudioProcessor();

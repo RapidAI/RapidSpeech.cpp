@@ -44,6 +44,8 @@ struct rs_quantize_options {
   std::vector<std::string> to_quant = {".*"};
   std::vector<std::string> to_skip;
   std::string imatrix_file;
+  std::string model_arch;
+  bool voxcpm2_aggressive = false;
   bool pure = false;
   enum ggml_type token_embedding_type = GGML_TYPE_COUNT;
   enum ggml_type output_tensor_type   = GGML_TYPE_COUNT;

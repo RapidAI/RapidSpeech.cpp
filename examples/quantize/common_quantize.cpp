@@ -207,6 +207,8 @@ static std::pair<int, int> extract_layer_info(const std::string &name) {
     int         n_total_hint;
   };
   static const PrefixInfo prefixes[] = {
+      {"base_lm.layers.",                  0},  // VoxCPM2 uses a uniform Base LM policy
+      {"residual_lm.layers.",              0},  // VoxCPM2 feedback stays at source precision
       {"model.layers.",                  28},  // Qwen3-style LLM
       {"llm.layers.",                    28},  // Qwen3 (alt name)
       {"llm.model.layers.",              28},  // FunASR LLM
@@ -243,6 +245,25 @@ static bool name_ends_with(const std::string &name, const char *suffix) {
   size_t nlen = name.size();
   size_t slen = strlen(suffix);
   return nlen >= slen && name.compare(nlen - slen, slen, suffix) == 0;
+}
+
+static bool is_voxcpm2_packed_vae_weight(
+    const rs_quantize_options &opts, const std::string &name,
+    const struct ggml_tensor *tensor) {
+  return opts.model_arch == "voxcpm2" && opts.voxcpm2_aggressive &&
+         name.rfind("audio_vae.", 0) == 0 &&
+         name != "audio_vae.decoder.model.9.weight_v" &&
+         name_ends_with(name, ".weight_v") &&
+         ggml_n_dims(tensor) >= 3 &&
+         (tensor->ne[0] * tensor->ne[1]) %
+                 ggml_blck_size(GGML_TYPE_Q4_0) ==
+             0;
+}
+
+static bool is_voxcpm2_vae_deconv_weight(const std::string &name) {
+  static const std::regex deconv(
+      R"(audio_vae\.decoder\.model\.[2-7]\.block\.1\.weight_v)");
+  return std::regex_match(name, deconv);
 }
 
 static tensor_category categorize_tensor(const std::string &name) {
@@ -340,8 +361,15 @@ rs_get_qtype_for_tensor(const rs_quantize_options &opts, const std::string &name
 
   auto cat = categorize_tensor(name);
 
-  auto align_check = [tensor](ggml_type qt) -> bool {
-    return tensor->ne[0] % ggml_blck_size(qt) == 0;
+  const bool packed_vae = is_voxcpm2_packed_vae_weight(opts, name, tensor);
+  const bool packed_deconv =
+      packed_vae && is_voxcpm2_vae_deconv_weight(name);
+  auto align_check = [tensor, packed_vae, packed_deconv](ggml_type qt) -> bool {
+    const int64_t row_size =
+        packed_deconv ? tensor->ne[2]
+                      : packed_vae ? tensor->ne[0] * tensor->ne[1]
+                                   : tensor->ne[0];
+    return row_size % ggml_blck_size(qt) == 0;
   };
 
   // Demote to an alignment-safe type when the preferred k-quant block (256)
@@ -398,6 +426,7 @@ rs_get_qtype_for_tensor(const rs_quantize_options &opts, const std::string &name
     static const std::regex lstm_w(R"(weight_(ih|hh)_l\d+(_reverse)?$)");
     quantize = std::regex_search(name, lstm_w);
   }
+  quantize |= packed_vae;
   for (const auto &s : to_skip) {
     if (std::regex_match(name, std::regex(s))) {
       quantize = false;
@@ -410,6 +439,26 @@ rs_get_qtype_for_tensor(const rs_quantize_options &opts, const std::string &name
 
   if (!quantize) {
     return tensor->type;
+  }
+
+  // VoxCPM2 feeds each generated acoustic patch back through Residual LM,
+  // the local feature encoder and DiT. Quantization error therefore compounds
+  // across the autoregressive loop: the stop trajectory drifts and the
+  // resulting latents can overflow the F16 AudioVAE. Even Q8 is not reliably
+  // stable here, so preserve this acoustic feedback loop at source precision
+  // and quantize the much larger text-conditioning Base LM instead.
+  if (opts.model_arch == "voxcpm2") {
+    const bool acoustic_feedback =
+        name.rfind("residual_lm.layers.", 0) == 0 ||
+        name.rfind("feat_encoder.encoder.layers.", 0) == 0 ||
+        name.rfind("feat_decoder.estimator.decoder.layers.", 0) == 0;
+    if (acoustic_feedback) {
+      return opts.voxcpm2_aggressive ? pick(GGML_TYPE_Q8_0) : tensor->type;
+    }
+  }
+
+  if (packed_vae) {
+    return pick(GGML_TYPE_Q4_K);
   }
 
   auto [layer, n_total] = extract_layer_info(name);
@@ -824,6 +873,9 @@ bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
   gguf_set_kv(ctx_out, gguf_input);
   gguf_set_val_u32(ctx_out, "general.quantization_version", GGML_QNT_VERSION);
   gguf_set_val_u32(ctx_out, "general.file_type", ftype);
+  if (opts.model_arch == "voxcpm2" && opts.voxcpm2_aggressive) {
+    gguf_set_val_bool(ctx_out, "voxcpm2.audio_vae.packed_weight_v", true);
+  }
 
   const int n_tensors = gguf_get_n_tensors(gguf_input);
 
@@ -840,7 +892,21 @@ bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
   for (int i = 0; i < n_tensors; ++i) {
     const std::string name = gguf_get_tensor_name(gguf_input, i);
     struct ggml_tensor *tensor = ggml_get_tensor(ctx, name.c_str());
-    gguf_add_tensor(ctx_out, tensor);
+    if (is_voxcpm2_packed_vae_weight(opts, name, tensor)) {
+      struct ggml_tensor packed = *tensor;
+      if (is_voxcpm2_vae_deconv_weight(name)) {
+        packed.ne[0] = tensor->ne[2];
+        packed.ne[1] = tensor->ne[0] * tensor->ne[1];
+      } else {
+        packed.ne[0] = tensor->ne[0] * tensor->ne[1];
+        packed.ne[1] = tensor->ne[2];
+      }
+      packed.ne[2] = tensor->ne[3];
+      packed.ne[3] = 1;
+      gguf_add_tensor(ctx_out, &packed);
+    } else {
+      gguf_add_tensor(ctx_out, tensor);
+    }
   }
 
   std::ofstream fout;
@@ -871,15 +937,8 @@ bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
                           gguf_get_data_offset(gguf_input);
     struct ggml_tensor *tensor = ggml_get_tensor(ctx, name.c_str());
 
-    if (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16) {
-      fprintf(
-          stderr,
-          "%s: unsupported tensor type %d (%s) for quantization (tensor: %s)\n",
-          __func__, tensor->type, ggml_type_name((ggml_type)tensor->type),
-          name.c_str());
-      close_ofstream();
-      return false;
-    }
+    const bool can_quantize_source =
+        tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_F16;
 
     fin.seekg(offset, std::ios::beg);
     if (!fin) {
@@ -898,8 +957,9 @@ bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
            ggml_type_name(tensor->type));
 
     // Determine per-tensor target type (handles mixed-precision strategies)
-    enum ggml_type new_type =
-        rs_get_qtype_for_tensor(opts, name, tensor);
+    enum ggml_type new_type = can_quantize_source
+                                  ? rs_get_qtype_for_tensor(opts, name, tensor)
+                                  : tensor->type;
     bool quantize = (new_type != tensor->type) && ggml_is_quantized(new_type);
 
     if (!quantize && new_type == tensor->type) {
@@ -957,6 +1017,7 @@ bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
 
       float *f32_data;
       std::vector<float> f32_converted; // only used when input is F16
+      std::vector<float> f32_reordered;
 
       if (tensor->type == GGML_TYPE_F32) {
         f32_data = (float *)tensor->data;
@@ -970,6 +1031,27 @@ bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
         f32_data = f32_converted.data();
       }
 
+      const bool packed_vae =
+          is_voxcpm2_packed_vae_weight(opts, name, tensor);
+      const bool packed_deconv =
+          packed_vae && is_voxcpm2_vae_deconv_weight(name);
+      if (packed_deconv) {
+        const int64_t input_channels = tensor->ne[2];
+        const int64_t output_values = tensor->ne[0] * tensor->ne[1];
+        f32_reordered.resize(nelements);
+        for (int64_t slice = 0; slice < tensor->ne[3]; ++slice) {
+          const int64_t slice_offset =
+              slice * input_channels * output_values;
+          for (int64_t output = 0; output < output_values; ++output) {
+            for (int64_t input = 0; input < input_channels; ++input) {
+              f32_reordered[slice_offset + output * input_channels + input] =
+                  f32_data[slice_offset + input * output_values + output];
+            }
+          }
+        }
+        f32_data = f32_reordered.data();
+      }
+
       printf("converting to %s .. ", ggml_type_name(new_type));
       fflush(stdout);
 
@@ -978,8 +1060,13 @@ bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
       }
       new_data = work.data();
 
-      const int64_t n_per_row = tensor->ne[0];
-      const int64_t nrows = tensor->ne[1];
+      const int64_t n_per_row =
+          packed_deconv ? tensor->ne[2]
+                        : packed_vae ? tensor->ne[0] * tensor->ne[1]
+                                     : tensor->ne[0];
+      const int64_t nrows =
+          packed_deconv ? tensor->ne[0] * tensor->ne[1]
+                        : packed_vae ? tensor->ne[2] : tensor->ne[1];
 
       static const int64_t min_chunk_size = 32 * 512;
       const int64_t chunk_size =
@@ -995,7 +1082,8 @@ bool rapid_speech_ggml_quantize(ggml_context *ctx, gguf_context *gguf_input,
 
       // quantize each expert/slice separately
       new_size = 0;
-      for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
+      const int64_t n_slices = packed_vae ? tensor->ne[3] : tensor->ne[2];
+      for (int64_t i03 = 0; i03 < n_slices; ++i03) {
         const float *f32_data_03 = f32_data + i03 * nelements_matrix;
         void *new_data_03 =
             (char *)new_data + ggml_row_size(new_type, n_per_row) * i03 * nrows;

@@ -236,15 +236,12 @@ RS_API int32_t rs_process(rs_context_t *ctx) {
     const bool is_tts =
         (arch == "openvoice2" || arch == "OmniVoice" ||
          arch == "cosyvoice3-llm" || arch == "cosyvoice3" ||
-         arch == "kokoro" || arch == "indextts2");
+         arch == "kokoro" || arch == "indextts2" || arch == "voxcpm2");
     if (is_tts) {
-      // Streaming path: only CosyVoice3 implements it today. Falls back to
-      // the offline ProcessTTS for other arches even if the caller asks for
-      // RS_TASK_TTS_ONLINE.
+      // Models advertise true chunk streaming through the common interface.
       const bool stream_requested =
           ctx->params.task_type == RS_TASK_TTS_ONLINE;
-      const bool stream_supported =
-          (arch == "cosyvoice3-llm" || arch == "cosyvoice3");
+      const bool stream_supported = ctx->processor->SupportsTTSStreaming();
       if (stream_requested && stream_supported) {
         result = ctx->processor->ProcessTTSStream();
       } else {

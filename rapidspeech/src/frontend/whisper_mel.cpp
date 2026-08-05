@@ -14,11 +14,27 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-extern "C" {
-void rdft(int n, int isgn, double *a, int *ip, double *w);
-}
-
 namespace {
+
+// Real-input DFT for arbitrary N. Ooura's rdft silently truncates non-pow2 N
+// to the largest pow2 below (n_fft=400 → 256), so it cannot be used here —
+// see the cosyvoice3_mel.cpp note on the same trap.
+//   power[k] = |X[k]|^2,  k = 0 .. N/2
+inline void real_power_spectrum(const double *x, int N,
+                                const double *cos_tab, const double *sin_tab,
+                                double *power) {
+  for (int k = 0; k <= N / 2; ++k) {
+    double re = 0.0, im = 0.0;
+    int phase = 0;
+    for (int n = 0; n < N; ++n) {
+      re += x[n] * cos_tab[phase];
+      im -= x[n] * sin_tab[phase];
+      phase += k;
+      if (phase >= N) phase -= N;
+    }
+    power[k] = re * re + im * im;
+  }
+}
 
 // Convert Hz to Slaney mel (matches librosa.filters.mel(htk=False)).
 //   Below 1000 Hz: linear ramp at 200/3 Hz per mel.
@@ -58,20 +74,25 @@ WhisperMelExtractor::WhisperMelExtractor(const WhisperMelConfig &config)
 WhisperMelExtractor::~WhisperMelExtractor() = default;
 
 void WhisperMelExtractor::InitTables() {
-  // Symmetric Hann window over n_fft samples (matches torch.hann_window with
-  // periodic=False, which is what WhisperFeatureExtractor uses).
+  // Hann window over n_fft samples. Symmetric matches torch.hann_window with
+  // periodic=False (original Qwen3-ASR bring-up); periodic matches
+  // torch.hann_window default / HF WhisperFeatureExtractor's
+  // window_function(400, "hann").
   hann_window_.resize(cfg_.n_fft);
+  const double denom =
+      cfg_.periodic_window ? (double)cfg_.n_fft : (double)(cfg_.n_fft - 1);
   for (int i = 0; i < cfg_.n_fft; ++i) {
-    hann_window_[i] =
-        0.5 - 0.5 * std::cos(2.0 * M_PI * i / (double)(cfg_.n_fft - 1));
+    hann_window_[i] = 0.5 - 0.5 * std::cos(2.0 * M_PI * i / denom);
   }
 
-  // Ooura rdft workspace.
-  fft_ip_.assign(2 + (int)std::sqrt((double)cfg_.n_fft / 2) + 1, 0);
-  fft_w_.assign(cfg_.n_fft / 2, 0.0);
-  fft_ip_[0] = 0;
-  std::vector<double> dummy(cfg_.n_fft, 0.0);
-  rdft(cfg_.n_fft, 1, dummy.data(), fft_ip_.data(), fft_w_.data());
+  // DFT twiddle tables (direct DFT — n_fft=400 is not a power of 2, which
+  // Ooura's rdft silently truncates).
+  cos_tab_.resize(cfg_.n_fft);
+  sin_tab_.resize(cfg_.n_fft);
+  for (int i = 0; i < cfg_.n_fft; ++i) {
+    cos_tab_[i] = std::cos(2.0 * M_PI * i / (double)cfg_.n_fft);
+    sin_tab_[i] = std::sin(2.0 * M_PI * i / (double)cfg_.n_fft);
+  }
 }
 
 void WhisperMelExtractor::InitMelFilters() {
@@ -144,7 +165,12 @@ int WhisperMelExtractor::Compute(const std::vector<float> &pcm,
     out.clear();
     return 0;
   }
-  const int n_frames = (n_padded - n_fft) / hop + 1;
+  int n_frames = (n_padded - n_fft) / hop + 1;
+  // HF WhisperFeatureExtractor drops the trailing STFT frame
+  // (log_spec[:, :-1]): 480000 samples -> 3001 frames -> 3000.
+  if (cfg_.max_frames > 0 && n_frames > cfg_.max_frames) {
+    n_frames = cfg_.max_frames;
+  }
 
   // 3. STFT + |X|^2 + mel projection + log10 for every frame.
   //    Output layout: mel-bin slow, frame fast. log_mel[m * n_frames + t].
@@ -158,17 +184,8 @@ int WhisperMelExtractor::Compute(const std::vector<float> &pcm,
       for (int j = 0; j < n_fft; ++j) {
         buf[j] = (double)padded[offset + j] * hann_window_[j];
       }
-      rdft(n_fft, 1, buf.data(),
-           const_cast<int *>(fft_ip_.data()),
-           const_cast<double *>(fft_w_.data()));
-      // Ooura layout: a[0]=Re(0), a[1]=Re(N/2), a[2k]=Re(k), a[2k+1]=Im(k).
-      power[0]         = buf[0] * buf[0];
-      power[n_bins - 1] = buf[1] * buf[1];
-      for (int k = 1; k < n_bins - 1; ++k) {
-        const double re = buf[2 * k];
-        const double im = buf[2 * k + 1];
-        power[k] = re * re + im * im;
-      }
+      real_power_spectrum(buf.data(), n_fft, cos_tab_.data(),
+                          sin_tab_.data(), power.data());
       for (int m = 0; m < n_mels; ++m) {
         const float *row = &mel_filters_[(size_t)m * n_bins];
         double acc = 0.0;

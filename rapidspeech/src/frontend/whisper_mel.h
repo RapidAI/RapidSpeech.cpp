@@ -29,6 +29,15 @@ struct WhisperMelConfig {
   // Chunk size in mel frames. Output is padded to a multiple of this.
   // Qwen3-ASR: chunk_size = 100 (2 * n_window with n_window=50).
   int chunk_size  = 100;
+  // Use a periodic Hann window (torch.hann_window periodic=True), which is
+  // what HF WhisperFeatureExtractor actually constructs. Default keeps the
+  // symmetric window used by the original Qwen3-ASR bring-up.
+  bool periodic_window = false;
+  // If > 0, truncate the STFT frame count to this value *before* the
+  // whisper max-8 normalization. HF WhisperFeatureExtractor drops the last
+  // STFT frame (480000 samples -> 3001 frames -> 3000), so per-30s-chunk
+  // callers (MossTranscribeDiarize) set max_frames = 3000.
+  int max_frames  = 0;
 };
 
 class WhisperMelExtractor {
@@ -57,8 +66,9 @@ private:
   // Precomputed tables.
   std::vector<double> hann_window_;        // n_fft
   std::vector<float>  mel_filters_;        // [n_mels, n_fft/2 + 1] (row-major)
-  std::vector<int>    fft_ip_;             // Ooura rdft workspace
-  std::vector<double> fft_w_;              // Ooura rdft workspace
+  std::vector<double> cos_tab_;            // direct-DFT twiddle tables
+  std::vector<double> sin_tab_;            // (n_fft=400 is not pow2; Ooura
+                                           // rdft would silently truncate)
 
   void InitTables();
   void InitMelFilters();

@@ -88,6 +88,9 @@ public:
     int n_slots() const { return n_slots_; }
     int n_active();   // slots not IDLE (for /health reporting)
     int n_queued();   // requests waiting for a slot
+    bool CanStreamFirstSentence() const {
+        return dual_worker_ && !scheds_voc_.empty();
+    }
 
     // Stream the first sentence of a WS connection directly via DecodeStream
     // on the vocoder thread's sched (sub-500ms first-chunk latency, concurrent
