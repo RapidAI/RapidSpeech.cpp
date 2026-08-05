@@ -246,7 +246,7 @@ void TtsBatchScheduler::RunLoop() {
                       model_->RunLM_Prefill(st, pf->lm, sched_);
             if (!ok) {
                 pf->error = "LM prefill failed";
-                pf->phase = TtsSlot::Phase::ERROR;
+                pf->phase = TtsSlot::Phase::FAILED;
             } else if (pf->lm.done) {
                 pf->phase = TtsSlot::Phase::FLOW;  // stop on first sample
             } else {
@@ -285,7 +285,7 @@ void TtsBatchScheduler::RunLoop() {
                 for (int i = 0; i < n; ++i) {
                     if (!ok) {
                         dec[i]->error = "LM step failed";
-                        dec[i]->phase = TtsSlot::Phase::ERROR;
+                        dec[i]->phase = TtsSlot::Phase::FAILED;
                     } else if (dec[i]->lm.done) {
                         dec[i]->phase = TtsSlot::Phase::FLOW;
                     }
@@ -355,7 +355,7 @@ void TtsBatchScheduler::RunLoop() {
                 for (int i = 0; i < n; ++i) {
                     if (!ok) {
                         fl[i]->error = "Flow failed";
-                        fl[i]->phase = TtsSlot::Phase::ERROR;
+                        fl[i]->phase = TtsSlot::Phase::FAILED;
                     } else {
                         fl[i]->phase = TtsSlot::Phase::HIFT;
                     }
@@ -376,7 +376,7 @@ void TtsBatchScheduler::RunLoop() {
                 for (int i = 0; i < n; ++i) {
                     if (!ok) {
                         hf[i]->error = "HiFT failed";
-                        hf[i]->phase = TtsSlot::Phase::ERROR;
+                        hf[i]->phase = TtsSlot::Phase::FAILED;
                     } else {
                         hf[i]->phase = TtsSlot::Phase::DONE;
                     }
@@ -384,10 +384,10 @@ void TtsBatchScheduler::RunLoop() {
             }
         }
 
-        // ── 4. Resolve DONE / ERROR slots ─────────────────────────────────
+        // ── 4. Resolve DONE / FAILED slots ────────────────────────────────
         for (auto &s : pool_) {
             if (s->phase == TtsSlot::Phase::DONE ||
-                s->phase == TtsSlot::Phase::ERROR) {
+                s->phase == TtsSlot::Phase::FAILED) {
                 FinishSlot(*s);
                 cv_.notify_all();
             }
@@ -441,7 +441,7 @@ void TtsBatchScheduler::RunLoopLM() {
                       model_->RunLM_Prefill(st, pf->lm, sched_);
             if (!ok) {
                 pf->error = "LM prefill failed";
-                pf->phase = TtsSlot::Phase::ERROR;
+                pf->phase = TtsSlot::Phase::FAILED;
                 FinishSlot(*pf);
             } else if (pf->lm.done) {
                 pf->phase = TtsSlot::Phase::FLOW;
@@ -476,7 +476,7 @@ void TtsBatchScheduler::RunLoopLM() {
             for (int i = 0; i < n; ++i) {
                 if (!ok) {
                     dec[i]->error = "LM step failed";
-                    dec[i]->phase = TtsSlot::Phase::ERROR;
+                    dec[i]->phase = TtsSlot::Phase::FAILED;
                     FinishSlot(*dec[i]);
                 } else if (dec[i]->lm.done) {
                     dec[i]->phase = TtsSlot::Phase::FLOW;
@@ -512,7 +512,7 @@ void TtsBatchScheduler::RunLoopLM() {
                                model_->RunHiFT(*s->state, sched_);
                     if (!fok) {
                         s->error = "Flow/HiFT inline failed";
-                        s->phase = TtsSlot::Phase::ERROR;
+                        s->phase = TtsSlot::Phase::FAILED;
                         FinishSlot(*s);
                     } else {
                         s->phase = TtsSlot::Phase::DONE;
@@ -559,7 +559,7 @@ void TtsBatchScheduler::RunLoopVoc(int voc_idx) {
         for (int i = 0; i < n; ++i) {
             if (!ok) {
                 fl[i]->error = "Flow failed";
-                fl[i]->phase = TtsSlot::Phase::ERROR;
+                fl[i]->phase = TtsSlot::Phase::FAILED;
             } else {
                 fl[i]->phase = TtsSlot::Phase::HIFT;
                 hf.push_back(fl[i]);
@@ -573,7 +573,7 @@ void TtsBatchScheduler::RunLoopVoc(int voc_idx) {
             for (int i = 0; i < m; ++i) {
                 if (!ok2) {
                     hf[i]->error = "HiFT failed";
-                    hf[i]->phase = TtsSlot::Phase::ERROR;
+                    hf[i]->phase = TtsSlot::Phase::FAILED;
                 } else {
                     hf[i]->phase = TtsSlot::Phase::DONE;
                 }

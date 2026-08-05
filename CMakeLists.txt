@@ -861,15 +861,19 @@ if (RS_BUILD_TESTS)
                     rapidspeech/src/frontend/kokoro_g2p_en.cpp)
             endif()
 
-            # AudioProcessor methods are likewise hidden inside
-            # librapidspeech-core (CXX_VISIBILITY_PRESET hidden). Compile the
-            # TU directly into the test binary. fftsg.c's rdft is extern "C"
-            # but isn't dllexported from the Windows DLL, so compile it in
-            # too for cross-platform link.
+            # AudioProcessor methods are hidden inside librapidspeech-core on
+            # Unix-like shared builds (CXX_VISIBILITY_PRESET hidden). Compile
+            # the TU directly into those test binaries. On Windows the class is
+            # exported from the DLL, so compiling the TU again causes LNK2005.
             if (module STREQUAL "audio_frontend")
-                target_sources(${test_target} PRIVATE
-                    rapidspeech/src/frontend/audio_processor.cpp
-                    rapidspeech/src/frontend/fftsg.c)
+                if (WIN32)
+                    target_sources(${test_target} PRIVATE
+                        rapidspeech/src/frontend/fftsg.c)
+                else()
+                    target_sources(${test_target} PRIVATE
+                        rapidspeech/src/frontend/audio_processor.cpp
+                        rapidspeech/src/frontend/fftsg.c)
+                endif()
             endif()
 
             if (module STREQUAL "realtime_protocol")

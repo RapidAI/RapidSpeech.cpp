@@ -1,7 +1,7 @@
 #pragma once
 // cosyvoice3_batch.h — TTS continuous-batching scheduler for CosyVoice3.
 //
-// Slot lifecycle: IDLE → PREFILLING → DECODING → FLOW → HIFT → DONE/ERROR
+// Slot lifecycle: IDLE → PREFILLING → DECODING → FLOW → HIFT → DONE/FAILED
 //
 // Concurrency model (single shared ggml sched — not thread-safe, so all
 // compute runs on one worker thread; concurrency comes from interleaving):
@@ -34,7 +34,7 @@
 // ── per-request slot ────────────────────────────────────────────────────────
 
 struct TtsSlot {
-    enum class Phase { IDLE, PREFILLING, DECODING, FLOW, HIFT, DONE, ERROR };
+    enum class Phase { IDLE, PREFILLING, DECODING, FLOW, HIFT, DONE, FAILED };
 
     int id = -1;
     Phase phase = Phase::IDLE;

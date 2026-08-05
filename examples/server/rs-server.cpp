@@ -2546,7 +2546,13 @@ int main(int argc_raw, char **argv_raw) {
     // Multi-worker uses two CUDA schedulers concurrently; CUDA graph capture
     // coordinates via a global lock that would serialize them. Disable it so
     // the two streams can overlap. (Harmless on non-CUDA - env is ignored.)
+#ifdef _WIN32
+    if (!std::getenv("GGML_CUDA_DISABLE_GRAPHS")) {
+        _putenv_s("GGML_CUDA_DISABLE_GRAPHS", "1");
+    }
+#else
     setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 0);
+#endif
 
     std::string asr_model, tts_model, vad_model, host = "127.0.0.1", web_dir;
     int port = 8080, ws_port = -1, threads = 4;
