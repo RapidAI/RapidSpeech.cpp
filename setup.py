@@ -56,6 +56,48 @@ def get_package_name():
 
 package_name = get_package_name()
 
+
+def sync_jieba_dict():
+    """Copy third_party/cppjieba/dict into the package so the wheel ships
+    the ZH G2P runtime data (`rapidspeech speak` needs it; the C++ runtime
+    picks it up via RS_KOKORO_JIEBA_DICT_DIR exported by the CLI)."""
+    import shutil
+    root = Path(__file__).parent.resolve()
+    src = root / "third_party" / "cppjieba" / "dict"
+    dst = root / "rapidspeech" / "data" / "cppjieba" / "dict"
+    if not src.is_dir():
+        return  # submodule not checked out; wheel will lack ZH G2P data
+    marker = src / "jieba.dict.utf8"
+    if dst.is_dir() and (dst / "jieba.dict.utf8").exists() and \
+            marker.exists() and \
+            (dst / "jieba.dict.utf8").stat().st_size == marker.stat().st_size:
+        return
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst)
+
+
+sync_jieba_dict()
+
+
+def get_package_data():
+    """Files bundled into the wheel next to the compiled extension:
+    the model registry and the TTS G2P runtime data (~30 MB)."""
+    return {
+        "rapidspeech": [
+            "*.so", "*.pyd", "*.dylib", "*.dll",
+            "bin/*",
+            "server/*",
+            "python/_registry.json",
+            "python/_demo.html",
+            "data/kokoro_zh/*",
+            "data/kokoro_en/*",
+            "data/wetext/*",
+            "data/cppjieba/dict/*",
+            "data/cppjieba/dict/pos_dict/*",
+        ]
+    }
+
 def cmake_extension(name, *args, **kwargs) -> setuptools.Extension:
     kwargs["language"] = "c++"
     sources = []
@@ -94,7 +136,9 @@ class BuildExtension(build_ext):
         if not need_split_package():
             extra_cmake_args += f" -DCMAKE_INSTALL_PREFIX={install_dir} "
         extra_cmake_args += " -DRS_ENABLE_PYTHON=ON "
-        extra_cmake_args += " -DRS_BUILD_CLI=OFF "
+        # `rapidspeech serve` delegates the OpenAI-compatible HTTP API and
+        # WebSocket streaming endpoints to the native server.
+        extra_cmake_args += " -DRS_BUILD_CLI=ON "
         extra_cmake_args += " -DRS_BUILD_TESTS=OFF "
 
 
@@ -278,9 +322,14 @@ setuptools.setup(
     install_requires=["numpy"],
     author="lovemefan",
     author_email="lovemefan@outlook.com",
-    packages=["rapidspeech"],
-    package_data={"rapidspeech": ["*.so", "*.pyd", "*.dylib", "*.dll"]},
+    packages=["rapidspeech", "rapidspeech.python"],
+    package_data=get_package_data(),
     include_package_data=True,
+    entry_points={
+        "console_scripts": [
+            "rapidspeech = rapidspeech.python.cli:main",
+        ],
+    },
     data_files=(
         [
             (

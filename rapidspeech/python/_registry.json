@@ -1,187 +1,1078 @@
 {
-    "registry_version": 1,
-    "repo": "RapidAI/RapidSpeech",
-    "sources": {
-        "modelscope": "https://www.modelscope.cn/models/RapidAI/RapidSpeech/resolve/master/",
-        "huggingface": "https://huggingface.co/RapidAI/RapidSpeech/resolve/main/"
-    },
-    "defaults": {
-        "asr": "funasr-nano",
-        "tts": "kokoro-zh",
-        "vad": "silero-vad"
-    },
-    "models": {
-        "funasr-nano": {
-            "task": "asr",
-            "languages": ["zh", "en"],
-            "license": "see model card (RapidAI/RapidSpeech)",
-            "description": "FunASR-Nano offline ASR: CTC first pass + optional LLM rescoring, zh/en",
-            "default_variant": "q4_k_m",
-            "recommended_backends": ["cpu", "metal", "cuda"],
-            "example": "rapidspeech transcribe audio.wav",
-            "variants": {
-                "q3_k": {
-                    "size_bytes": 499063360,
-                    "sha256": "2e060dc62ace358ee358e9d14dc32410f69678e395ac4e13a9cc5485a2b9cbc4",
-                    "files": {
-                        "modelscope": "ASR/FunASRNano/funasr-nano-q3_k.gguf",
-                        "huggingface": "ASR/FunasrNano/funasr-nano-q3_k.gguf"
-                    }
-                },
-                "q4_k_m": {
-                    "size_bytes": 692140864,
-                    "sha256": "82c5bc2aea12a852ce55bf78183d0c23624454df181da59b1b9e1fef8292e6ab",
-                    "files": {
-                        "modelscope": "ASR/FunASRNano/funasr-nano-q4_k_m.gguf",
-                        "huggingface": "ASR/FunasrNano/funasr-nano-q4_k_m.gguf"
-                    }
-                },
-                "q6_k": {
-                    "size_bytes": 886263360,
-                    "sha256": "b1ef1dc8ce00e0b81523c8979039e99ab56b57bc52a5e58356063114636dd04c",
-                    "files": {
-                        "modelscope": "ASR/FunASRNano/funasr-nano-q6_k.gguf",
-                        "huggingface": "ASR/FunasrNano/funasr-nano-q6_k.gguf"
-                    }
-                },
-                "q8_0": {
-                    "size_bytes": 1126925504,
-                    "sha256": "864a598a49f849ca80e7f664da8b95305ea281fe724538c815dd4fadbb1da89f",
-                    "files": {
-                        "modelscope": "ASR/FunASRNano/funasr-nano-q8_0.gguf"
-                    }
-                }
-            }
+  "registry_version": 2,
+  "repo": "RapidAI/RapidSpeech",
+  "sources": {
+    "modelscope": "https://www.modelscope.cn/models/RapidAI/RapidSpeech/resolve/master/",
+    "huggingface": "https://huggingface.co/RapidAI/RapidSpeech/resolve/main/"
+  },
+  "defaults": {
+    "asr": "funasr-nano",
+    "tts": "kokoro-zh",
+    "vad": "silero-vad",
+    "speaker": "campplus"
+  },
+  "models": {
+    "funasr-nano": {
+      "task": "asr",
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "license": "see model card (RapidAI/RapidSpeech)",
+      "description": "FunASR-Nano offline ASR: CTC first pass + optional LLM rescoring, zh/en",
+      "default_variant": "q4_k_m",
+      "recommended_backends": [
+        "cpu",
+        "metal",
+        "cuda"
+      ],
+      "example": "rapidspeech transcribe audio.wav",
+      "variants": {
+        "fp16": {
+          "size_bytes": 2056512640,
+          "sha256": "14cd8d0e981ce00f1762499ad24e2cbc14036473976933f4c5ad708c5edef2f4",
+          "files": {
+            "modelscope": "ASR/FunASRNano/funasr-nano-fp16.gguf"
+          }
         },
-        "kokoro-zh": {
-            "task": "tts",
-            "languages": ["zh"],
-            "license": "Apache-2.0",
-            "description": "Kokoro v1.1-zh TTS: 82M params, 100 Chinese voices, deterministic, 24 kHz",
-            "default_variant": "q8_0",
-            "default_voice": "zf_001",
-            "recommended_backends": ["cpu", "metal", "cuda"],
-            "example": "rapidspeech speak \"你好，世界\" -o hello.wav",
-            "variants": {
-                "q4_k_m": {
-                    "size_bytes": 76425216,
-                    "sha256": "a83df5085e1a5b2ea4a40408baef311e98252673ab114c29bb75e52af9c64e15",
-                    "known_issues": "silent output on Metal (2026-07-16); works on CPU — use q8_0/f16 on macOS",
-                    "files": {
-                        "modelscope": "TTS/kokoro/kokoro-v1_1-zh-q4_k_m.gguf"
-                    }
-                },
-                "q8_0": {
-                    "size_bytes": 106742912,
-                    "sha256": "8f80e7bb3ede009dc5066bbd33a1c07d3588407fd4cee1c0fbb4ba462e3953dc",
-                    "files": {
-                        "modelscope": "TTS/kokoro/kokoro-v1_1-zh-q8_0.gguf"
-                    }
-                },
-                "f16": {
-                    "size_bytes": 163727136,
-                    "sha256": "0de363d93377879f35d96a8157552618ec1a3e1866f293cfc9013d2e5441699e",
-                    "files": {
-                        "modelscope": "TTS/kokoro/kokoro-v1_1-zh-f16.gguf"
-                    }
-                }
-            },
-            "voices": {
-                "zf_001": {
-                    "size_bytes": 522560,
-                    "sha256": "6d6e0bab5fa23f382f0748a455188087249a21914d534bb49bee6693f86e2d23",
-                    "files": {
-                        "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_001.gguf"
-                    }
-                },
-                "zf_002": {
-                    "size_bytes": 522560,
-                    "sha256": "1bcdc4bb676cd40eef5ab9ef43ec32d88bfeac5af54891f96c24d31d3585499f",
-                    "files": {
-                        "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_002.gguf"
-                    }
-                },
-                "zf_003": {
-                    "size_bytes": 522560,
-                    "sha256": "a001f7e7ac95164da207f6a450bb7b16d1c893ac99e430827220a3ea1334f816",
-                    "files": {
-                        "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_003.gguf"
-                    }
-                },
-                "zm_009": {
-                    "size_bytes": 522560,
-                    "sha256": "0ee971b5eb369b3ed903309e98ae044d731b3fd23206b5a1d5190aeec7c2d15e",
-                    "files": {
-                        "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_009.gguf"
-                    }
-                },
-                "zm_010": {
-                    "size_bytes": 522560,
-                    "sha256": "f4bcd1d2299b0c0760ef42a9838419e67096e91c5086bfc08551ecd726cbcd82",
-                    "files": {
-                        "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_010.gguf"
-                    }
-                },
-                "af_maple": {
-                    "size_bytes": 522560,
-                    "sha256": "0ea1af354637ebe53f37bfd5d5323c8e09c17eaa18c83c1d9fd22c560eea2fb5",
-                    "files": {
-                        "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-af_maple.gguf"
-                    }
-                },
-                "af_sol": {
-                    "size_bytes": 522560,
-                    "sha256": "ba5c791c8b2821f669b9b1f620b6e46c20709a7162127ae8474e619abb905c97",
-                    "files": {
-                        "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-af_sol.gguf"
-                    }
-                },
-                "bf_vale": {
-                    "size_bytes": 522560,
-                    "sha256": "2afa6cf7fd13727d018e776302c8802e8ff7b6297bd4c8f048c33717d5ef3398",
-                    "files": {
-                        "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-bf_vale.gguf"
-                    }
-                }
-            }
+        "q3_k": {
+          "size_bytes": 499063360,
+          "sha256": "2e060dc62ace358ee358e9d14dc32410f69678e395ac4e13a9cc5485a2b9cbc4",
+          "files": {
+            "modelscope": "ASR/FunASRNano/funasr-nano-q3_k.gguf",
+            "huggingface": "ASR/FunasrNano/funasr-nano-q3_k.gguf"
+          }
         },
-        "silero-vad": {
-            "task": "vad",
-            "languages": ["*"],
-            "license": "MIT",
-            "description": "Silero VAD v6: tiny universal voice activity detector",
-            "default_variant": "v6",
-            "recommended_backends": ["cpu"],
-            "example": "rapidspeech transcribe long.wav --vad",
-            "variants": {
-                "v6": {
-                    "size_bytes": 1239680,
-                    "sha256": "e4d29fb7072c5584a960145a2de45cf4c0126eca6f338ba7d23741df551438d3",
-                    "files": {
-                        "modelscope": "VAD/silero_vad_v6.gguf",
-                        "huggingface": "VAD/silero_vad_v6.gguf"
-                    }
-                }
-            }
+        "q4_k_m": {
+          "size_bytes": 692140864,
+          "sha256": "82c5bc2aea12a852ce55bf78183d0c23624454df181da59b1b9e1fef8292e6ab",
+          "files": {
+            "modelscope": "ASR/FunASRNano/funasr-nano-q4_k_m.gguf",
+            "huggingface": "ASR/FunasrNano/funasr-nano-q4_k_m.gguf"
+          }
         },
-        "firered-vad": {
-            "task": "vad",
-            "languages": ["*"],
-            "license": "see model card (RapidAI/RapidSpeech)",
-            "description": "FireRed streaming VAD",
-            "default_variant": "v1",
-            "recommended_backends": ["cpu"],
-            "example": "rapidspeech transcribe long.wav --vad firered-vad",
-            "variants": {
-                "v1": {
-                    "size_bytes": 2275648,
-                    "sha256": "00bb734dcbf790e86447ddd04269320cb5f24df1c44126a389145add32dd93e4",
-                    "files": {
-                        "modelscope": "VAD/firered-stream-vad.gguf",
-                        "huggingface": "VAD/firered-stream-vad.gguf"
-                    }
-                }
-            }
+        "q6_k": {
+          "size_bytes": 886263360,
+          "sha256": "b1ef1dc8ce00e0b81523c8979039e99ab56b57bc52a5e58356063114636dd04c",
+          "files": {
+            "modelscope": "ASR/FunASRNano/funasr-nano-q6_k.gguf",
+            "huggingface": "ASR/FunasrNano/funasr-nano-q6_k.gguf"
+          }
+        },
+        "q8_0": {
+          "size_bytes": 1126925504,
+          "sha256": "864a598a49f849ca80e7f664da8b95305ea281fe724538c815dd4fadbb1da89f",
+          "files": {
+            "modelscope": "ASR/FunASRNano/funasr-nano-q8_0.gguf"
+          }
         }
+      }
+    },
+    "sense-voice": {
+      "task": "asr",
+      "languages": [
+        "zh",
+        "en",
+        "ja",
+        "ko",
+        "yue"
+      ],
+      "license": "see model card (RapidAI/RapidSpeech)",
+      "description": "SenseVoice-small: multilingual ASR (zh/en/ja/ko/yue) with emotion & event tags",
+      "default_variant": "q4_k_m",
+      "recommended_backends": [
+        "cpu",
+        "metal",
+        "cuda"
+      ],
+      "example": "rapidspeech transcribe audio.wav --model sense-voice",
+      "variants": {
+        "fp16": {
+          "size_bytes": 470318848,
+          "sha256": "a8d8bf5c2ca29e05e70c38fd0f1b54a6f27a312394133e3ffe9619412b4b35ae",
+          "files": {
+            "modelscope": "ASR/SenseVoice/sense-voice-small-fp16.gguf",
+            "huggingface": "ASR/SenseVoice/sense-voice-small-fp16.gguf"
+          }
+        },
+        "q4_k_m": {
+          "size_bytes": 145181984,
+          "sha256": "565aea29121600eac68e6234aa4819458f3ca43c9cf88b2628a5d194c4b4ebd7",
+          "files": {
+            "modelscope": "ASR/SenseVoice/sense-voice-small-q4_k_m.gguf"
+          }
+        },
+        "q6_k": {
+          "size_bytes": 238872896,
+          "sha256": "6c5e8962fa7160e68fd75e272cb9aad0c5a8a1ece093ed1fbca4fd4527c6eff1",
+          "files": {
+            "modelscope": "ASR/SenseVoice/sense-voice-small-q6_k.gguf",
+            "huggingface": "ASR/SenseVoice/sense-voice-small-q6_k.gguf"
+          }
+        },
+        "q8_0": {
+          "size_bytes": 292012352,
+          "sha256": "51e4a1eef8d2364fbf4380c20864e91c4d45552403207719eabe375b9ac446a7",
+          "files": {
+            "modelscope": "ASR/SenseVoice/sense-voice-small-q8_0.gguf",
+            "huggingface": "ASR/SenseVoice/sense-voice-small-q8_0.gguf"
+          }
+        }
+      }
+    },
+    "xasr": {
+      "task": "asr",
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "license": "see model card (RapidAI/RapidSpeech)",
+      "description": "X-ASR: Zipformer2 transducer, offline + true streaming, punctuation, zh/en",
+      "default_variant": "q4_k_m",
+      "recommended_backends": [
+        "cpu",
+        "metal",
+        "cuda"
+      ],
+      "example": "rapidspeech transcribe audio.wav --model xasr",
+      "variants": {
+        "f16": {
+          "size_bytes": 320063136,
+          "sha256": "d56f77c3b7d4d8e8ab378f0eb586adbe6e1398eea7013659e328012d46c23ec9",
+          "files": {
+            "modelscope": "ASR/X-ASR/xasr-f16.gguf"
+          }
+        },
+        "q4_k_m": {
+          "size_bytes": 104300800,
+          "sha256": "f18450bcd94153aebcb5df4894903de1adfa160e095fea4b22486b12bfd3f5b5",
+          "files": {
+            "modelscope": "ASR/X-ASR/xasr-q4_k_m.gguf"
+          }
+        },
+        "q8_0": {
+          "size_bytes": 178311424,
+          "sha256": "d3308e7f283f9e3403f5f787d48dbff57b335b6fbb05899074ce48d009d9de57",
+          "files": {
+            "modelscope": "ASR/X-ASR/xasr-q8_0.gguf"
+          }
+        }
+      }
+    },
+    "kokoro-zh": {
+      "task": "tts",
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "license": "Apache-2.0 (kokoro), see model card",
+      "description": "Kokoro v1.1-zh TTS: 82M params, 100+ Chinese voices, deterministic, 24 kHz",
+      "default_variant": "q8_0",
+      "recommended_backends": [
+        "cpu",
+        "metal",
+        "cuda"
+      ],
+      "example": "rapidspeech speak \"你好，世界\" -o hello.wav",
+      "variants": {
+        "f16": {
+          "size_bytes": 163727136,
+          "sha256": "0de363d93377879f35d96a8157552618ec1a3e1866f293cfc9013d2e5441699e",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro-v1_1-zh-f16.gguf"
+          }
+        },
+        "q3_k_m": {
+          "size_bytes": 71155616,
+          "sha256": "6cf2b9bb4c12b7ea3843c72ce575c2143a54f34955b3afd56cbdf4e576384a76",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro-v1_1-zh-q3_k_m.gguf"
+          },
+          "known_issues": "silent/clipped output on Metal (2026-07-16); works on CPU"
+        },
+        "q4_k_m": {
+          "size_bytes": 76425216,
+          "sha256": "a83df5085e1a5b2ea4a40408baef311e98252673ab114c29bb75e52af9c64e15",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro-v1_1-zh-q4_k_m.gguf"
+          },
+          "known_issues": "silent output on Metal (2026-07-16); works on CPU — use q8_0/f16 on macOS"
+        },
+        "q5_k_m": {
+          "size_bytes": 84027680,
+          "sha256": "e91ffafaae4cfa596fa9e2dfe20071c42e4c84accffa1d9ff7701661450c13ea",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro-v1_1-zh-q5_k_m.gguf"
+          }
+        },
+        "q8_0": {
+          "size_bytes": 106742912,
+          "sha256": "8f80e7bb3ede009dc5066bbd33a1c07d3588407fd4cee1c0fbb4ba462e3953dc",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro-v1_1-zh-q8_0.gguf"
+          }
+        }
+      },
+      "default_voice": "zf_001",
+      "voices": {
+        "af_maple": {
+          "size_bytes": 522560,
+          "sha256": "0ea1af354637ebe53f37bfd5d5323c8e09c17eaa18c83c1d9fd22c560eea2fb5",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-af_maple.gguf"
+          }
+        },
+        "af_sol": {
+          "size_bytes": 522560,
+          "sha256": "ba5c791c8b2821f669b9b1f620b6e46c20709a7162127ae8474e619abb905c97",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-af_sol.gguf"
+          }
+        },
+        "bf_vale": {
+          "size_bytes": 522560,
+          "sha256": "2afa6cf7fd13727d018e776302c8802e8ff7b6297bd4c8f048c33717d5ef3398",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-bf_vale.gguf"
+          }
+        },
+        "zf_001": {
+          "size_bytes": 522560,
+          "sha256": "6d6e0bab5fa23f382f0748a455188087249a21914d534bb49bee6693f86e2d23",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_001.gguf"
+          }
+        },
+        "zf_002": {
+          "size_bytes": 522560,
+          "sha256": "1bcdc4bb676cd40eef5ab9ef43ec32d88bfeac5af54891f96c24d31d3585499f",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_002.gguf"
+          }
+        },
+        "zf_003": {
+          "size_bytes": 522560,
+          "sha256": "a001f7e7ac95164da207f6a450bb7b16d1c893ac99e430827220a3ea1334f816",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_003.gguf"
+          }
+        },
+        "zf_004": {
+          "size_bytes": 522560,
+          "sha256": "3aee0c52cf3094afc7626348a60fe45bee88bf53e1cad5733b0c536bc508340e",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_004.gguf"
+          }
+        },
+        "zf_005": {
+          "size_bytes": 522560,
+          "sha256": "c00d728093e2a008ddda39901b11a159019f6e16790c48c4789af968cbf41a64",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_005.gguf"
+          }
+        },
+        "zf_006": {
+          "size_bytes": 522560,
+          "sha256": "9ba38d5bc66d3725658d1ac7c8d7a711ca147857e26ee615e108a3af3cc3644c",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_006.gguf"
+          }
+        },
+        "zf_007": {
+          "size_bytes": 522560,
+          "sha256": "366cfa3e94c3c5cb61dc1383d9846fcc7f3c7164894faa300fd18501976d7d51",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_007.gguf"
+          }
+        },
+        "zf_008": {
+          "size_bytes": 522560,
+          "sha256": "30aa82c34a638b0930a5b5cbd90953aa2a4a2875064f4f1b496fcbeaaafca782",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_008.gguf"
+          }
+        },
+        "zf_017": {
+          "size_bytes": 522560,
+          "sha256": "b2980f0c8cead09683d85c8eb6e46f18269843564cabcb1351a47a31d103fbf2",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_017.gguf"
+          }
+        },
+        "zf_018": {
+          "size_bytes": 522560,
+          "sha256": "edc385ac5c6924bf05b033b7e19cde83c72b609a22444d433a5321170fb063fd",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_018.gguf"
+          }
+        },
+        "zf_019": {
+          "size_bytes": 522560,
+          "sha256": "7796777a24836c0bf17b7888f0804ae131986ab8c180a254df886cd89a68c7ce",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_019.gguf"
+          }
+        },
+        "zf_021": {
+          "size_bytes": 522560,
+          "sha256": "ab0efdb4074c82da92343540766a152db80d1f4b2b451bee9d671b9eb628c669",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_021.gguf"
+          }
+        },
+        "zf_022": {
+          "size_bytes": 522560,
+          "sha256": "d74d0ebb1f0e58205a17bab11e550e985980ab356b41de9713da15c8bd89f541",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_022.gguf"
+          }
+        },
+        "zf_023": {
+          "size_bytes": 522560,
+          "sha256": "a911daaa57a275bea9f2e85d7caae7328b6698150e3fcfd49120f25fd4bc8857",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_023.gguf"
+          }
+        },
+        "zf_024": {
+          "size_bytes": 522560,
+          "sha256": "d63c770b8a97eb980c5b5a05e593891c411ec71a064b9758075a6ba8fe3037af",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_024.gguf"
+          }
+        },
+        "zf_026": {
+          "size_bytes": 522560,
+          "sha256": "67d4e81f56e45c7b53815a270fa46eb6a0e18b57152a3df76bbca695aac037c5",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_026.gguf"
+          }
+        },
+        "zf_027": {
+          "size_bytes": 522560,
+          "sha256": "34ffb433ce4901c316dcfa70751f86d890c08d09fdf315a50644288392c986c1",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_027.gguf"
+          }
+        },
+        "zf_028": {
+          "size_bytes": 522560,
+          "sha256": "21e70df6fe64dc2223d24c3bef149c84ec011be1a7f58b407a21c1e6643b0d55",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_028.gguf"
+          }
+        },
+        "zf_032": {
+          "size_bytes": 522560,
+          "sha256": "87ee6984d564956a43ff783db0a74deaf1a8eab3db4b649692af6a5f3073e0ab",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_032.gguf"
+          }
+        },
+        "zf_036": {
+          "size_bytes": 522560,
+          "sha256": "66bc82504d1132aa1f57a2dce76dce5f5c33cc4d2b14ae259bacba413b85bd38",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_036.gguf"
+          }
+        },
+        "zf_038": {
+          "size_bytes": 522560,
+          "sha256": "39141801c2ae889af2ed629b0258d82d9bb51f07d902658d54299199c48db7bc",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_038.gguf"
+          }
+        },
+        "zf_039": {
+          "size_bytes": 522560,
+          "sha256": "673c9eab65ffaf14703516598f48eec519ce1c777bd6b5a531de2fa7078f3756",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_039.gguf"
+          }
+        },
+        "zf_040": {
+          "size_bytes": 522560,
+          "sha256": "cfb876c15ed98ac7a091816ae5afc861f5a9db9a74e53cbae9017b3b01677d1b",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_040.gguf"
+          }
+        },
+        "zf_042": {
+          "size_bytes": 522560,
+          "sha256": "be1fd0f5192b39e92efe097e8500d8058c7b60f658bef6a66cf5df5caab04ee4",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_042.gguf"
+          }
+        },
+        "zf_043": {
+          "size_bytes": 522560,
+          "sha256": "45dac89ea28ccd2fdf0fa4348628386d8a232790cb4865f2d628d55b7c5ae916",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_043.gguf"
+          }
+        },
+        "zf_044": {
+          "size_bytes": 522560,
+          "sha256": "f105bd5bc8a82d0840ef2b325de92d11a5d88c44f67e3614e993a3a02d6c5071",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_044.gguf"
+          }
+        },
+        "zf_046": {
+          "size_bytes": 522560,
+          "sha256": "9a5b88167633f31411a6878213a4380c72ee7e7ef7dfc79eb226af7de62c0c32",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_046.gguf"
+          }
+        },
+        "zf_047": {
+          "size_bytes": 522560,
+          "sha256": "e395380c9f39f8374c098988bebdf69cad2ea14dbe70ae881cd91ce979a8ab25",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_047.gguf"
+          }
+        },
+        "zf_048": {
+          "size_bytes": 522560,
+          "sha256": "0bcffe8de60f0b5b36996e52bff322b2d5601185d4a8da517a582b611969270f",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_048.gguf"
+          }
+        },
+        "zf_049": {
+          "size_bytes": 522560,
+          "sha256": "3dac8df7c98f936a0b5abef940c35a4260b246ee4ee74d3905587504c1003b39",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_049.gguf"
+          }
+        },
+        "zf_051": {
+          "size_bytes": 522560,
+          "sha256": "f49306ba7514fdc6283bb25afd51a79ea45af40a9b79b47001dbf44ca956a09b",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_051.gguf"
+          }
+        },
+        "zf_059": {
+          "size_bytes": 522560,
+          "sha256": "5736be5c77078dbae75fcab0cbec52eab726221f7f9f7c36aec2fc0f19bb3dbd",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_059.gguf"
+          }
+        },
+        "zf_060": {
+          "size_bytes": 522560,
+          "sha256": "a940d4007932bf38082c78a66d1639d9c6cab859d8b8ed3c25c4f9c8e0caca12",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_060.gguf"
+          }
+        },
+        "zf_067": {
+          "size_bytes": 522560,
+          "sha256": "69b5679e8d28aa9b93c7b82966d936a69ccb5c7b468e6dc647cd8a99a0a31a26",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_067.gguf"
+          }
+        },
+        "zf_070": {
+          "size_bytes": 522560,
+          "sha256": "cd0f89cf84df34f394a85da9c08a6ece1cee232261620a1be1d2ae035bcd26b2",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_070.gguf"
+          }
+        },
+        "zf_071": {
+          "size_bytes": 522560,
+          "sha256": "f19d1bed9e2a3bfa10ce2735ac01abf6262478988dd2b2062df7ba07576fc394",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_071.gguf"
+          }
+        },
+        "zf_072": {
+          "size_bytes": 522560,
+          "sha256": "d5aeaf190c0151dd2a6cf9c4e2a61552d4ec74275b659f66d9d139a980ba50a7",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_072.gguf"
+          }
+        },
+        "zf_073": {
+          "size_bytes": 522560,
+          "sha256": "9466c6b32abe558b7b7c6d231bdb8945301dbd929360ae859c6fe023f0798604",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_073.gguf"
+          }
+        },
+        "zf_074": {
+          "size_bytes": 522560,
+          "sha256": "3a49a30ad683b01fbce81aa285990153af4113e932cdd6194ad8a0b2ce303241",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_074.gguf"
+          }
+        },
+        "zf_075": {
+          "size_bytes": 522560,
+          "sha256": "79b33e36cafbf5122c54ede9f20ed87be6cbb835db351dcac741ed0d88d3f016",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_075.gguf"
+          }
+        },
+        "zf_076": {
+          "size_bytes": 522560,
+          "sha256": "29de66bc881eaa3d1f7e1d071eda28454aa22fbda444b03caacdf5d0f82c820a",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_076.gguf"
+          }
+        },
+        "zf_077": {
+          "size_bytes": 522560,
+          "sha256": "079638756a783ed55ef0547d3d687c88b49511624f431eb0216c45efafdf9a74",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_077.gguf"
+          }
+        },
+        "zf_078": {
+          "size_bytes": 522560,
+          "sha256": "0c4aaef9a6828615e9ec00175af9ce3ed0a44a9ee7fb03d444a9b0ad42a20768",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_078.gguf"
+          }
+        },
+        "zf_079": {
+          "size_bytes": 522560,
+          "sha256": "6e373bda17563ecc4564dcdb0eead5a447fcff4ef6ec3cc2b10cf374a7f749f2",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_079.gguf"
+          }
+        },
+        "zf_083": {
+          "size_bytes": 522560,
+          "sha256": "4ba99c955525de4bfb75a29345ca8e2471e9138f19cb1b7899e4517b4bbe9d1d",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_083.gguf"
+          }
+        },
+        "zf_084": {
+          "size_bytes": 522560,
+          "sha256": "5bb9ff9f9264b3b0de5c588281fd0fb4cae8b4d9b009b5b84e8bbb26c87aae23",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_084.gguf"
+          }
+        },
+        "zf_085": {
+          "size_bytes": 522560,
+          "sha256": "d606d9115e461deee279bdcff09ff88664bec82b69b7cb2999cf8b3a2a37d006",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_085.gguf"
+          }
+        },
+        "zf_086": {
+          "size_bytes": 522560,
+          "sha256": "f9a20eb35157b58613458d3d3e05315ba3d54ab89ff016272f7daaa9ddf3b3df",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_086.gguf"
+          }
+        },
+        "zf_087": {
+          "size_bytes": 522560,
+          "sha256": "0f3750bc9140474b1b309b47375f6304b1089f47d88b588bae2a6a73f6ed8726",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_087.gguf"
+          }
+        },
+        "zf_088": {
+          "size_bytes": 522560,
+          "sha256": "871367b25c33d029016d414997319707c8adefa55e7b6ef80385aba2f8f8cadc",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_088.gguf"
+          }
+        },
+        "zf_090": {
+          "size_bytes": 522560,
+          "sha256": "37c3e52bd59a1177be887e72d666c92a29c775757a1dce6d4ab525dca9795a03",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_090.gguf"
+          }
+        },
+        "zf_092": {
+          "size_bytes": 522560,
+          "sha256": "1cea7c90698d2f8f51ae1bedd0fe5de5a4cfc73cef3ca3b7f125414636763817",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_092.gguf"
+          }
+        },
+        "zf_093": {
+          "size_bytes": 522560,
+          "sha256": "20cc7905906d8ca9a633ac415fdb3f005213faa45f35b39c63e0cd8b9c8da5cf",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_093.gguf"
+          }
+        },
+        "zf_094": {
+          "size_bytes": 522560,
+          "sha256": "b9ab0d20174c08a68224caebd228de7e5ac24bf3fe4a9a77ae448c30042e4756",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_094.gguf"
+          }
+        },
+        "zf_099": {
+          "size_bytes": 522560,
+          "sha256": "9c2efce9c580ca4c6ff528d22397abdd685bac9abf664677f749751711656a11",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zf_099.gguf"
+          }
+        },
+        "zm_009": {
+          "size_bytes": 522560,
+          "sha256": "0ee971b5eb369b3ed903309e98ae044d731b3fd23206b5a1d5190aeec7c2d15e",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_009.gguf"
+          }
+        },
+        "zm_010": {
+          "size_bytes": 522560,
+          "sha256": "f4bcd1d2299b0c0760ef42a9838419e67096e91c5086bfc08551ecd726cbcd82",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_010.gguf"
+          }
+        },
+        "zm_011": {
+          "size_bytes": 522560,
+          "sha256": "36141ce447a703b31eb482c31879ae0bcfec4e83b1c93e77c470090336443c1c",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_011.gguf"
+          }
+        },
+        "zm_012": {
+          "size_bytes": 522560,
+          "sha256": "59bb61f572a49e97f8b72abb7a1e525a523b209f7828cc4fbfcc7eac23c6d52d",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_012.gguf"
+          }
+        },
+        "zm_013": {
+          "size_bytes": 522560,
+          "sha256": "a124f1088deb26fc889a6d22db7d33d64c011c7c7fd68f3336b2f677a713dc79",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_013.gguf"
+          }
+        },
+        "zm_014": {
+          "size_bytes": 522560,
+          "sha256": "ad0226f1fd17f15685fa582792e166a75a78fe3bc854b4010c91659a4bb244c6",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_014.gguf"
+          }
+        },
+        "zm_015": {
+          "size_bytes": 522560,
+          "sha256": "19c4315ce2244b0d41221f4d6351a183d4e54fa2292de50e91a38ad2c91a7aac",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_015.gguf"
+          }
+        },
+        "zm_016": {
+          "size_bytes": 522560,
+          "sha256": "a35fbcfa418512d510f70061b4929e0491ccb4527bb428a995fa244ce26c8723",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_016.gguf"
+          }
+        },
+        "zm_020": {
+          "size_bytes": 522560,
+          "sha256": "cec6361e3db31a6dde90de65ab2263d0b71c0f5a5536d1d064a0a57ca55c745f",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_020.gguf"
+          }
+        },
+        "zm_025": {
+          "size_bytes": 522560,
+          "sha256": "5d11f5fc7edd46371aa2cc7857f926b0c13cfca1e6e97ad99d52cc1bc8c7a7e9",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_025.gguf"
+          }
+        },
+        "zm_029": {
+          "size_bytes": 522560,
+          "sha256": "51584ac7cd2c4f391a9feb32233d01c3bba7f263b06623ed230aaeaf1fef3429",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_029.gguf"
+          }
+        },
+        "zm_030": {
+          "size_bytes": 522560,
+          "sha256": "7a0a12737e7444f370b286b79fe7e54d6ae48d847885dce635a37a38020a55b4",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_030.gguf"
+          }
+        },
+        "zm_031": {
+          "size_bytes": 522560,
+          "sha256": "ea67802dc663af055476d011441f2227b40ea044143846fa0f3d06f5c0a90785",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_031.gguf"
+          }
+        },
+        "zm_033": {
+          "size_bytes": 522560,
+          "sha256": "995d9339a8b9dd6bed2fe49158c94a2d2c70b8dbf3ca62eb121e76322d85f28f",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_033.gguf"
+          }
+        },
+        "zm_034": {
+          "size_bytes": 522560,
+          "sha256": "68a03a10b1ed774f5891491365718941e03dc67ba48c5dc4ffedc55c1cdb2676",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_034.gguf"
+          }
+        },
+        "zm_035": {
+          "size_bytes": 522560,
+          "sha256": "84092e3582a7bb71b9099c233d165cf6659401b3a8bf9f39918628f359000728",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_035.gguf"
+          }
+        },
+        "zm_037": {
+          "size_bytes": 522560,
+          "sha256": "6d89271cf88aae942d51970a7bcefd3a502659f44174c5a5ce129f783f394b47",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_037.gguf"
+          }
+        },
+        "zm_041": {
+          "size_bytes": 522560,
+          "sha256": "2d7f993a685f5b96a30a3b9005a85df58277cd7a72d0bec8026ef6e060f49afb",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_041.gguf"
+          }
+        },
+        "zm_045": {
+          "size_bytes": 522560,
+          "sha256": "76e93dbd872f5598912fe8ffc24ec1f404fb13d1d480388b60482389a5fc90da",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_045.gguf"
+          }
+        },
+        "zm_050": {
+          "size_bytes": 522560,
+          "sha256": "4b78b1de4158c35768b2607b1013d7ae3a2f842e19afeb25cb5c71609cc364c9",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_050.gguf"
+          }
+        },
+        "zm_052": {
+          "size_bytes": 522560,
+          "sha256": "db27d62e6d14938cb8e514aa0ca7851bac0bd41f4ff67711a770909b80f95ad8",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_052.gguf"
+          }
+        },
+        "zm_053": {
+          "size_bytes": 522560,
+          "sha256": "016b256903d2e31d4f49040e95e76870ddad3d8d8977904e2217957e19269584",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_053.gguf"
+          }
+        },
+        "zm_054": {
+          "size_bytes": 522560,
+          "sha256": "8179bf9e1cfb53a25c14981bd4cfb2f44b26c56355bb4d506ee7966261dab7d9",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_054.gguf"
+          }
+        },
+        "zm_055": {
+          "size_bytes": 522560,
+          "sha256": "d4370c2af0ed7f59863111ba2028ccec3db11d29d74ea00fb424663dcb73aaf5",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_055.gguf"
+          }
+        },
+        "zm_056": {
+          "size_bytes": 522560,
+          "sha256": "9a9dd796656f1a73f2c1d5fd6a1588a031078ecd1d8892b0464465901090a869",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_056.gguf"
+          }
+        },
+        "zm_057": {
+          "size_bytes": 522560,
+          "sha256": "99769a225eb776a69b100fa2c89379c9d714e9ee4148e3ab12f0e6a024daadc3",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_057.gguf"
+          }
+        },
+        "zm_058": {
+          "size_bytes": 522560,
+          "sha256": "9e9bf83c5a64e3794ef29ca47a3274c8b2e0a4deebb3ca0d6b5ac1d5b7770e7e",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_058.gguf"
+          }
+        },
+        "zm_061": {
+          "size_bytes": 522560,
+          "sha256": "ff09190cb95c06db058509851a598b84ccbd986da3de8dc32625a2c4af7dcbf0",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_061.gguf"
+          }
+        },
+        "zm_062": {
+          "size_bytes": 522560,
+          "sha256": "0cd4a0d97955d2b8285205140fbeadbf43aba737ad0484fa7dc8ab02cd35d97f",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_062.gguf"
+          }
+        },
+        "zm_063": {
+          "size_bytes": 522560,
+          "sha256": "3f1e48cb67b5221312ffa8c8b80957a116920d01ee8a00ec117cdc464141f16a",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_063.gguf"
+          }
+        },
+        "zm_064": {
+          "size_bytes": 522560,
+          "sha256": "9d5930b8b181b43544f5ef06a3aed23b08c8b57b0386289f3e123c12e7b3c525",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_064.gguf"
+          }
+        },
+        "zm_065": {
+          "size_bytes": 522560,
+          "sha256": "4a8f91ce55b0b61c248acf8040fc097bf6343061396e8d6131040d1f37af8a70",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_065.gguf"
+          }
+        },
+        "zm_066": {
+          "size_bytes": 522560,
+          "sha256": "242e2ffd343d4313cc64086e483ff46535a77213880f2b9a57dabf3bbff524bc",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_066.gguf"
+          }
+        },
+        "zm_068": {
+          "size_bytes": 522560,
+          "sha256": "dfcd7282b5509b705b68cdd3564c8531aa8799caf2423c3c53a87058e9ad5467",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_068.gguf"
+          }
+        },
+        "zm_069": {
+          "size_bytes": 522560,
+          "sha256": "ae1e7387d1837ee4e3b5a8a4cae91d9ec884547ea9597428ed20749824a251e2",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_069.gguf"
+          }
+        },
+        "zm_080": {
+          "size_bytes": 522560,
+          "sha256": "e5cf0080d7051cce5505f4ff18b0706d843f22c6467dcaed3c5170d0f1d20728",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_080.gguf"
+          }
+        },
+        "zm_081": {
+          "size_bytes": 522560,
+          "sha256": "10c74bdcb16817456340d22579d5bc5b174b8570589d8f1f612de318c04fe391",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_081.gguf"
+          }
+        },
+        "zm_082": {
+          "size_bytes": 522560,
+          "sha256": "6779895820fa3954040b9a948bc64974d7365cf244d079251e37d7d6f8149901",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_082.gguf"
+          }
+        },
+        "zm_089": {
+          "size_bytes": 522560,
+          "sha256": "d5bdde46bd00836a92913f38b65c0d57ded29cdf253d83e91ac62ce69a9e70ae",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_089.gguf"
+          }
+        },
+        "zm_091": {
+          "size_bytes": 522560,
+          "sha256": "d356fb8d3dbc49851c3065b519c1325f896fcde240db11fd37f29c423d1a33f6",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_091.gguf"
+          }
+        },
+        "zm_095": {
+          "size_bytes": 522560,
+          "sha256": "146de19355e7628f32aca0f31e0b3c614072b7fc968d90b66cd3002b87d47cd2",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_095.gguf"
+          }
+        },
+        "zm_096": {
+          "size_bytes": 522560,
+          "sha256": "43e6a66aa0f193ac2c14b2194697535aa0ec42b57faaeb949c54125f64bc1cc6",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_096.gguf"
+          }
+        },
+        "zm_097": {
+          "size_bytes": 522560,
+          "sha256": "825ef749ebb5a1feb39f397ef725b18d5de78cef57ec61d1c4ede965b853d0fa",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_097.gguf"
+          }
+        },
+        "zm_098": {
+          "size_bytes": 522560,
+          "sha256": "b1429cbe465de04cd794be75adab2b3408ae0adcf5fc4d82edf67f76648dd270",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_098.gguf"
+          }
+        },
+        "zm_100": {
+          "size_bytes": 522560,
+          "sha256": "72233fd11e979411a25dafd2148bed7993183b411db7faa099ebeb530f875d48",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro_voices/kokoro-voice-zm_100.gguf"
+          }
+        }
+      }
+    },
+    "omnivoice": {
+      "task": "tts",
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "license": "see model card (RapidAI/RapidSpeech)",
+      "description": "OmniVoice: single-stage diffusion TTS (Qwen3-0.6B backbone), instruct-controlled voice, 24 kHz",
+      "default_variant": "q4_k_m",
+      "recommended_backends": [
+        "cpu",
+        "metal",
+        "cuda"
+      ],
+      "example": "rapidspeech speak \"Hello there\" --model omnivoice --lang English -o hi.wav",
+      "variants": {
+        "f16": {
+          "size_bytes": 1632778496,
+          "sha256": "c4e7c2d15cb5c47c630f0a79aee8df3ec464d5b821cebfa166000a90f95e8ec4",
+          "files": {
+            "modelscope": "TTS/omnivoice/omnivoice-f16.gguf",
+            "huggingface": "TTS/omnivoice-f16.gguf"
+          }
+        },
+        "iq3_xxs": {
+          "size_bytes": 687359008,
+          "sha256": "fe970d1365afd8f1c1ce83134aeb9b73340754b8188bcc0294d7237724aaff3a",
+          "files": {
+            "modelscope": "TTS/omnivoice/omnivoice-iq3_xxs.gguf",
+            "huggingface": "TTS/omnivoice-iq3_xxs.gguf"
+          }
+        },
+        "q4_0": {
+          "size_bytes": 775302656,
+          "sha256": "85d68828dd599029bf7c2dabbcb1bd1e349d47bce3c73aff1622954c1cf746d3",
+          "files": {
+            "modelscope": "TTS/omnivoice/omnivoice-q4_0.gguf",
+            "huggingface": "TTS/omnivoice-q4_0.gguf"
+          }
+        },
+        "q4_k_m": {
+          "size_bytes": 822996448,
+          "sha256": "861e6bf314abe06078f5b43d44d66bf1e00763d09d9c3994e56da10867ae7ecf",
+          "files": {
+            "modelscope": "TTS/omnivoice/omnivoice-q4_k_m.gguf",
+            "huggingface": "TTS/omnivoice-q4_k_m.gguf"
+          }
+        },
+        "q5_k_m": {
+          "size_bytes": 880242144,
+          "sha256": "58cb3cc41fab6304e79a941869ad2a9c4facf89652d5d6e3cd63158b78b3217c",
+          "files": {
+            "modelscope": "TTS/omnivoice/omnivoice-q5_k_m.gguf",
+            "huggingface": "TTS/omnivoice-q5_k_m.gguf"
+          }
+        },
+        "q8_0": {
+          "size_bytes": 1073554944,
+          "sha256": "f2d9745a4ce154ecf1e4169f53827b9653550cca5034c8a31a37ac4335a5c58a",
+          "files": {
+            "modelscope": "TTS/omnivoice/omnivoice-q8_0.gguf",
+            "huggingface": "TTS/omnivoice-q8_0.gguf"
+          }
+        }
+      }
+    },
+    "silero-vad": {
+      "task": "vad",
+      "languages": [
+        "*"
+      ],
+      "license": "MIT (Silero VAD)",
+      "description": "Silero VAD v6: tiny universal voice activity detector",
+      "default_variant": "v6",
+      "recommended_backends": [
+        "cpu"
+      ],
+      "example": "used automatically by VAD-segmented ASR",
+      "variants": {
+        "v6": {
+          "size_bytes": 1239680,
+          "sha256": "e4d29fb7072c5584a960145a2de45cf4c0126eca6f338ba7d23741df551438d3",
+          "files": {
+            "modelscope": "VAD/silero_vad_v6.gguf",
+            "huggingface": "VAD/silero_vad_v6.gguf"
+          }
+        }
+      }
+    },
+    "firered-vad": {
+      "task": "vad",
+      "languages": [
+        "*"
+      ],
+      "license": "see model card (RapidAI/RapidSpeech)",
+      "description": "FireRed streaming VAD",
+      "default_variant": "v1",
+      "recommended_backends": [
+        "cpu"
+      ],
+      "example": "used automatically by streaming ASR",
+      "variants": {
+        "v1": {
+          "size_bytes": 2275648,
+          "sha256": "00bb734dcbf790e86447ddd04269320cb5f24df1c44126a389145add32dd93e4",
+          "files": {
+            "modelscope": "VAD/firered-stream-vad.gguf",
+            "huggingface": "VAD/firered-stream-vad.gguf"
+          }
+        }
+      }
+    },
+    "campplus": {
+      "task": "speaker",
+      "languages": [
+        "*"
+      ],
+      "license": "see model card (RapidAI/RapidSpeech)",
+      "description": "CAM++ speaker embedding (192-dim); speaker verification & voice cloning",
+      "default_variant": "v1",
+      "recommended_backends": [
+        "cpu",
+        "metal",
+        "cuda"
+      ],
+      "example": "used for speaker embedding / voice cloning",
+      "variants": {
+        "v1": {
+          "size_bytes": 27779360,
+          "sha256": "c2debc36561fffa7f956f8650582a2c86df04644c744a1c1adddcde248191859",
+          "files": {
+            "modelscope": "SV/campplus.gguf"
+          }
+        }
+      }
     }
+  }
 }

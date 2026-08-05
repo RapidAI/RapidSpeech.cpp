@@ -13,6 +13,7 @@ Subcommands:
 - ``pull``        download a model by ID (resumable, sha256-verified)
 - ``transcribe``  WAV -> text with the default (or named) ASR model
 - ``speak``       text -> WAV with the default (or named) TTS model
+- ``serve``        launch the local API and browser speech console
 
 Errors follow the project remediation rule: say what happened, the most
 likely cause, and the exact next command to run.
@@ -23,9 +24,13 @@ import math
 import os
 import platform
 import shutil
+import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 import wave
+import webbrowser
 from pathlib import Path
 
 from rapidspeech.python import download as dl
@@ -169,14 +174,16 @@ def _model_path(registry, spec, task):
 # Kokoro runtime data (G2P dictionaries shipped inside the wheel)
 # ──────────────────────────────────────────────────────────────────────
 def _pkg_data_dir():
-    return Path(__file__).resolve().parent / "data"
+    # This file lives in rapidspeech/python/; the data ships one level up
+    # at rapidspeech/data/.
+    return Path(__file__).resolve().parents[1] / "data"
 
 
 def _data_dir_candidates(rel):
     """Mirror of rs::find_data_dir search order, for the pip-install case."""
     cands = [_pkg_data_dir() / rel]
     # Dev tree: repo_root/rapidspeech/data/<rel> and repo_root/third_party/<rel>
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[2]
     cands.append(repo_root / "rapidspeech" / "data" / rel)
     if rel.startswith("cppjieba/"):
         cands.append(repo_root / "third_party" / rel)
@@ -504,6 +511,185 @@ def cmd_demo(args):
 
 
 # ──────────────────────────────────────────────────────────────────────
+# serve
+# ──────────────────────────────────────────────────────────────────────
+def _server_candidates():
+    """Return likely locations for the packaged or source-tree server."""
+    candidates = []
+    configured = os.environ.get("RAPIDSPEECH_SERVER_BIN")
+    if configured:
+        candidates.append(Path(configured).expanduser())
+
+    package_dir = Path(__file__).resolve().parents[1]
+    candidates.extend([
+        package_dir / "bin" / "rs-server",
+        package_dir / "rs-server",
+    ])
+
+    repo_root = Path(__file__).resolve().parents[2]
+    candidates.extend([
+        repo_root / "build" / "rs-server",
+        repo_root / "build" / "bin" / "rs-server",
+    ])
+
+    path_server = shutil.which("rs-server")
+    if path_server:
+        candidates.append(Path(path_server))
+    return candidates
+
+
+def _find_server_binary():
+    for candidate in _server_candidates():
+        if candidate.is_file() and os.access(str(candidate), os.X_OK):
+            return candidate
+    return None
+
+
+def _server_web_dir():
+    package_dir = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[2]
+    candidates = [
+        package_dir / "server",
+        repo_root / "examples" / "server",
+    ]
+    for candidate in candidates:
+        if (candidate / "webui.html").is_file():
+            return candidate
+    return None
+
+
+def _wait_for_server(url, process, timeout):
+    deadline = time.monotonic() + timeout
+    health_url = url.rstrip("/") + "/health"
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            return False
+        try:
+            with urllib.request.urlopen(health_url, timeout=0.5) as response:
+                if response.status == 200:
+                    return True
+        except (OSError, urllib.error.URLError):
+            time.sleep(0.15)
+    return False
+
+
+def _terminate_server(process):
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def cmd_serve(args):
+    registry = _load_registry()
+    server = _find_server_binary()
+    if server is None:
+        fail(
+            "the native `rs-server` executable is not installed",
+            cause="this package was installed without the server component, "
+                  "or the source tree has not been built",
+            next_step="reinstall a wheel that includes the server, or build it: "
+                      "cmake -B build && cmake --build build --target rs-server",
+        )
+
+    model_note = "ASR + TTS" + ("" if args.no_vad else " + VAD")
+    print("Preparing models (first run downloads %s)..." % model_note,
+          file=sys.stderr)
+    asr_path, _ = _model_path(registry, args.asr_model, "asr")
+    tts_path, tts_name = _model_path(registry, args.tts_model, "tts")
+    asr_path = asr_path.resolve()
+    tts_path = tts_path.resolve()
+    vad_path = None
+    if not args.no_vad:
+        vad_path, _ = _model_path(registry, args.vad_model, "vad")
+        vad_path = vad_path.resolve()
+
+    if tts_name and registry.models[tts_name].get("voices"):
+        voice = args.voice or registry.default_voice(tts_name)
+        try:
+            vfile = dl.ensure_file(registry.resolve_voice(tts_name, voice))
+        except (reg.RegistryError, dl.DownloadError) as e:
+            _fail_from(e)
+        os.environ.setdefault("RS_KOKORO_VOICE_PATH", str(vfile))
+
+    missing = _export_kokoro_data_env()
+    if missing:
+        fail(
+            "TTS runtime data missing: %s" % ", ".join(missing),
+            cause="the wheel was built without bundled G2P data, or you are "
+                  "running from a stripped source tree",
+            next_step="pip install --upgrade rapidspeech",
+        )
+
+    web_dir = _server_web_dir()
+    if web_dir is None:
+        fail(
+            "the browser console assets are not installed",
+            cause="the package is incomplete or the source tree is missing "
+                  "examples/server/webui.html",
+            next_step="pip install --force-reinstall rapidspeech",
+        )
+
+    ws_port = args.ws_port if args.ws_port is not None else args.port + 1
+    cmd = [
+        str(server),
+        "--asr-model", str(asr_path),
+        "--tts-model", str(tts_path),
+        "--web-dir", str(web_dir),
+        "--host", args.host,
+        "--port", str(args.port),
+        "--ws-port", str(ws_port),
+        "--threads", str(args.threads),
+    ]
+    if vad_path is not None:
+        cmd.extend(["--vad-model", str(vad_path)])
+    if args.two_pass:
+        cmd.append("--two-pass")
+    if args.ctc_precheck:
+        cmd.append("--ctc-precheck")
+    if args.cpu:
+        cmd.append("--cpu")
+    if args.ws_log:
+        cmd.append("--ws-log")
+
+    http_url = "http://%s:%d" % (args.host, args.port)
+    console_url = http_url + "/webui.html"
+    print("  command: %s" % " ".join(cmd), file=sys.stderr)
+    process = None
+    try:
+        print("Starting RapidSpeech server...", file=sys.stderr)
+        process = subprocess.Popen(cmd)
+        if not _wait_for_server(http_url, process, args.startup_timeout):
+            code = process.poll()
+            fail(
+                "RapidSpeech server did not become ready",
+                cause="native model loading failed or the selected port is busy"
+                      + ((" (exit code %d)" % code) if code is not None else ""),
+                next_step="run the printed server command directly for logs",
+            )
+
+        print("\nRapidSpeech is ready", file=sys.stderr)
+        print("  browser console: %s" % console_url, file=sys.stderr)
+        print("  OpenAI API:      %s/v1" % http_url, file=sys.stderr)
+        print("  WebSocket API:   ws://%s:%d" % (args.host, ws_port),
+              file=sys.stderr)
+        print("  Ctrl-C to stop.\n", file=sys.stderr)
+        if not args.no_browser:
+            webbrowser.open(console_url)
+        return process.wait()
+    except KeyboardInterrupt:
+        print("\nstopping RapidSpeech server...", file=sys.stderr)
+        return 130
+    finally:
+        if process is not None:
+            _terminate_server(process)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # entry point
 # ──────────────────────────────────────────────────────────────────────
 def build_parser():
@@ -562,6 +748,37 @@ def build_parser():
     sp.add_argument("--no-browser", action="store_true",
                     help="don't open the browser automatically")
     sp.set_defaults(func=cmd_demo)
+
+    sp = sub.add_parser(
+        "serve",
+        help="start the OpenAI-compatible API and browser speech console",
+    )
+    sp.add_argument("--asr-model", default=None,
+                    help="registry ID or .gguf path (default: funasr-nano)")
+    sp.add_argument("--tts-model", default=None,
+                    help="registry ID or .gguf path (default: kokoro-zh)")
+    sp.add_argument("--vad-model", default=None,
+                    help="registry ID or .gguf path (default: silero-vad)")
+    sp.add_argument("--voice", default=None,
+                    help="voice pack name for registry TTS models")
+    sp.add_argument("--no-vad", action="store_true",
+                    help="don't download/load a VAD model")
+    sp.add_argument("--host", default="127.0.0.1")
+    sp.add_argument("--port", type=int, default=8080)
+    sp.add_argument("--ws-port", type=int, default=None)
+    sp.add_argument("--threads", type=int, default=4)
+    sp.add_argument("--startup-timeout", type=float, default=120.0,
+                    help="seconds to wait for native models to load")
+    sp.add_argument("--two-pass", action="store_true",
+                    help="use CTC first pass and LLM final re-decode")
+    sp.add_argument("--ctc-precheck", action="store_true",
+                    help="skip LLM decoding for CTC-empty audio")
+    sp.add_argument("--ws-log", action="store_true",
+                    help="log WebSocket connection lifecycle events")
+    sp.add_argument("--cpu", action="store_true", help="disable GPU")
+    sp.add_argument("--no-browser", action="store_true",
+                    help="don't open the browser automatically")
+    sp.set_defaults(func=cmd_serve)
 
     return p
 

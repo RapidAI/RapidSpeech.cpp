@@ -1,12 +1,12 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>RapidSpeech Server — Test Console</title>
+<title>RapidSpeech 服务控制台</title>
 <style>
-  :root { --bg:#0f1115; --card:#171a21; --line:#262b36; --fg:#e6e9ef; --mut:#9aa4b2;
-          --acc:#4f8cff; --ok:#3ecf8e; --warn:#e0a33e; --err:#ff6b6b; }
+  :root { --bg:#0f1115; --card:#171a21; --card2:#10131a; --line:#262b36; --fg:#e6e9ef; --mut:#9aa4b2;
+          --acc:#4f8cff; --ok:#3ecf8e; --warn:#e0a33e; --err:#ff6b6b; --violet:#b59cff; }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,
          BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
@@ -17,14 +17,14 @@
   header .dot { display:inline-block; width:8px; height:8px; border-radius:50%;
                 background:var(--err); margin-right:5px; vertical-align:middle; }
   header .dot.up { background:var(--ok); }
-  main { max-width:1100px; margin:0 auto; padding:18px; display:grid;
+  main { max-width:1440px; margin:0 auto; padding:18px; display:grid;
          grid-template-columns:1fr 1fr; gap:16px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
   .card h2 { font-size:13px; margin:0 0 10px; color:var(--acc); font-weight:600;
              text-transform:uppercase; letter-spacing:.04em; }
   .card h2 .tag { float:right; font-size:10px; color:var(--mut); text-transform:none; letter-spacing:0; }
   label { display:block; font-size:12px; color:var(--mut); margin:8px 0 3px; }
-  input[type=text], textarea, select {
+  input[type=text], input[type=number], textarea, select {
     width:100%; background:#0d1017; border:1px solid var(--line); color:var(--fg);
     border-radius:7px; padding:7px 9px; font:inherit; }
   textarea { resize:vertical; min-height:52px; }
@@ -32,9 +32,15 @@
   button { background:var(--acc); color:#fff; border:0; border-radius:7px;
            padding:7px 13px; font:inherit; font-weight:600; cursor:pointer; margin:8px 6px 0 0; }
   button.sec { background:#2a3140; }
+  button.danger { background:#7b3539; }
   button:disabled { opacity:.45; cursor:not-allowed; }
   .row { display:flex; gap:8px; flex-wrap:wrap; align-items:end; }
   .row > * { flex:1; min-width:0; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .grid3 { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+  .split { display:grid; grid-template-columns:360px minmax(0,1fr); gap:14px; }
+  .toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .toolbar .push { flex:1; }
   .out { margin-top:10px; background:#0b0e14; border:1px solid var(--line);
          border-radius:7px; padding:9px 11px; min-height:38px; font-size:13px;
          white-space:pre-wrap; word-break:break-word; }
@@ -42,11 +48,52 @@
   .final { color:var(--ok); }
   .seg { border-left:2px solid var(--line); padding-left:8px; margin:3px 0; }
   .muted { color:var(--mut); font-size:12px; }
+  .pill { display:inline-flex; align-items:center; height:24px; padding:0 8px;
+          color:var(--mut); background:var(--card2); border:1px solid var(--line);
+          border-radius:6px; font-size:11px; font-variant-numeric:tabular-nums; }
+  .metrics { display:grid; grid-template-columns:repeat(6,minmax(110px,1fr)); gap:8px; margin-top:10px; }
+  .metric { background:var(--card2); border:1px solid var(--line); border-radius:7px; padding:8px 10px; min-height:56px; }
+  .metric .k { color:var(--mut); font-size:10px; text-transform:uppercase; letter-spacing:.05em; }
+  .metric .v { margin-top:3px; color:var(--ok); font-weight:700; font-size:17px; font-variant-numeric:tabular-nums; overflow:hidden; text-overflow:ellipsis; }
+  .metric .s { color:var(--mut); font-size:11px; font-variant-numeric:tabular-nums; }
+  .trace { margin-top:10px; min-height:190px; max-height:360px; overflow:auto; background:#0b0e14;
+           border:1px solid var(--line); border-radius:7px; padding:8px; }
+  .line { border-left:2px solid var(--line); padding:7px 9px; margin:0 0 7px;
+          background:#10141c; border-radius:0 6px 6px 0; }
+  .line.partial { border-left-color:var(--warn); color:#f3d18a; }
+  .line.final { border-left-color:var(--ok); color:var(--fg); }
+  .line.error { border-left-color:var(--err); color:#ffb1b1; }
+  .line .meta { color:var(--mut); font-size:11px; margin-bottom:3px; font-variant-numeric:tabular-nums; }
+  .checklist { display:grid; grid-template-columns:repeat(4,minmax(180px,1fr)); gap:8px; }
+  .check { background:var(--card2); border:1px solid var(--line); border-radius:7px; padding:9px 10px; }
+  .check b { display:block; color:var(--fg); margin-bottom:3px; }
+  canvas { display:block; width:100%; height:150px; background:#0b0e14; border:1px solid var(--line); border-radius:7px; margin-top:10px; }
+  .chunkbar { height:28px; background:#0b0e14; border:1px solid var(--line); border-radius:7px;
+              margin-top:10px; position:relative; overflow:hidden; display:flex; align-items:stretch; }
+  .chunkbar .chunk { border-right:1px solid #0b0e14; background:var(--acc); opacity:.85; animation:pop .22s ease; }
+  .chunkbar .playhead { position:absolute; top:0; bottom:0; width:2px; background:#fff; left:0; }
+  @keyframes pop { from { transform:scaleY(0); } to { transform:scaleY(1); } }
+  .video-box { position:relative; overflow:hidden; min-height:210px; background:#07090d;
+               border:1px solid var(--line); border-radius:7px; display:grid; place-items:center; margin-top:10px; }
+  .video-box img { display:block; width:100%; max-height:360px; object-fit:contain; background:#07090d; }
+  .alerts { display:grid; gap:7px; margin-top:10px; }
+  .alert { padding:8px 9px; background:#271f14; color:#f0c36a; border:1px solid #5e4920; border-radius:6px; }
+  .alert.error { background:#2b1719; color:#ffb4b4; border-color:#6f3137; }
   audio { width:100%; margin-top:10px; }
   .full { grid-column:1 / -1; }
   #log { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11px;
          color:var(--mut); max-height:150px; overflow:auto; }
   code { color:var(--acc); }
+  @media (max-width:1040px) {
+    main { grid-template-columns:1fr; }
+    .split { grid-template-columns:1fr; }
+    .metrics { grid-template-columns:repeat(3,minmax(110px,1fr)); }
+    .checklist { grid-template-columns:1fr 1fr; }
+  }
+  @media (max-width:640px) {
+    .grid2, .grid3, .metrics, .checklist { grid-template-columns:1fr; }
+    header input[type=text] { width:100% !important; }
+  }
 </style>
 </head>
 <body>
@@ -55,6 +102,8 @@
   <div><span id="dot" class="dot"></span><span id="status" class="st">not connected</span></div>
   <div style="flex:1"></div>
   <div style="display:flex; gap:8px; align-items:center;">
+    <label style="margin:0">Language</label>
+    <select id="langSelect" style="width:96px"><option value="zh">中文</option><option value="en">English</option></select>
     <label style="margin:0">HTTP</label>
     <input id="httpBase" type="text" style="width:190px" placeholder="http://127.0.0.1:8080">
     <label style="margin:0">WS</label>
@@ -64,6 +113,16 @@
 </header>
 
 <main>
+  <section class="card full">
+    <h2>Capability coverage <span class="tag">one console · local first</span></h2>
+    <div class="checklist">
+      <div class="check"><b>HTTP ASR / TTS</b><span class="muted">OpenAI-compatible transcription and speech endpoints.</span></div>
+      <div class="check"><b>Streaming ASR</b><span class="muted">Microphone or file input, pure stream and VAD segmentation.</span></div>
+      <div class="check"><b>Streaming TTS</b><span class="muted">True chunk streaming, sentence segmentation, latency and RTF.</span></div>
+      <div class="check"><b>Observer bridge</b><span class="muted">Optional ffmpeg source, video, RSS/CPU and soak-test alerts.</span></div>
+    </div>
+  </section>
+
   <!-- HTTP: transcription -->
   <section class="card">
     <h2>HTTP transcription <span class="tag">POST /v1/audio/transcriptions</span></h2>
@@ -93,28 +152,51 @@
     <div class="row">
       <div><label>chunk_len</label>
         <select id="asChunk"><option>16</option><option selected>32</option><option>48</option><option>96</option></select></div>
+      <div><label>PCM chunk ms</label><input id="asPcmMs" type="number" value="200" min="40" max="1000"></div>
     </div>
     <div>
-      <button id="asMic" onclick="asrStreamMic()">🎙 Mic</button>
-      <button class="sec" id="asStop" onclick="stopMic()" disabled>Stop</button>
+      <button id="asMic" onclick="runAsrMic()">🎙 Mic</button>
+      <button class="sec" id="asStop" onclick="stopAsr()" disabled>Stop</button>
       <label style="display:inline">or file:</label>
       <input id="asFile" type="file" accept="audio/*" style="display:inline; width:auto">
-      <button class="sec" onclick="asrStreamFile('/asr/stream','asOut',false)">Send file</button>
+      <button class="sec" onclick="runAsrFile('/asr/stream','asOut',false)">Send file</button>
+      <button class="sec" onclick="clearAsrOutput('asOut')">Clear</button>
+      <button class="sec" onclick="downloadAsrText('asOut')">Download transcript</button>
     </div>
-    <div id="asOut" class="out"></div>
+    <div class="metrics">
+      <div class="metric"><div class="k">Audio</div><div id="asAudio" class="v">0.0s</div><div class="s">16 kHz mono</div></div>
+      <div class="metric"><div class="k">Level</div><div id="asRms" class="v">-120 dB</div><div id="asPeak" class="s">peak -120 dB</div></div>
+      <div class="metric"><div class="k">Messages</div><div id="asMessages" class="v">0</div><div id="asFinals" class="s">0 finals</div></div>
+      <div class="metric"><div class="k">ASR idle</div><div id="asIdle" class="v">0s</div><div class="s">since last event</div></div>
+    </div>
+    <canvas id="asWave" width="1000" height="180"></canvas>
+    <div id="asOut" class="trace"></div>
   </section>
 
   <!-- WS: VAD + ASR -->
   <section class="card">
     <h2>WS VAD + ASR <span class="tag">/asr/vad</span></h2>
+    <div class="grid3">
+      <div><label>threshold</label><input id="vaThreshold" type="number" value="0.5" min="0" max="1" step="0.05"></div>
+      <div><label>end silence ms</label><input id="vaSilence" type="number" value="600" min="0"></div>
+      <div><label>partial ms</label><input id="vaPartial" type="number" value="600" min="0"></div>
+    </div>
+    <div class="grid3">
+      <div><label>min segment ms</label><input id="vaMinSeg" type="number" value="500" min="0"></div>
+      <div><label>max segment ms</label><input id="vaMaxSeg" type="number" value="0" min="0"></div>
+      <label class="muted" style="display:flex;align-items:center;gap:6px;margin:22px 0 0"><input id="vaTwoPass" type="checkbox" style="width:auto"> two pass</label>
+      <label class="muted" style="display:flex;align-items:center;gap:6px;margin:22px 0 0"><input id="vaCtcPrecheck" type="checkbox" style="width:auto"> CTC precheck</label>
+    </div>
     <div>
-      <button id="vaMic" onclick="asrVadMic()">🎙 Mic</button>
-      <button class="sec" id="vaStop" onclick="stopMic()" disabled>Stop</button>
+      <button id="vaMic" onclick="runVadMic()">🎙 Mic</button>
+      <button class="sec" id="vaStop" onclick="stopAsr()" disabled>Stop</button>
       <label style="display:inline">or file:</label>
       <input id="vaFile" type="file" accept="audio/*" style="display:inline; width:auto">
-      <button class="sec" onclick="asrStreamFile('/asr/vad','vaOut',true)">Send file</button>
+      <button class="sec" onclick="runAsrFile('/asr/vad','vaOut',true)">Send file</button>
+      <button class="sec" onclick="clearAsrOutput('vaOut')">Clear</button>
+      <button class="sec" onclick="downloadAsrText('vaOut')">Download transcript</button>
     </div>
-    <div id="vaOut" class="out"></div>
+    <div id="vaOut" class="trace"></div>
   </section>
 
   <!-- WS: TTS streaming -->
@@ -125,13 +207,91 @@
     <div class="row">
       <div><label>voice</label><input id="ttVoice" type="text" value="female"></div>
       <div><label>language</label><input id="ttLang" type="text" value="Chinese"></div>
+      <div><label>seed</label><input id="ttSeed" type="number" value="42"></div>
+      <div><label>steps</label><input id="ttSteps" type="number" value="8" min="1"></div>
+    </div>
+    <div class="row">
+      <div><label>stream mode</label>
+        <select id="ttStreamMode">
+          <option value="true">true · full-text streaming</option>
+          <option value="hybrid" selected>hybrid · first sentence + batched tail</option>
+          <option value="auto">auto · hybrid for multi-sentence text</option>
+        </select></div>
+      <div><label>segment max chars</label><input id="ttSegmentMaxChars" type="number" value="80" min="16" max="512"></div>
     </div>
     <div>
-      <button onclick="ttsWs('/tts/stream')">Pure stream</button>
-      <button onclick="ttsWs('/tts/segmented')">Segmented</button>
+      <select id="ttEndpoint" style="width:auto"><option value="/tts/stream">/tts/stream · selectable stream mode</option><option value="/tts/segmented">/tts/segmented · sentence chunks</option></select>
+      <button id="ttStart" onclick="runTts()">Synthesize and play</button>
+      <button class="sec" id="ttStop" onclick="stopTts()" disabled>Stop</button>
+      <button class="sec" id="ttDownload" onclick="downloadTts()" disabled>Download WAV</button>
     </div>
     <div id="ttOut" class="out muted"></div>
+    <div class="metrics">
+      <div class="metric"><div class="k">First audio</div><div id="ttFirst" class="v">-</div><div class="s">request to first chunk</div></div>
+      <div class="metric"><div class="k">Chunks</div><div id="ttChunks" class="v">0</div><div id="ttSegments" class="s">0 segments</div></div>
+      <div class="metric"><div class="k">Audio</div><div id="ttAudioSec" class="v">0.00s</div><div class="s">received PCM</div></div>
+      <div class="metric"><div class="k">Wall / RTF</div><div id="ttWall" class="v">-</div><div id="ttRtf" class="s">RTF -</div></div>
+      <div class="metric"><div class="k">Buffer ahead</div><div id="ttAhead" class="v">-</div><div class="s">positive is healthy</div></div>
+    </div>
+    <div id="ttBar" class="chunkbar"><div class="playhead"></div></div>
     <audio id="ttAudio" controls></audio>
+  </section>
+
+  <!-- Optional asr-observer bridge -->
+  <section class="card full">
+    <div class="toolbar">
+      <h2 style="margin:0">ASR Observer bridge <span class="tag">optional observer.py on :8090</span></h2>
+      <span class="push"></span><span id="obEventState" class="pill">events disconnected</span>
+    </div>
+    <div class="split">
+      <div>
+        <label>observer HTTP base</label><input id="obBase" type="text" value="http://127.0.0.1:8090">
+        <label>source URL or file path</label><input id="obSource" type="text" value="http://38.75.136.137:98/gslb/dsdqbv/cctv1hd.m3u8?auth=test20251009" placeholder="/path/audio.wav or https://...">
+        <div class="row">
+          <div><label>rs-server WS</label><input id="obRsWs" type="text"></div>
+          <div><label>ASR endpoint</label><select id="obMode"><option value="stream">/asr/stream</option><option value="vad">/asr/vad</option></select></div>
+        </div>
+        <div class="row">
+          <div><label>chunk ms</label><input id="obChunkMs" type="number" value="200" min="40"></div>
+          <div><label>chunk_len</label><select id="obChunkLen"><option>16</option><option selected>32</option><option>48</option><option>96</option></select></div>
+        </div>
+        <div class="grid3">
+          <div><label>source idle s</label><input id="obSourceIdleWarn" type="number" value="30" min="5"></div>
+          <div><label>ASR idle s</label><input id="obAsrIdle" type="number" value="180" min="15"></div>
+          <div><label>RSS warn MB/h</label><input id="obLeakWarn" type="number" value="200" min="0"></div>
+        </div>
+        <div class="toolbar" style="margin-top:8px">
+          <label class="muted" style="display:flex;align-items:center;gap:6px"><input id="obRealtime" type="checkbox" checked style="width:auto"> pace source</label>
+          <label class="muted" style="display:flex;align-items:center;gap:6px"><input id="obVideo" type="checkbox" checked style="width:auto"> video preview</label>
+          <label class="muted" style="display:flex;align-items:center;gap:6px"><input id="obPlay" type="checkbox" style="width:auto"> monitor audio</label>
+          <input id="obVolume" type="range" min="0" max="1" step="0.05" value="0.35" style="width:110px">
+        </div>
+        <div class="grid3">
+          <div><label>video FPS</label><input id="obVideoFps" type="number" value="2" min="1" max="10"></div>
+          <div><label>video width</label><input id="obVideoWidth" type="number" value="640" min="240" max="1920"></div>
+          <div><label>ffmpeg extra args</label><input id="obFfmpegExtra" type="text" placeholder="-headers ..."></div>
+        </div>
+        <button id="obConnect" class="sec" onclick="connectObserver()">Connect events</button>
+        <button id="obStart" onclick="startObserver()">Start observer</button>
+        <button id="obStop" class="danger" onclick="stopObserver()" disabled>Stop</button>
+        <div class="muted" style="margin-top:8px">This bridge keeps ffmpeg, video preview, process RSS/CPU, idle and RSS-slope checks in the existing observer backend. Start it separately with <code>python3 examples/server/asr-observer/observer.py</code>.</div>
+      </div>
+      <div>
+        <div class="metrics">
+          <div class="metric"><div class="k">Source audio</div><div id="obAudio" class="v">0.0s</div><div id="obAudioMb" class="s">0.00 MB</div></div>
+          <div class="metric"><div class="k">Level</div><div id="obRms" class="v">-120 dB</div><div id="obPeak" class="s">peak -120 dB</div></div>
+          <div class="metric"><div class="k">rs-server</div><div id="obRs" class="v">n/a</div><div id="obRsCpu" class="s">cpu n/a</div></div>
+          <div class="metric"><div class="k">ffmpeg</div><div id="obFfmpeg" class="v">n/a</div><div id="obFfmpegCpu" class="s">cpu n/a</div></div>
+          <div class="metric"><div class="k">Idle</div><div id="obIdle" class="v">0s</div><div id="obSourceIdleMetric" class="s">source 0s</div></div>
+          <div class="metric"><div class="k">RSS slope</div><div id="obSlope" class="v">n/a</div><div id="obFfSlope" class="s">ffmpeg n/a</div></div>
+        </div>
+        <canvas id="obWave" width="1000" height="180"></canvas>
+        <div class="video-box"><img id="obVideoFrame" alt="observer video preview" style="display:none"><div id="obVideoEmpty" class="muted">No video frames</div></div>
+        <div class="toolbar" style="margin-top:10px"><span class="muted">Observer transcript</span><span class="push"></span><button class="sec" onclick="clearObserverTranscript()">Clear</button></div>
+        <div id="obTranscript" class="trace"></div>
+        <div id="obAlerts" class="alerts"><div class="muted">No observer alerts</div></div>
+      </div>
+    </div>
   </section>
 
   <!-- log -->
@@ -142,6 +302,157 @@
 </main>
 
 <script>
+const UI_I18N = {
+  "RapidSpeech Server — Test Console": { zh: "RapidSpeech 服务控制台", en: "RapidSpeech Server — Test Console" },
+  "not connected": { zh: "未连接", en: "not connected" },
+  "unreachable": { zh: "无法连接", en: "unreachable" },
+  "Language": { zh: "语言", en: "Language" },
+  "Connect": { zh: "连接", en: "Connect" },
+  "Capability coverage": { zh: "能力覆盖", en: "Capability coverage" },
+  "one console · local first": { zh: "一个控制台 · 本地优先", en: "one console · local first" },
+  "HTTP ASR / TTS": { zh: "HTTP ASR / TTS", en: "HTTP ASR / TTS" },
+  "OpenAI-compatible transcription and speech endpoints.": { zh: "OpenAI 兼容的转写和语音合成端点。", en: "OpenAI-compatible transcription and speech endpoints." },
+  "Streaming ASR": { zh: "流式 ASR", en: "Streaming ASR" },
+  "Microphone or file input, pure stream and VAD segmentation.": { zh: "支持麦克风或文件输入、纯流式和 VAD 分段。", en: "Microphone or file input, pure stream and VAD segmentation." },
+  "Streaming TTS": { zh: "流式 TTS", en: "Streaming TTS" },
+  "True chunk streaming, sentence segmentation, latency and RTF.": { zh: "支持真实分块流、按句分段、延迟和 RTF 指标。", en: "True chunk streaming, sentence segmentation, latency and RTF." },
+  "Observer bridge": { zh: "Observer 桥接", en: "Observer bridge" },
+  "Optional ffmpeg source, video, RSS/CPU and soak-test alerts.": { zh: "可选 ffmpeg 源、视频预览、RSS/CPU 和长跑告警。", en: "Optional ffmpeg source, video, RSS/CPU and soak-test alerts." },
+  "HTTP transcription": { zh: "HTTP 转写", en: "HTTP transcription" },
+  "Audio file (WAV)": { zh: "音频文件（WAV）", en: "Audio file (WAV)" },
+  "Transcribe": { zh: "开始转写", en: "Transcribe" },
+  "HTTP speech": { zh: "HTTP 语音合成", en: "HTTP speech" },
+  "Text": { zh: "文本", en: "Text" },
+  "voice": { zh: "音色", en: "voice" },
+  "language": { zh: "语言", en: "language" },
+  "Synthesize": { zh: "合成", en: "Synthesize" },
+  "WS streaming ASR": { zh: "WS 流式 ASR", en: "WS streaming ASR" },
+  "PCM chunk ms": { zh: "PCM 分块 ms", en: "PCM chunk ms" },
+  "Mic": { zh: "麦克风", en: "Mic" },
+  "Stop": { zh: "停止", en: "Stop" },
+  "or file:": { zh: "或文件：", en: "or file:" },
+  "Send file": { zh: "发送文件", en: "Send file" },
+  "Clear": { zh: "清空", en: "Clear" },
+  "Download transcript": { zh: "下载转写文本", en: "Download transcript" },
+  "Audio": { zh: "音频", en: "Audio" },
+  "16 kHz mono": { zh: "16 kHz 单声道", en: "16 kHz mono" },
+  "Level": { zh: "电平", en: "Level" },
+  "peak -120 dB": { zh: "峰值 -120 dB", en: "peak -120 dB" },
+  "Messages": { zh: "消息数", en: "Messages" },
+  "0 finals": { zh: "0 个 final", en: "0 finals" },
+  "ASR idle": { zh: "ASR 空闲", en: "ASR idle" },
+  "since last event": { zh: "距上次事件", en: "since last event" },
+  "WS VAD + ASR": { zh: "WS VAD + ASR", en: "WS VAD + ASR" },
+  "threshold": { zh: "阈值", en: "threshold" },
+  "end silence ms": { zh: "结束静音 ms", en: "end silence ms" },
+  "partial ms": { zh: "partial 间隔 ms", en: "partial ms" },
+  "min segment ms": { zh: "最短分段 ms", en: "min segment ms" },
+  "max segment ms": { zh: "最长分段 ms", en: "max segment ms" },
+  "two pass": { zh: "二次解码", en: "two pass" },
+  "CTC precheck": { zh: "CTC 预检", en: "CTC precheck" },
+  "WS TTS": { zh: "WS TTS", en: "WS TTS" },
+  "seed": { zh: "随机种子", en: "seed" },
+  "steps": { zh: "步数", en: "steps" },
+  "stream mode": { zh: "流式模式", en: "stream mode" },
+  "segment max chars": { zh: "分段最大字符数", en: "segment max chars" },
+  "true · full-text streaming": { zh: "true · 整段真流式", en: "true · full-text streaming" },
+  "hybrid · first sentence + batched tail": { zh: "hybrid · 首句真流式 + 后续批处理", en: "hybrid · first sentence + batched tail" },
+  "auto · hybrid for multi-sentence text": { zh: "auto · 多句自动 hybrid", en: "auto · hybrid for multi-sentence text" },
+  "/tts/stream · selectable stream mode": { zh: "/tts/stream · 可选流式模式", en: "/tts/stream · selectable stream mode" },
+  "/tts/segmented · sentence chunks": { zh: "/tts/segmented · 按句分块", en: "/tts/segmented · sentence chunks" },
+  "Synthesize and play": { zh: "合成并播放", en: "Synthesize and play" },
+  "Download WAV": { zh: "下载 WAV", en: "Download WAV" },
+  "First audio": { zh: "首个音频", en: "First audio" },
+  "request to first chunk": { zh: "请求到首包", en: "request to first chunk" },
+  "Chunks": { zh: "分块数", en: "Chunks" },
+  "0 segments": { zh: "0 个分段", en: "0 segments" },
+  "received PCM": { zh: "已接收 PCM", en: "received PCM" },
+  "Wall / RTF": { zh: "耗时 / RTF", en: "Wall / RTF" },
+  "Buffer ahead": { zh: "缓冲领先", en: "Buffer ahead" },
+  "positive is healthy": { zh: "正数表示播放稳定", en: "positive is healthy" },
+  "ASR Observer bridge": { zh: "ASR Observer 桥接", en: "ASR Observer bridge" },
+  "optional observer.py on :8090": { zh: "可选 observer.py，默认 :8090", en: "optional observer.py on :8090" },
+  "events disconnected": { zh: "事件未连接", en: "events disconnected" },
+  "events connecting": { zh: "事件连接中", en: "events connecting" },
+  "events connected": { zh: "事件已连接", en: "events connected" },
+  "events reconnecting": { zh: "事件重连中", en: "events reconnecting" },
+  "observer HTTP base": { zh: "observer API 地址", en: "observer HTTP base" },
+  "source URL or file path": { zh: "媒体源 URL 或文件路径", en: "source URL or file path" },
+  "rs-server WS": { zh: "rs-server WS 地址", en: "rs-server WS" },
+  "ASR endpoint": { zh: "ASR 端点", en: "ASR endpoint" },
+  "chunk ms": { zh: "分块 ms", en: "chunk ms" },
+  "source idle s": { zh: "源空闲告警 s", en: "source idle s" },
+  "RSS warn MB/h": { zh: "RSS 增长告警 MB/h", en: "RSS warn MB/h" },
+  "pace source": { zh: "按实时速率推流", en: "pace source" },
+  "video preview": { zh: "视频预览", en: "video preview" },
+  "monitor audio": { zh: "监听音频", en: "monitor audio" },
+  "video FPS": { zh: "视频 FPS", en: "video FPS" },
+  "video width": { zh: "视频宽度", en: "video width" },
+  "ffmpeg extra args": { zh: "ffmpeg 额外参数", en: "ffmpeg extra args" },
+  "Connect events": { zh: "连接事件", en: "Connect events" },
+  "Start observer": { zh: "启动 Observer", en: "Start observer" },
+  "This bridge keeps ffmpeg, video preview, process RSS/CPU, idle and RSS-slope checks in the existing observer backend. Start it separately with": { zh: "此桥接保留现有 observer 后端的 ffmpeg、视频预览、进程 RSS/CPU、空闲和 RSS 斜率检查。请先单独启动：", en: "This bridge keeps ffmpeg, video preview, process RSS/CPU, idle and RSS-slope checks in the existing observer backend. Start it separately with" },
+  "Source audio": { zh: "源音频", en: "Source audio" },
+  "rs-server": { zh: "rs-server", en: "rs-server" },
+  "ffmpeg": { zh: "ffmpeg", en: "ffmpeg" },
+  "Idle": { zh: "空闲", en: "Idle" },
+  "source 0s": { zh: "源 0s", en: "source 0s" },
+  "RSS slope": { zh: "RSS 斜率", en: "RSS slope" },
+  "ffmpeg n/a": { zh: "ffmpeg 无数据", en: "ffmpeg n/a" },
+  "No video frames": { zh: "暂无视频帧", en: "No video frames" },
+  "Observer transcript": { zh: "Observer 转写", en: "Observer transcript" },
+  "No observer alerts": { zh: "暂无 observer 告警", en: "No observer alerts" },
+  "Log": { zh: "日志", en: "Log" }
+};
+const UI_ATTR_I18N = {
+  "/path/audio.wav or https://...": { zh: "本地音频路径或媒体 URL", en: "/path/audio.wav or https://..." },
+  "-headers ...": { zh: "-headers ...", en: "-headers ..." }
+};
+function currentLang() {
+  return document.getElementById("langSelect")?.value || "zh";
+}
+function uiText(key) {
+  const lang = currentLang();
+  return UI_I18N[key]?.[lang] || key;
+}
+function applyI18n(lang) {
+  const active = lang || "zh";
+  document.documentElement.lang = active === "zh" ? "zh-CN" : "en";
+  document.title = UI_I18N["RapidSpeech Server — Test Console"][active];
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const parent = node.parentElement;
+      if (!parent || ["SCRIPT", "STYLE", "CODE"].includes(parent.tagName)) return NodeFilter.FILTER_REJECT;
+      const key = node.__i18nKey || node.nodeValue.trim();
+      return UI_I18N[key] ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+    }
+  });
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  nodes.forEach(node => {
+    const key = node.__i18nKey || node.nodeValue.trim();
+    node.__i18nKey = key;
+    const leading = node.nodeValue.match(/^\s*/)[0];
+    const trailing = node.nodeValue.match(/\s*$/)[0];
+    node.nodeValue = leading + UI_I18N[key][active] + trailing;
+  });
+  document.querySelectorAll("[placeholder]").forEach(node => {
+    const key = node.dataset.i18nPlaceholder || node.getAttribute("placeholder");
+    if (!UI_ATTR_I18N[key]) return;
+    node.dataset.i18nPlaceholder = key;
+    node.setAttribute("placeholder", UI_ATTR_I18N[key][active]);
+  });
+}
+function initI18n() {
+  const select = document.getElementById("langSelect");
+  const lang = localStorage.getItem("rs_webui_lang") || "zh";
+  select.value = lang;
+  applyI18n(lang);
+  select.addEventListener("change", () => {
+    localStorage.setItem("rs_webui_lang", select.value);
+    applyI18n(select.value);
+  });
+}
 // ── config ──────────────────────────────────────────────────────────────
 (function init() {
   const loc = location;
@@ -150,6 +461,7 @@
   const wsPort = served ? (Number(loc.port || 80) + 1) : 8081;
   const wsHost = served ? loc.hostname : "127.0.0.1";
   wsBase.value = `ws://${wsHost}:${wsPort}`;
+  initI18n();
 })();
 const HTTP = () => httpBase.value.replace(/\/$/, "");
 const WS = () => wsBase.value.replace(/\/$/, "");
@@ -158,14 +470,18 @@ function log(m) { const t = new Date().toLocaleTimeString();
   document.getElementById("log").scrollTop = 1e9; }
 
 async function ping() {
+  const dotEl = document.getElementById("dot");
+  const statusEl = document.getElementById("status");
   try {
     const h = await fetch(HTTP() + "/health").then(r => r.json());
     const m = await fetch(HTTP() + "/v1/models").then(r => r.json());
     const ids = m.data.map(d => `${d.id}(${d.arch})`).join(", ") || "none";
-    dot.classList.add("up");
-    status.textContent = `${h.status} · models: ${ids}`;
+    dotEl.classList.add("up");
+    statusEl.textContent = currentLang() === "zh"
+      ? `${h.status === "ok" ? "正常" : h.status} · 模型：${ids}`
+      : `${h.status} · models: ${ids}`;
     log("connected · models: " + ids);
-  } catch (e) { dot.classList.remove("up"); status.textContent = "unreachable";
+  } catch (e) { dotEl.classList.remove("up"); statusEl.textContent = uiText("unreachable");
     log("health failed: " + e); }
 }
 
@@ -310,11 +626,17 @@ function ttsWs(path) {
   ws.binaryType = "arraybuffer";
   ttOut.textContent = "connecting…";
   let sr = 24000, actx = null, playAt = 0, chunks = [], nSeg = 0, t0 = 0, firstAt = 0;
-  ws.onopen = () => {
-    t0 = performance.now();
-    ws.send(JSON.stringify({ type:"text", text:ttText.value,
-                             voice:ttVoice.value, language:ttLang.value }));
-    log(path + " sent text");
+    ws.onopen = () => {
+      t0 = performance.now();
+      const req = { type:"text", text:ttText.value,
+                    voice:ttVoice.value, language:ttLang.value };
+      if (path === "/tts/stream") {
+        req.stream_mode = ttStreamMode.value;
+        req.segment_max_chars = Number(ttSegmentMaxChars.value || 80);
+      }
+      ws.send(JSON.stringify(req));
+      log(path + " sent text" + (req.stream_mode ? " mode=" + req.stream_mode
+        + " max_chars=" + req.segment_max_chars : ""));
   };
   ws.onmessage = (e) => {
     if (typeof e.data === "string") {
@@ -323,6 +645,9 @@ function ttsWs(path) {
         sr = d.sample_rate;
         actx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sr });
         playAt = actx.currentTime + 0.1;
+        log(path + " audio " + sr + " Hz"
+            + (d.stream_mode ? " mode=" + d.stream_mode : "")
+            + (d.segment_max_chars ? " max_chars=" + d.segment_max_chars : ""));
       } else if (d.type === "segment") { nSeg++; }
       else if (d.type === "error") { ttOut.textContent = "error: " + d.error; }
       else if (d.type === "final") {
@@ -363,6 +688,624 @@ function wavBlob(chunks, sr) {
 }
 
 ping();
+</script>
+<script>
+// Enhanced workbench: keeps the original smoke-test functions intact while
+// adding the asr-observer and tts-stream capabilities to this page.
+(function () {
+  const el = (id) => document.getElementById(id);
+  const is_zh = () => currentLang() === "zh";
+  const final_label = (n) => is_zh() ? `${n} 个 final` : `${n} finals`;
+  const segment_label = (n) => is_zh() ? `${n} 个分段` : `${n} segments`;
+  const peak_label = (v) => is_zh() ? `峰值 ${v}` : `peak ${v}`;
+  const source_idle_label = (v) => is_zh() ? `源 ${v}` : `source ${v}`;
+  const cpu_label = (v) => is_zh() ? `CPU ${v}` : `cpu ${v}`;
+  const asr = {
+    ws: null, ctx: null, node: null, stream: null, mode: "", output: "",
+    is_vad: false, segments: {}, cancel: false, audio_samples: 0,
+    messages: 0, finals: 0, last_event: 0, started_at: 0
+  };
+  const tts = {
+    ws: null, ctx: null, sample_rate: 24000, play_at: 0, chunks: [],
+    total_samples: 0, segments: 0, started_at: 0, first_at: 0,
+    running: false, timer: null, finished: false
+  };
+  const observer = {
+    events: null, audio_ctx: null, play_at: 0, metrics: [], last_pcm: new Int16Array(0)
+  };
+
+  function http_root() {
+    return el("httpBase").value.trim().replace(/\/+$/, "");
+  }
+  function ws_root() {
+    return el("wsBase").value.trim().replace(/\/+$/, "");
+  }
+  function escape_text(value) {
+    return String(value == null ? "" : value);
+  }
+  function set_text(id, value) {
+    el(id).textContent = String(value);
+  }
+  function log_enhanced(message) {
+    const t = new Date().toLocaleTimeString();
+    const target = el("log");
+    target.textContent += "[" + t + "] " + message + "\n";
+    target.scrollTop = target.scrollHeight;
+  }
+  function wait_open(ws) {
+    return new Promise((resolve, reject) => {
+      ws.addEventListener("open", resolve, { once: true });
+      ws.addEventListener("error", () => reject(new Error("WebSocket connection failed")), { once: true });
+    });
+  }
+  function wait_ms(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  function float_to_i16(f32) {
+    const out = new Int16Array(f32.length);
+    for (let i = 0; i < f32.length; i++) {
+      const sample = Math.max(-1, Math.min(1, f32[i]));
+      out[i] = sample < 0 ? sample * 32768 : sample * 32767;
+    }
+    return out;
+  }
+  function resample_audio(f32, from, to) {
+    if (from === to) return f32;
+    const n = Math.max(1, Math.round(f32.length * to / from));
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const x = i * from / to;
+      const i0 = Math.min(f32.length - 1, Math.floor(x));
+      const i1 = Math.min(f32.length - 1, i0 + 1);
+      out[i] = f32[i0] + (f32[i1] - f32[i0]) * (x - i0);
+    }
+    return out;
+  }
+  function pcm_stats(i16) {
+    if (!i16.length) return { rms: -120, peak: -120 };
+    let sum = 0, peak = 0;
+    for (let i = 0; i < i16.length; i++) {
+      const n = i16[i] / 32768;
+      sum += n * n;
+      peak = Math.max(peak, Math.abs(i16[i]) / 32768);
+    }
+    return {
+      rms: 20 * Math.log10(Math.max(Math.sqrt(sum / i16.length), 1e-6)),
+      peak: 20 * Math.log10(Math.max(peak, 1e-6))
+    };
+  }
+  function draw_wave(canvas_id, i16, rms, peak) {
+    const canvas = el(canvas_id);
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const width = Math.max(1, canvas.clientWidth);
+    const height = Math.max(1, canvas.clientHeight);
+    if (canvas.width !== Math.floor(width * dpr) || canvas.height !== Math.floor(height * dpr)) {
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
+    }
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#0b0e14";
+    ctx.fillRect(0, 0, width, height);
+    ctx.strokeStyle = "#27303b";
+    ctx.lineWidth = 1;
+    for (let y = 0; y <= height; y += height / 4) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke();
+    }
+    ctx.strokeStyle = "#3ecf8e";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    const mid = height / 2;
+    const step = Math.max(1, Math.floor(i16.length / width));
+    for (let x = 0; x < width; x++) {
+      const start = x * step;
+      let min = 0, max = 0;
+      for (let j = 0; j < step && start + j < i16.length; j++) {
+        const value = i16[start + j] / 32768;
+        min = Math.min(min, value); max = Math.max(max, value);
+      }
+      ctx.moveTo(x, mid - max * mid * 0.9);
+      ctx.lineTo(x, mid - min * mid * 0.9);
+    }
+    ctx.stroke();
+    ctx.fillStyle = "#9aa4b2";
+    ctx.font = "11px ui-monospace,SFMono-Regular,Menlo,monospace";
+    ctx.fillText("rms " + Number(rms || -120).toFixed(1) + " dB  " +
+      peak_label(Number(peak || -120).toFixed(1) + " dB"), 10, 18);
+  }
+  function base64_i16(value) {
+    const raw = atob(value || "");
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    return new Int16Array(bytes.buffer);
+  }
+  function wav_blob(chunks, sample_rate) {
+    const samples = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const buffer = new ArrayBuffer(44 + samples * 2);
+    const view = new DataView(buffer);
+    const write = (offset, text) => {
+      for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
+    };
+    write(0, "RIFF"); view.setUint32(4, 36 + samples * 2, true);
+    write(8, "WAVE"); write(12, "fmt "); view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+    view.setUint32(24, sample_rate, true); view.setUint32(28, sample_rate * 2, true);
+    view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+    write(36, "data"); view.setUint32(40, samples * 2, true);
+    let offset = 44;
+    for (const chunk of chunks) {
+      for (let i = 0; i < chunk.length; i++, offset += 2) view.setInt16(offset, chunk[i], true);
+    }
+    return new Blob([buffer], { type: "audio/wav" });
+  }
+  function download_blob(blob, name) {
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = name;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  }
+
+  // ── ASR workbench ─────────────────────────────────────────────────────
+  function asr_query(path) {
+    const query = new URLSearchParams();
+    if (path === "/asr/stream") {
+      query.set("chunk_len", el("asChunk").value);
+    } else {
+      query.set("vad_threshold", el("vaThreshold").value);
+      query.set("vad_end_silence_ms", el("vaSilence").value);
+      query.set("vad_partial_ms", el("vaPartial").value);
+      query.set("vad_min_segment_ms", el("vaMinSeg").value);
+      query.set("vad_max_segment_ms", el("vaMaxSeg").value);
+      query.set("two_pass", el("vaTwoPass").checked ? "1" : "0");
+      query.set("ctc_precheck", el("vaCtcPrecheck").checked ? "1" : "0");
+    }
+    return path + "?" + query.toString();
+  }
+  function reset_asr_stats() {
+    asr.audio_samples = 0; asr.messages = 0; asr.finals = 0;
+    asr.last_event = performance.now(); asr.started_at = performance.now();
+    set_text("asAudio", "0.0s"); set_text("asRms", "-120 dB");
+    set_text("asPeak", "peak -120 dB"); set_text("asMessages", "0");
+    set_text("asFinals", final_label(0)); set_text("asIdle", "0s");
+  }
+  function set_asr_active(active) {
+    el("asMic").disabled = active; el("vaMic").disabled = active;
+    el("asStop").disabled = !active; el("vaStop").disabled = !active;
+  }
+  function note_asr_pcm(i16) {
+    const stats = pcm_stats(i16);
+    asr.audio_samples += i16.length;
+    set_text("asAudio", (asr.audio_samples / 16000).toFixed(1) + "s");
+    set_text("asRms", stats.rms.toFixed(1) + " dB");
+    set_text("asPeak", peak_label(stats.peak.toFixed(1) + " dB"));
+    draw_wave("asWave", i16, stats.rms, stats.peak);
+  }
+  function add_asr_line(output, kind, text, meta) {
+    const box = el(output);
+    if (box.querySelector(".muted")) box.innerHTML = "";
+    const line = document.createElement("div");
+    line.className = "line " + kind;
+    const header = document.createElement("div");
+    header.className = "meta";
+    header.textContent = new Date().toLocaleTimeString() + " " + meta;
+    line.appendChild(header);
+    line.appendChild(document.createTextNode(escape_text(text)));
+    box.insertBefore(line, box.firstChild);
+    while (box.children.length > 220) box.lastChild.remove();
+  }
+  function update_asr_partial(output, segments, key, text, meta) {
+    let line = segments[key];
+    if (!line) {
+      line = document.createElement("div");
+      line.className = "line partial";
+      const header = document.createElement("div");
+      header.className = "meta";
+      line.appendChild(header);
+      line.appendChild(document.createTextNode(""));
+      el(output).prepend(line);
+      segments[key] = line;
+    }
+    line.querySelector(".meta").textContent = new Date().toLocaleTimeString() + " " + meta;
+    line.lastChild.nodeValue = escape_text(text || "(listening)");
+  }
+  function handle_asr_event(event, output, is_vad, segments) {
+    if (typeof event.data !== "string") return;
+    let data;
+    try { data = JSON.parse(event.data); } catch (_) { return; }
+    asr.messages++;
+    asr.last_event = performance.now();
+    set_text("asMessages", asr.messages);
+    if (data.type === "ready") {
+      log_enhanced("ASR ready " + (is_vad ? JSON.stringify(data) : ""));
+      return;
+    }
+    if (data.type === "error") {
+      add_asr_line(output, "error", data.error || "ASR error", "error");
+      return;
+    }
+    if (data.type === "partial") {
+      const key = is_vad ? "segment-" + data.segment : "stream";
+      update_asr_partial(output, segments, key, data.text, "partial" +
+        (data.segment === undefined ? "" : " · segment " + data.segment));
+      return;
+    }
+    if (data.type === "final") {
+      asr.finals++;
+      set_text("asFinals", final_label(asr.finals));
+      const key = is_vad ? "segment-" + data.segment : "stream";
+      if (segments[key]) {
+        segments[key].className = "line final";
+        segments[key].querySelector(".meta").textContent =
+          new Date().toLocaleTimeString() + " final" +
+          (data.segment === undefined ? "" : " · segment " + data.segment);
+        segments[key].lastChild.nodeValue = escape_text(data.text);
+      } else {
+        add_asr_line(output, "final", data.text || "", "final");
+      }
+      return;
+    }
+    if (data.type === "done") log_enhanced("VAD done");
+  }
+  async function open_asr(path, output, is_vad) {
+    if (asr.ws && asr.ws.readyState === WebSocket.OPEN) asr.ws.close();
+    reset_asr_stats();
+    clearAsrOutput(output);
+    asr.mode = path; asr.output = output; asr.is_vad = is_vad;
+    asr.segments = {}; asr.cancel = false;
+    const ws = new WebSocket(ws_root() + asr_query(path));
+    ws.binaryType = "arraybuffer";
+    ws.onmessage = (event) => handle_asr_event(event, output, is_vad, asr.segments);
+    ws.onclose = () => {
+      if (asr.ws === ws) {
+        asr.ws = null; set_asr_active(false);
+        log_enhanced(path + " closed");
+      }
+    };
+    asr.ws = ws;
+    await wait_open(ws);
+    log_enhanced(path + " connected");
+    return ws;
+  }
+  async function begin_asr_mic(path, is_vad) {
+    try {
+      const ws = await open_asr(path, is_vad ? "vaOut" : "asOut", is_vad);
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });
+      const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      const source = ctx.createMediaStreamSource(stream);
+      const node = ctx.createScriptProcessor(4096, 1, 1);
+      const rate = ctx.sampleRate;
+      source.connect(node); node.connect(ctx.destination);
+      node.onaudioprocess = (event) => {
+        if (!asr.ws || asr.ws.readyState !== WebSocket.OPEN) return;
+        let pcm = event.inputBuffer.getChannelData(0);
+        if (rate !== 16000) pcm = resample_audio(pcm, rate, 16000);
+        const i16 = float_to_i16(pcm);
+        note_asr_pcm(i16);
+        asr.ws.send(i16.buffer);
+      };
+      asr.ctx = ctx; asr.node = node; asr.stream = stream;
+      set_asr_active(true);
+    } catch (error) {
+      log_enhanced("mic error: " + error);
+      set_asr_active(false);
+    }
+  }
+  window.runAsrMic = () => begin_asr_mic("/asr/stream", false);
+  window.runVadMic = () => begin_asr_mic("/asr/vad", true);
+  window.stopAsr = () => {
+    asr.cancel = true;
+    if (asr.node) asr.node.disconnect();
+    if (asr.stream) asr.stream.getTracks().forEach((track) => track.stop());
+    if (asr.ctx) asr.ctx.close();
+    asr.node = null; asr.stream = null; asr.ctx = null;
+    if (asr.ws && asr.ws.readyState === WebSocket.OPEN) {
+      asr.ws.send(JSON.stringify({ type: "eos" }));
+    } else {
+      set_asr_active(false);
+    }
+  };
+  window.runAsrFile = async (path, output, is_vad) => {
+    const input = el(is_vad ? "vaFile" : "asFile");
+    const file = input.files[0];
+    if (!file) { log_enhanced("pick an audio file"); return; }
+    try {
+      const decode_ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const decoded = await decode_ctx.decodeAudioData(await file.arrayBuffer());
+      const pcm = resample_audio(decoded.getChannelData(0), decoded.sampleRate, 16000);
+      await decode_ctx.close();
+      const ws = await open_asr(path, output, is_vad);
+      set_asr_active(true);
+      const step = Math.max(640, Math.round(16000 * Number(el("asPcmMs").value || 200) / 1000));
+      log_enhanced(path + " sending " + (pcm.length / 16000).toFixed(1) + "s");
+      for (let offset = 0; offset < pcm.length && !asr.cancel; offset += step) {
+        const i16 = float_to_i16(pcm.subarray(offset, Math.min(offset + step, pcm.length)));
+        note_asr_pcm(i16);
+        ws.send(i16.buffer);
+        await wait_ms(30);
+      }
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "eos" }));
+    } catch (error) {
+      log_enhanced("file ASR error: " + error);
+      set_asr_active(false);
+    }
+  };
+  window.clearAsrOutput = (id) => { el(id).innerHTML = ""; };
+  window.downloadAsrText = (id) => {
+    const text = el(id).innerText.trim();
+    if (text) download_blob(new Blob([text + "\n"], { type: "text/plain;charset=utf-8" }), "transcript.txt");
+  };
+  setInterval(() => {
+    if (asr.ws && asr.last_event) set_text("asIdle", ((performance.now() - asr.last_event) / 1000).toFixed(1) + "s");
+  }, 500);
+
+  // ── Streaming TTS metrics, gapless playback and download ─────────────
+  function reset_tts() {
+    if (tts.timer) clearInterval(tts.timer);
+    tts.timer = null; tts.chunks = []; tts.total_samples = 0; tts.segments = 0;
+    tts.first_at = 0; tts.sample_rate = 24000; tts.started_at = 0;
+    tts.ctx = null; tts.play_at = 0; tts.finished = false;
+    el("ttBar").innerHTML = '<div class="playhead"></div>';
+    ["ttFirst", "ttWall", "ttRtf", "ttAhead"].forEach((id) => set_text(id, "-"));
+    set_text("ttChunks", "0"); set_text("ttSegments", segment_label(0)); set_text("ttAudioSec", "0.00s");
+  }
+  function tts_play_chunk(i16) {
+    if (!tts.ctx) tts.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const f32 = new Float32Array(i16.length);
+    for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+    const buffer = tts.ctx.createBuffer(1, f32.length, tts.sample_rate);
+    buffer.copyToChannel(f32, 0);
+    const source = tts.ctx.createBufferSource();
+    source.buffer = buffer; source.connect(tts.ctx.destination);
+    tts.play_at = Math.max(tts.play_at, tts.ctx.currentTime + 0.02);
+    source.start(tts.play_at); tts.play_at += buffer.duration;
+  }
+  function tts_chunk(i16) {
+    if (!tts.first_at) {
+      tts.first_at = performance.now();
+      set_text("ttFirst", Math.round(tts.first_at - tts.started_at) + " ms");
+    }
+    tts.chunks.push(i16); tts.total_samples += i16.length; tts_play_chunk(i16);
+    const chunk = document.createElement("div");
+    chunk.className = "chunk";
+    chunk.style.width = Math.max(2, i16.length / tts.sample_rate * 40) + "px";
+    chunk.title = (i16.length / tts.sample_rate).toFixed(2) + "s";
+    el("ttBar").appendChild(chunk);
+    set_text("ttChunks", tts.chunks.length);
+    set_text("ttAudioSec", (tts.total_samples / tts.sample_rate).toFixed(2) + "s");
+  }
+  function tick_tts() {
+    if (!tts.running) return;
+    const wall = (performance.now() - tts.started_at) / 1000;
+    const audio_sec = tts.total_samples / tts.sample_rate;
+    set_text("ttWall", wall.toFixed(2) + "s");
+    if (audio_sec > 0) set_text("ttRtf", "RTF " + (wall / audio_sec).toFixed(3));
+    if (tts.ctx) {
+      const ahead = tts.play_at - tts.ctx.currentTime;
+      set_text("ttAhead", ahead.toFixed(2) + "s");
+      const playhead = el("ttBar").querySelector(".playhead");
+      if (playhead && audio_sec > 0) {
+        const played = Math.max(0, Math.min(1, 1 - ahead / audio_sec));
+        playhead.style.left = (played * el("ttBar").clientWidth) + "px";
+      }
+    }
+  }
+  function finish_tts(reason) {
+    if (tts.finished) return;
+    tts.finished = true; tts.running = false;
+    if (tts.timer) clearInterval(tts.timer);
+    el("ttStart").disabled = false; el("ttStop").disabled = true;
+    el("ttDownload").disabled = !tts.chunks.length;
+    const audio_sec = tts.total_samples / tts.sample_rate;
+    const wall = tts.started_at ? (performance.now() - tts.started_at) / 1000 : 0;
+    set_text("ttWall", wall.toFixed(2) + "s");
+    if (audio_sec > 0) set_text("ttRtf", "RTF " + (wall / audio_sec).toFixed(3));
+    if (tts.chunks.length) el("ttAudio").src = URL.createObjectURL(wav_blob(tts.chunks, tts.sample_rate));
+    set_text("ttOut", (is_zh() ? "完成 · " : "done · ") + audio_sec.toFixed(2) + "s · " + tts.chunks.length +
+      (is_zh() ? " 个 chunk · " : " chunks · ") + reason);
+    if (tts.ws) { try { tts.ws.close(); } catch (_) {} tts.ws = null; }
+  }
+  window.runTts = async () => {
+    if (tts.running) return;
+    reset_tts();
+    const text = el("ttText").value.trim();
+    if (!text) { set_text("ttOut", is_zh() ? "请输入文本" : "enter text"); return; }
+    const path = el("ttEndpoint").value;
+    const ws = new WebSocket(ws_root() + path);
+    ws.binaryType = "arraybuffer"; tts.ws = ws; tts.running = true;
+    el("ttStart").disabled = true; el("ttStop").disabled = false; el("ttDownload").disabled = true;
+    set_text("ttOut", is_zh() ? "连接中..." : "connecting...");
+    ws.onmessage = (event) => {
+      if (event.data instanceof ArrayBuffer) { tts_chunk(new Int16Array(event.data)); return; }
+      let data; try { data = JSON.parse(event.data); } catch (_) { return; }
+      if (data.type === "audio_info") {
+        tts.sample_rate = Number(data.sample_rate || 24000);
+        log_enhanced(path + " audio " + tts.sample_rate + " Hz"
+          + (data.stream_mode ? " mode=" + data.stream_mode : "")
+          + (data.segment_max_chars ? " max_chars=" + data.segment_max_chars : ""));
+      } else if (data.type === "segment") {
+        tts.segments++; set_text("ttSegments", segment_label(tts.segments));
+      } else if (data.type === "error") {
+        set_text("ttOut", "error: " + (data.error || "TTS error")); finish_tts("error");
+      } else if (data.type === "final" || data.type === "done") {
+        finish_tts("server final");
+      }
+    };
+    ws.onerror = () => { set_text("ttOut", is_zh() ? "WebSocket 错误" : "WebSocket error"); finish_tts(is_zh() ? "连接错误" : "connection error"); };
+    ws.onclose = () => { if (tts.running) finish_tts("connection closed"); };
+    try {
+      await wait_open(ws);
+      tts.started_at = performance.now();
+      tts.timer = setInterval(tick_tts, 100);
+      const req = {
+        text: text, voice: el("ttVoice").value.trim() || "female",
+        language: el("ttLang").value, seed: Number(el("ttSeed").value || 42),
+        n_steps: Number(el("ttSteps").value || 8)
+      };
+      if (path === "/tts/stream") {
+        req.stream_mode = el("ttStreamMode").value;
+        req.segment_max_chars = Number(el("ttSegmentMaxChars").value || 80);
+      }
+      ws.send(JSON.stringify(req));
+      log_enhanced(path + " sent " + text.length + " chars"
+        + (req.stream_mode ? " mode=" + req.stream_mode
+        + " max_chars=" + req.segment_max_chars : ""));
+    } catch (error) {
+      set_text("ttOut", "connection error: " + error); finish_tts("connection error");
+    }
+  };
+  window.stopTts = () => finish_tts("manual stop");
+  window.downloadTts = () => {
+    if (tts.chunks.length) download_blob(wav_blob(tts.chunks, tts.sample_rate), "tts-stream.wav");
+  };
+
+  // ── Optional asr-observer SSE bridge ──────────────────────────────────
+  function observer_base() { return el("obBase").value.trim().replace(/\/+$/, ""); }
+  function observer_url(path) { return observer_base() + path; }
+  function observer_alert(level, message) {
+    const box = el("obAlerts");
+    const empty = box.querySelector(".muted");
+    if (empty) box.innerHTML = "";
+    const item = document.createElement("div");
+    item.className = "alert " + (level === "error" ? "error" : "");
+    item.textContent = new Date().toLocaleTimeString() + " " + message;
+    box.prepend(item);
+    while (box.children.length > 8) box.lastChild.remove();
+  }
+  function observer_transcript(data) {
+    if (data.type === "ready") { log_enhanced("observer ASR ready"); return; }
+    if (data.type === "partial") {
+      set_text("obTranscript", data.text || "(listening)");
+      el("obTranscript").className = "trace partial";
+      return;
+    }
+    if (data.type === "final") {
+      const box = el("obTranscript");
+      if (box.classList.contains("partial")) { box.className = "trace"; box.innerHTML = ""; }
+      const line = document.createElement("div");
+      line.className = "line final";
+      line.textContent = "[" + new Date().toLocaleTimeString() + "] " +
+        (data.segment === undefined ? "" : "segment " + data.segment + " ") + (data.text || "");
+      box.prepend(line);
+      while (box.children.length > 220) box.lastChild.remove();
+    } else if (data.type === "error") observer_alert("error", data.error || "observer ASR error");
+  }
+  function fill_process(value_id, cpu_id, process) {
+    if (!process || !process.alive) { set_text(value_id, "n/a"); set_text(cpu_id, cpu_label("n/a")); return; }
+    set_text(value_id, Number(process.rss_mb || 0).toFixed(1) + " MB");
+    set_text(cpu_id, cpu_label(Number(process.cpu_pct || 0).toFixed(1) + "%"));
+  }
+  function observer_metrics(data) {
+    observer.metrics.push(data);
+    if (observer.metrics.length > 900) observer.metrics.shift();
+    set_text("obAudio", Number(data.audio_sec || 0).toFixed(1) + "s");
+    set_text("obAudioMb", Number(data.audio_mb || 0).toFixed(2) + " MB");
+    set_text("obIdle", Number(data.last_asr_age_s || 0).toFixed(0) + "s");
+    set_text("obSourceIdleMetric", source_idle_label(Number(data.last_audio_age_s || 0).toFixed(0) + "s"));
+    fill_process("obRs", "obRsCpu", data.rs_server);
+    fill_process("obFfmpeg", "obFfmpegCpu", data.ffmpeg);
+    set_text("obSlope", data.rs_rss_slope_mb_h == null ? "n/a" : data.rs_rss_slope_mb_h + " MB/h");
+    set_text("obFfSlope", data.ffmpeg_rss_slope_mb_h == null ? "ffmpeg n/a" : "ffmpeg " + data.ffmpeg_rss_slope_mb_h + " MB/h");
+  }
+  function observer_snapshot(data) {
+    if (data.metrics && Object.keys(data.metrics).length) observer_metrics(data.metrics);
+    if (Array.isArray(data.transcripts)) {
+      clearObserverTranscript();
+      data.transcripts.forEach(observer_transcript);
+    }
+    if (Array.isArray(data.alerts)) {
+      data.alerts.forEach((item) => observer_alert(item.level, item.message));
+    }
+  }
+  function connect_observer_events() {
+    if (observer.events) observer.events.close();
+    const events = new EventSource(observer_url("/api/events"));
+    observer.events = events;
+    el("obEventState").textContent = uiText("events connecting");
+    events.onopen = () => { el("obEventState").textContent = uiText("events connected"); };
+    events.onerror = () => { el("obEventState").textContent = uiText("events reconnecting"); };
+    events.addEventListener("state", (event) => {
+      const data = JSON.parse(event.data);
+      observer_snapshot(data);
+      if (data.status) {
+        el("obStart").disabled = data.status !== "idle";
+        el("obStop").disabled = data.status === "idle";
+      }
+    });
+    events.addEventListener("status", (event) => {
+      const data = JSON.parse(event.data);
+      el("obStart").disabled = data.status !== "idle";
+      el("obStop").disabled = data.status === "idle";
+    });
+    events.addEventListener("log", (event) => log_enhanced("observer: " + JSON.parse(event.data).message));
+    events.addEventListener("alert", (event) => {
+      const data = JSON.parse(event.data); observer_alert(data.level, data.message);
+    });
+    events.addEventListener("audio", (event) => {
+      const data = JSON.parse(event.data);
+      const i16 = base64_i16(data.pcm_b64);
+      observer.last_pcm = i16;
+      const stats = pcm_stats(i16);
+      set_text("obRms", stats.rms.toFixed(1) + " dB"); set_text("obPeak", peak_label(stats.peak.toFixed(1) + " dB"));
+      draw_wave("obWave", i16, stats.rms, stats.peak);
+      if (el("obPlay").checked) {
+        if (!observer.audio_ctx) observer.audio_ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const f32 = new Float32Array(i16.length);
+        for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768 * Number(el("obVolume")?.value || 0.35);
+        const buffer = observer.audio_ctx.createBuffer(1, f32.length, Number(data.sample_rate || 16000));
+        buffer.copyToChannel(f32, 0);
+        const source = observer.audio_ctx.createBufferSource(); source.buffer = buffer; source.connect(observer.audio_ctx.destination);
+        observer.play_at = Math.max(observer.play_at, observer.audio_ctx.currentTime + 0.02);
+        source.start(observer.play_at); observer.play_at += buffer.duration;
+      }
+    });
+    events.addEventListener("video", (event) => {
+      const data = JSON.parse(event.data);
+      const image = el("obVideoFrame");
+      image.src = "data:image/jpeg;base64," + data.jpg_b64; image.style.display = "block";
+      el("obVideoEmpty").style.display = "none";
+    });
+    events.addEventListener("transcript", (event) => observer_transcript(JSON.parse(event.data)));
+    events.addEventListener("metrics", (event) => observer_metrics(JSON.parse(event.data)));
+  }
+  window.connectObserver = connect_observer_events;
+  window.startObserver = async () => {
+    if (!observer.events) connect_observer_events();
+    const cfg = {
+      source: el("obSource").value.trim(), mode: el("obMode").value,
+      rs_ws: el("obRsWs").value.trim() || ws_root(), rs_pid: "auto",
+      chunk_len: Number(el("obChunkLen").value), chunk_ms: Number(el("obChunkMs").value),
+      realtime: el("obRealtime").checked, video_preview: el("obVideo").checked,
+      vad_threshold: Number(el("vaThreshold").value), vad_end_silence_ms: Number(el("vaSilence").value),
+      vad_partial_ms: Number(el("vaPartial").value), vad_min_segment_ms: Number(el("vaMinSeg").value),
+      vad_max_segment_ms: Number(el("vaMaxSeg").value), two_pass: el("vaTwoPass").checked,
+      ctc_precheck: el("vaCtcPrecheck").checked,
+      source_idle_warn_s: Number(el("obSourceIdleWarn").value),
+      asr_idle_warn_s: Number(el("obAsrIdle").value),
+      leak_warn_mb_per_hour: Number(el("obLeakWarn").value),
+      video_fps: Number(el("obVideoFps").value),
+      video_width: Number(el("obVideoWidth").value),
+      ffmpeg_extra: el("obFfmpegExtra").value.trim()
+    };
+    if (!cfg.source) { observer_alert("error", "observer source is required"); return; }
+    try {
+      const response = await fetch(observer_url("/api/start"), {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(cfg)
+      });
+      const data = await response.json();
+      if (!data.ok) observer_alert("error", data.error || "observer start failed");
+    } catch (error) { observer_alert("error", "observer unavailable: " + error); }
+  };
+  window.stopObserver = async () => {
+    try { await fetch(observer_url("/api/stop"), { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }); }
+    catch (error) { observer_alert("error", "observer stop failed: " + error); }
+  };
+  window.clearObserverTranscript = () => { el("obTranscript").className = "trace"; el("obTranscript").innerHTML = ""; };
+  el("obRsWs").value = ws_root();
+  draw_wave("asWave", new Int16Array(0), -120, -120);
+  draw_wave("obWave", new Int16Array(0), -120, -120);
+})();
 </script>
 </body>
 </html>
