@@ -58,5 +58,6 @@ RS_API bool load_wav_file_resampled(const char *filename,
                                     int target_sample_rate,
                                     int *src_sample_rate = nullptr);
 
-void load_cmvn_params(struct gguf_context *ctx_gguf, std::vector<float> &means,
-                      std::vector<float> &vars);
+RS_API void load_cmvn_params(struct gguf_context *ctx_gguf,
+                             std::vector<float> &means,
+                             std::vector<float> &vars);

@@ -663,9 +663,10 @@ bool llm_model::load_hparams(struct gguf_context *ctx_gguf) {
       (arch_idx != -1) ? gguf_get_val_str(ctx_gguf, arch_idx) : "unknown";
 
   if (arch_str == "qwen3" || arch_str == "FunASRNano" ||
-      arch_str == "Qwen3ASR") {
+      arch_str == "Qwen3ASR" || arch_str == "MossTranscribeDiarize") {
     hparams_.arch = LLM_ARCH_QWEN3;
-    arch_key = (arch_str == "FunASRNano" || arch_str == "Qwen3ASR")
+    arch_key = (arch_str == "FunASRNano" || arch_str == "Qwen3ASR" ||
+                arch_str == "MossTranscribeDiarize")
                    ? "qwen3"
                    : arch_str;
   } else if (arch_str == "omnivoice-lm") {
@@ -932,6 +933,11 @@ bool llm_model::map_tensors_qwen3(
   output_norm_ = find_tensor("model.norm.weight");
   output_norm_b_ = find_tensor("model.norm.bias");
   output_ = find_tensor("lm_head.weight");
+  if (!output_) {
+    // Tied word embeddings (e.g. MOSS-Transcribe-Diarize / Qwen3-0.6B):
+    // reuse embed_tokens as the LM head.
+    output_ = tok_embd_;
+  }
 
   layers_.resize(hparams_.n_layer);
   for (uint32_t il = 0; il < hparams_.n_layer; ++il) {

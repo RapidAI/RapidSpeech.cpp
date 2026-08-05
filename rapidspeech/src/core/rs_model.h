@@ -3,6 +3,7 @@
 #include "frontend/audio_processor.h"
 #include "ggml-backend.h"
 #include "gguf.h"
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -50,8 +51,35 @@ public:
   virtual bool Encode(const std::vector<float> &input_frames, RSState &state,
                       ggml_backend_sched_t sched) = 0;
 
+  // Optional model-level batching for requests with identical frontend feature
+  // lengths. Default preserves existing behavior by encoding each state
+  // independently on the same scheduler.
+  virtual bool EncodeBatch(const std::vector<const std::vector<float> *> &inputs,
+                           const std::vector<RSState *> &states,
+                           ggml_backend_sched_t sched) {
+    if (inputs.size() != states.size()) return false;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+      if (!inputs[i] || !states[i]) return false;
+      ggml_backend_sched_reset(sched);
+      if (!Encode(*inputs[i], *states[i], sched)) return false;
+    }
+    return true;
+  }
+
   // 4. Decode/Generate: e.g., Hidden States -> Text Tokens
   virtual bool Decode(RSState &state, ggml_backend_sched_t sched) = 0;
+
+  // Optional model-level decoder batching for states with identical encoded
+  // sequence lengths and compatible runtime decode flags.
+  virtual bool DecodeBatch(const std::vector<RSState *> &states,
+                           ggml_backend_sched_t sched) {
+    for (auto *state : states) {
+      if (!state) return false;
+      ggml_backend_sched_reset(sched);
+      if (!Decode(*state, sched)) return false;
+    }
+    return true;
+  }
 
   virtual std::string GetTranscription(RSState &state) = 0;
 
@@ -97,6 +125,15 @@ public:
 
   virtual int GetAudioOutput(RSState &state, float **out_data) {
     (void)state; (void)out_data; return 0;
+  }
+
+  using AudioChunkCallback = std::function<void(const float *pcm, size_t n)>;
+
+  virtual bool SupportsTTSStreaming() const { return false; }
+
+  virtual bool DecodeStream(RSState &state, ggml_backend_sched_t sched,
+                            AudioChunkCallback emit) {
+    (void)state; (void)sched; (void)emit; return false;
   }
 
   // Independent emotion control (IndexTTS-2). Default no-ops; only emotion-aware

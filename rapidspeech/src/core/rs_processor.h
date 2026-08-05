@@ -163,10 +163,10 @@ public:
   int ProcessTTS();
 
   /**
-   * Run one TTS streaming step (CosyVoice3 chunk-level streaming).
+   * Run one TTS streaming step for models that advertise chunk streaming.
    *
    * First call spawns a background worker that drives
-   * `CosyVoice3LMModel::DecodeStream`. Each PCM chunk emitted by the
+   * the model's `DecodeStream`. Each PCM chunk emitted by the
    * worker is pushed onto an internal queue. Each `ProcessTTSStream` call
    * blocks until either the next chunk arrives or the worker finishes,
    * then swaps the chunk into `tts_audio_buf_` so the regular
@@ -177,6 +177,10 @@ public:
    *        -1: error
    */
   int ProcessTTSStream();
+
+  bool SupportsTTSStreaming() const {
+    return model_ && model_->SupportsTTSStreaming();
+  }
 
   /**
    * Get synthesized audio output.
@@ -231,7 +235,7 @@ private:
   int tts_audio_read_pos_ = 0;
 
   // ----- TTS streaming (rs-tts-online) -------------------------------------
-  // Background worker drives `CosyVoice3LMModel::DecodeStream`; each emitted
+  // Background worker drives the model's `DecodeStream`; each emitted
   // PCM chunk is pushed onto `tts_chunk_queue_`. `ProcessTTSStream` blocks
   // on `tts_queue_cv_` until either a chunk arrives or the worker finishes,
   // then swaps the chunk into `tts_audio_buf_`.

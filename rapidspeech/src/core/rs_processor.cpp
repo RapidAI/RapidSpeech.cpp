@@ -339,9 +339,8 @@ int RSProcessor::ProcessTTSStream() {
   RS_LOG_ERR("ProcessTTSStream: not available in WASM build");
   return -1;
 #else
-  auto *cv3 = dynamic_cast<CosyVoice3LMModel *>(model_.get());
-  if (!cv3) {
-    RS_LOG_ERR("ProcessTTSStream: only CosyVoice3 supports streaming");
+  if (!model_->SupportsTTSStreaming()) {
+    RS_LOG_ERR("ProcessTTSStream: model does not support TTS streaming");
     return -1;
   }
 
@@ -359,7 +358,7 @@ int RSProcessor::ProcessTTSStream() {
 
     auto *state_raw = state_.get();
     auto sched = sched_;
-    tts_worker_ = std::thread([this, cv3, state_raw, sched]() {
+    tts_worker_ = std::thread([this, state_raw, sched]() {
       auto emit_cb = [this](const float *pcm, size_t n) {
         if (!pcm || n == 0) return;
         std::unique_lock<std::mutex> lk(tts_queue_mu_);
@@ -375,7 +374,7 @@ int RSProcessor::ProcessTTSStream() {
         tts_queue_cv_.notify_all();
       };
       ggml_backend_sched_reset(sched);
-      bool ok = cv3->DecodeStream(*state_raw, sched, emit_cb);
+      bool ok = model_->DecodeStream(*state_raw, sched, emit_cb);
       {
         std::lock_guard<std::mutex> lk(tts_queue_mu_);
         if (!ok) tts_stream_error_.store(true);
