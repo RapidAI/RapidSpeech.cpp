@@ -83,6 +83,12 @@ set(RS_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/funasr-nano.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/silero_vad.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/fireredvad.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/tenvad.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/ten-vad/fftw.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/ten-vad/stft.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/ten-vad/biquad.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/ten-vad/fscvrt.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/ten-vad/pitch_est.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/llm_model.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/llm_graph.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/arch/llm_kv_cache.cpp
@@ -104,6 +110,7 @@ target_include_directories(rapidspeech-core-wasm PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     ${CMAKE_CURRENT_SOURCE_DIR}/../src
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/c_api
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/ten-vad
     ${GGML_PATH}/include
     ${GGML_PATH}/src
 )
