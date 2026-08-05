@@ -1,109 +1,170 @@
 <div align="center">
-<img src="assets/rapid-speech.png" alt="RapidSpeech Logo" />
+<img src="assets/rapid-speech.png" alt="RapidSpeech Logo" width="640" />
+
+<h1>RapidSpeech.cpp</h1>
+
+<p><strong>Private speech AI that runs where your users are.</strong></p>
+
+<p>
+ASR · streaming ASR · TTS · VAD · voice cloning<br />
+One native C/C++ runtime. Python-simple. GGUF-powered.
+</p>
+
+<p>
+<a href="https://rapidai-rapidspeech-wasm.hf.space"><strong>Try in your browser</strong></a>
+· <a href="https://colab.research.google.com/github/RapidAI/RapidSpeech.cpp/blob/main/colab/RapidSpeech_Quickstart.ipynb">Run in Colab</a>
+· <a href="https://huggingface.co/RapidAI/RapidSpeech">Models</a>
+· <a href="docs/cli.md">CLI guide</a>
+</p>
+
+<p>
+<a href="https://huggingface.co/RapidAI/RapidSpeech"><img src="https://img.shields.io/badge/Hugging_Face-models-yellow" alt="Hugging Face models"></a>
+<a href="https://www.modelscope.cn/models/RapidAI/RapidSpeech/files?version=main"><img src="https://img.shields.io/badge/ModelScope-models-blue" alt="ModelScope models"></a>
+<a href="https://github.com/RapidAI/RapidSpeech.cpp/stargazers"><img src="https://img.shields.io/github/stars/RapidAI/RapidSpeech.cpp?color=ccf" alt="GitHub stars"></a>
+</p>
 </div>
 
 English | [简体中文](./README-CN.md)
 
-<a href="https://huggingface.co/RapidAI/RapidSpeech" target="_blank"><img src="https://img.shields.io/badge/🤗-Hugging Face-blue"></a>
-<a href="https://www.modelscope.cn/models/RapidAI/RapidSpeech/files?version=main" target="_blank"><img src="https://img.shields.io/badge/ModelScope-blue"></a>
-<a href="https://colab.research.google.com/drive/16U6k9zhdtfrEwVLP9a6ks99J0bEHNQyS?usp=sharing" target="_blank"><img src="https://raw.githubusercontent.com/RapidAI/RapidOCR/main/assets/colab-badge.svg" alt="Open in Colab"></a>
-<a href="https://rapidai-rapidspeech-wasm.hf.space" target="_blank"><img src="https://img.shields.io/badge/%F0%9F%A4%97-Hugging Face wasm Demo-blue"></a>
-<a href="https://rapidai-rapidspeech-wasm.ms.show" target="_blank"><img src="https://img.shields.io/badge/魔搭-wasm Demo-blue"></a>
-<a href="https://github.com/RapidAI/RapidSpeech.cpp/stargazers"><img src="https://img.shields.io/github/stars/RapidAI/RapidSpeech.cpp?color=ccf"></a>
-
-
-# RapidSpeech.cpp
-
-On-device speech AI runtime for ASR, TTS, VAD, and voice cloning.
-Python-simple, C++-native, GGUF-powered.
-
-**RapidSpeech.cpp** runs speech recognition, text-to-speech, VAD, speaker
-embedding, and voice cloning on-device. It gives Python developers a simple API
-while keeping the runtime pure C/C++, backed by **ggml** and a unified **GGUF**
-model format. No cloud API, no speech server, no heavyweight Python model stack.
+RapidSpeech.cpp gives applications local speech recognition, text-to-speech,
+voice activity detection and voice cloning without sending audio to a cloud
+service. The runtime is pure C/C++ on ggml, models use GGUF, and Python users
+get installable wheels instead of a heavyweight PyTorch stack.
 
 ------
 
-## Python In 60 Seconds
-
-### Install
+## Install, Then Speak or Transcribe
 
 ```bash
-pip install rapidspeech
+# Choose one package for your machine
+pip install rapidspeech-metal  # macOS / Apple Silicon
+pip install rapidspeech-cuda   # Linux / NVIDIA
+pip install rapidspeech        # CPU, Linux / Windows
+
+rapidspeech transcribe your-audio.wav             # speech → text
+rapidspeech speak "你好，欢迎使用语音合成。" -o hello.wav   # text → speech
+rapidspeech serve                                # OpenAI API + browser console
 ```
 
-GPU wheels:
+No model paths, no CMake, no config. The first run auto-downloads the default
+models (sha256-verified, resumable, cached in `~/.cache/rapidspeech/models/`);
+inference uses no network after the files are cached. Set
+`RAPIDSPEECH_OFFLINE=1` to enforce offline mode.
+
+Example result from an Apple M1 Pro using Metal:
+
+```text
+$ rapidspeech transcribe news-15s.wav
+model: FunASRNano  backend: MTL0
+15.10s audio in 2.08s (RTF 0.138)
+国家发展改革委等部门发布关于开展重点行业节能降碳改造攻坚三年行动的通知。通知提出，重点行业能源消耗和二氧化碳排放的规模大、强度高。
+```
+
+Something broken? `rapidspeech doctor` checks your install, backends and model
+cache, and prints the exact fix for every problem it finds.
+See [docs/cli.md](docs/cli.md) for all commands (`models`, `pull`, offline
+mode, mirrors).
+
+Want to see the whole loop at once? `rapidspeech demo` opens a local browser
+page with hold-to-talk recognition, synthesis, and an echo mode that speaks
+your words back — models, backend and per-request latency shown on screen,
+nothing leaving localhost.
+
+Building a local speech app? `rapidspeech serve` starts the native server,
+opens `http://127.0.0.1:8080/webui.html`, and exposes OpenAI-compatible HTTP
+plus WebSocket streaming ASR/TTS endpoints from the same process.
+
+> The default TTS model is Mandarin Kokoro v1.1-zh. Curated voice packs are
+> available through the model registry, and English words embedded in Chinese
+> text are supported. For English and voice-cloning TTS, see the
+> [model guides](#documentation).
+
+## Try Before Installing
+
+The browser demo runs inference client-side with WebAssembly and WebGPU:
+
+- [Hugging Face browser demo](https://rapidai-rapidspeech-wasm.hf.space)
+- [ModelScope browser demo](https://rapidai-rapidspeech-wasm.ms.show)
+- [Google Colab quickstart](https://colab.research.google.com/github/RapidAI/RapidSpeech.cpp/blob/main/colab/RapidSpeech_Quickstart.ipynb)
+
+It includes offline ASR, microphone ASR with VAD, and local TTS. Your model and
+audio stay in the browser session.
+
+## Use It From Python
 
 ```bash
-pip install rapidspeech-metal   # macOS / Apple Silicon
-pip install rapidspeech-cuda    # Linux / NVIDIA
+rapidspeech pull funasr-nano     # prints the local model path
 ```
-
-### Text to speech
-
-```bash
-python python-api-examples/tts/tts-offline.py \
-  --model /path/to/omnivoice-f16.gguf \
-  --text "Hello, welcome to RapidSpeech." \
-  --output output.wav
-```
-
-### Speech to text
-
-```bash
-python python-api-examples/asr/asr-offline.py \
-  --model /path/to/funasr-nano-fp16.gguf \
-  --audio /path/to/audio.wav
-```
-
-### Python API
 
 ```python
+import os
 import rapidspeech
 
-tts = rapidspeech.tts_synthesizer("/path/to/omnivoice-f16.gguf")
-tts.set_params(instruct="male, young adult", language="English", seed=42)
-pcm = tts.synthesize("Hello from a native speech engine.")
-sample_rate = tts.get_sample_rate()
-```
-
-```python
-import rapidspeech
-
-asr = rapidspeech.asr_offline("/path/to/funasr-nano-fp16.gguf")
-sample_rate = asr.get_model_meta()["audio_sample_rate"]
-pcm = ...  # 1-D float32 mono PCM at sample_rate
-asr.push_audio(pcm)
+model = os.path.expanduser("~/.cache/rapidspeech/models/funasr-nano-q4_k_m.gguf")
+asr = rapidspeech.asr_offline(model)
+asr.push_audio(pcm)              # 1-D float32 mono PCM
 asr.process()
 print(asr.get_text())
 ```
+
+TTS, streaming ASR, VAD and voice cloning:
+[Python examples](python-api-examples/README.md).
+
+------
+
+## What You Can Build
+
+- **Private transcription:** offline files, VAD-segmented audio, hotword
+  biasing for names and domain terms.
+- **Live captions and voice input:** microphone streaming with partial and
+  final results.
+- **Local speech output:** multilingual TTS, expressive synthesis and
+  zero-shot voice cloning.
+- **A local speech service:** OpenAI-compatible HTTP endpoints, WebSocket
+  streaming and MCP from one server.
+- **Browser and native applications:** WASM/JavaScript, Python, C API and
+  self-contained C++ executables.
 
 ------
 
 ## Why RapidSpeech.cpp
 
-- **Built for the edge**: run speech models locally on laptops, servers,
-  browsers, and device-class hardware.
-- **Python-simple, C++-native**: write Python, run a C++/ggml engine underneath.
-- **One model format**: ASR, TTS, VAD, and speaker models use GGUF.
-- **NumPy in, NumPy out**: ASR takes float32 PCM; TTS returns float32 PCM.
-- **Edge-first backends**: CPU, Metal, CUDA, Vulkan, CANN, OpenCL, and WebGPU.
+1. **Local by construction.** Audio is processed by the native runtime on your
+   machine. Model downloads are explicit and offline mode is enforceable.
+2. **A speech workflow, not only a model runner.** VAD, streaming buffers,
+   hotword biasing, Chinese text normalization, speaker embeddings, model
+   quantization and serving live in the same project.
+3. **One core, several deployment surfaces.** Use Python while prototyping,
+   then embed the C API, ship a native executable, run a local server, or move
+   the workflow into the browser.
+
+The shared GGUF format targets CPU, Metal, CUDA, Vulkan, CANN, OpenCL and
+WebGPU. Backend support and optimization vary by model; the model guides record
+the current paths and known limitations.
 
 ------
 
-## Performance Snapshot
+## Measured Performance
 
-Test environment: Apple M1 Pro, funasr-nano-fp16.gguf, 15s audio.
+Apple M1 Pro, macOS, default models, warm inference, 5 runs each. The table is
+generated from raw JSON in [`benchmarks/results/`](benchmarks/results/) — see
+[benchmarks/README.md](benchmarks/README.md) for the rules and one-command
+reproduction on your own machine:
 
-| Configuration | RTF | Wall Time | Notes |
-| --- | --- | --- | --- |
-| CPU -t 4 | 0.465 | 12.4s | CPU-only inference |
-| GPU -t 4 | 0.170 | 5.2s | Metal acceleration |
-| GPU -t 4 Q4_K | 0.756 | - | Quantized model: GPU dequant overhead |
-| CPU -t 4 Q4_K | 0.530 | - | Quantized model CPU inference, 596 MB (3.3x compression) |
+| Task | Model | Backend | Cold start | RTF (median) | RTF (p95) |
+| --- | --- | --- | --- | --- | --- |
+| ASR | funasr-nano q4_k_m (692 MB) | Metal | 0.78 s | 0.106 | 0.132 |
+| ASR | funasr-nano q4_k_m | CPU ×4 | 0.41 s | 0.172 | 0.210 |
+| TTS | kokoro-zh q8_0 (107 MB) | Metal | 0.24 s | 0.362 | 0.363 |
+| TTS | kokoro-zh q8_0 | CPU ×4 | 0.13 s | 0.693 | 0.758 |
 
-RTF is processing time divided by audio duration. Lower is faster; RTF < 1 is
-faster than real time.
+RTF is processing time divided by audio duration. Lower is faster; RTF below
+1 means faster than real time. Results depend on hardware, backend, model,
+quantization and input; the CLI prints RTF on every run. CUDA / Windows /
+WASM platforms are marked "awaiting community reproduction" in
+[benchmarks/README.md](benchmarks/README.md) — we publish measurements, not
+estimates. The [OmniVoice guide](docs/omnivoice.md#performance-rtf) includes
+a per-model quantization/step matrix.
 
 ------
 
@@ -113,7 +174,7 @@ faster than real time.
 | --- | --- | --- |
 | ASR | SenseVoice-small, FunASR-nano, X-ASR (Zipformer2, streaming) | Stable |
 | VAD | Silero VAD, FireRedVAD | Stable |
-| TTS | OmniVoice, OpenVoice2, Kokoro, IndexTTS-2 | Active |
+| TTS | Kokoro, CosyVoice3, OmniVoice, OpenVoice2, IndexTTS-2 | Active |
 | Speaker | CAMPPlus | Stable |
 
 **X-ASR** — Chinese/English Zipformer2 transducer (icefall/k2). One GGUF serves
@@ -126,9 +187,20 @@ CUDA / Vulkan and quantizes to q4_k_m (99.5 MB).
 BigVGAN-v2 vocoder) with 4-mode emotion control (reference audio / vector / text
 / Qwen). See [docs/index2tts.md](docs/index2tts.md).
 
+## Use It Your Way
+
+| Surface | Best for | Start here |
+| --- | --- | --- |
+| `rapidspeech` CLI | First run, scripts and local tools | [CLI guide](docs/cli.md) |
+| Python API | Application integration and NumPy audio | [Python examples](python-api-examples/README.md) |
+| Native C API | Desktop/mobile bindings and embedded runtimes | [`include/rapidspeech.h`](include/rapidspeech.h) |
+| HTTP/WebSocket/MCP | Local services and agent integrations | [Server guide](examples/server/README.md) |
+| Browser WASM | Client-side ASR, VAD and TTS | [WASM guide](wasm-examples/README.md) |
+| Node.js | JavaScript tooling with the WASM runtime | [Node.js example](node-api-example/README.md) |
+
 ## In Progress
 
-CosyVoice3, Qwen3-ASR, Qwen3-TTS.
+Qwen3-ASR, Qwen3-TTS.
 
 ------
 
@@ -154,7 +226,8 @@ CosyVoice3, Qwen3-ASR, Qwen3-TTS.
 
 ### Download Models
 
-Models are available on:
+The pip CLI handles this automatically (see the top of this page). For the
+C++ CLIs, download GGUF files manually from:
 
 - 🤗 Hugging Face: https://huggingface.co/RapidAI/RapidSpeech
 - ModelScope: https://www.modelscope.cn/models/RapidAI/RapidSpeech
@@ -216,11 +289,11 @@ Build artifacts are located in the `build/` directory:
 **Hotword biasing (FunASR-Nano)**
 
 ```bash
-# Bias proper nouns / fix homophones (e.g. 郭总 → 虢总); use --hotword-file for a large list
+# Bias proper nouns / fix homophones ; use --hotword-file for a large list
 ./build/rs-asr-offline \
   -m /path/to/funasr-nano-fp16.gguf \
   -w /path/to/audio.wav \
-  --hotwords "虢总,阿里巴巴"
+  --hotwords "阿里巴巴"
 ```
 
 > See [docs/funasr-nano.md](docs/funasr-nano.md#6-热词rag-上下文偏置) for details.
@@ -258,7 +331,10 @@ and GGUF conversion.
 **Server (OpenAI API + MCP)**
 
 ```bash
-# Serve ASR + TTS over an OpenAI-compatible HTTP API and MCP
+# From the pip package: auto-download defaults, start API, open browser console
+rapidspeech serve
+
+# From a native build: serve ASR + TTS over OpenAI-compatible HTTP API and MCP
 ./build/rs-server --asr-model xasr.gguf --tts-model omnivoice.gguf --port 8080
 
 curl http://127.0.0.1:8080/v1/audio/transcriptions -F file=@audio.wav -F model=rapidspeech-asr
@@ -281,11 +357,17 @@ ASR, offline TTS, streaming TTS, VAD, and voice cloning.
 
 ## 🤝 Contributing
 
-If you are interested in the following areas, we welcome your PRs or participation in discussions:
+Contributions are most useful when they include a command that reproduces the
+change and a result that can be checked. Current high-impact areas:
 
-- Adapting more models to the framework.
-- Refining and optimizing the project architecture.
-- Improving inference performance.
+- Cross-platform installation and wheel testing.
+- Reproducible latency, memory and quality benchmarks.
+- Streaming, Metal, CUDA, Vulkan and WebGPU performance.
+- Documentation and first-run examples.
+- Model ports with conversion scripts, parity checks and known limitations.
+
+Open an issue before starting a large port so the implementation can align with
+the runtime architecture.
 
 ## Acknowledgements
 
