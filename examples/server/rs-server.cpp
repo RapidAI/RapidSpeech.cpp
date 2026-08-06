@@ -41,6 +41,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <array>
 #include <cctype>
 #include <cstdarg>
 #include <chrono>
@@ -56,8 +57,12 @@
 #include <future>
 #include <iostream>
 #include <iterator>
+#include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -74,7 +79,37 @@
 #define RS_FILENO fileno
 #endif
 
+#ifdef _WIN32
+#define RS_POPEN _popen
+#define RS_PCLOSE _pclose
+#else
+#define RS_POPEN popen
+#define RS_PCLOSE pclose
+#endif
+
 namespace fs = std::filesystem;
+
+static std::string find_registry_path_from_argv0(const char *argv0) {
+    std::vector<fs::path> candidates;
+    candidates.push_back(fs::path("rapidspeech") / "python" / "_registry.json");
+    if (argv0 && argv0[0]) {
+        fs::path exe = fs::absolute(fs::path(argv0));
+        fs::path dir = exe.parent_path();
+        candidates.push_back(dir / ".." / "python" / "_registry.json");
+        candidates.push_back(dir / ".." / "rapidspeech" / "python" /
+                             "_registry.json");
+        candidates.push_back(dir / ".." / ".." / "rapidspeech" / "python" /
+                             "_registry.json");
+    }
+    for (const auto &candidate : candidates) {
+        std::error_code ec;
+        if (fs::is_regular_file(candidate, ec)) {
+            fs::path canon = fs::weakly_canonical(candidate, ec);
+            return (ec ? candidate : canon).string();
+        }
+    }
+    return "";
+}
 
 static const char *kServerName = "rapidspeech-server";
 
@@ -161,6 +196,13 @@ struct Engine {
 static Engine g_asr, g_tts;
 static bool g_have_asr = false, g_have_tts = false;
 static std::string g_asr_model_path;
+static std::string g_current_asr_model_spec;
+static std::string g_current_tts_model_spec;
+static std::string g_current_vad_model_spec;
+static std::string g_current_speaker_model_spec;
+static std::string g_registry_path;
+static std::string g_python_executable;
+static std::mutex g_model_switch_mu;
 static int g_model_threads = 4;
 static bool g_model_gpu = true;
 static int g_asr_reload_every = 0; // 0 = disabled
@@ -177,6 +219,16 @@ static bool g_ws_log = false;
 static std::atomic<uint64_t> g_asr_cmvn_version{0};
 static std::vector<float> g_asr_cmvn_means;
 static std::vector<float> g_asr_cmvn_vars;
+
+static rs_speaker_t *g_speaker = nullptr;
+static std::mutex g_speaker_mu;
+static bool g_have_speaker = false;
+static std::string g_speaker_model_path;
+static std::string g_speaker_cluster = "spectral";
+static float g_speaker_threshold = 0.5f;
+static int g_speaker_num_speakers = 0;
+static int g_speaker_max_speakers = 10;
+static std::string g_speaker_log_path;
 
 // CosyVoice3 continuous-batching scheduler. VoxCPM2 has a separate queued
 // scheduler below because its diffusion/AR pipeline is request-oriented.
@@ -413,7 +465,475 @@ struct AsrSegment {
     float start_s = 0.0f;
     float end_s = 0.0f;
     std::string text;
+    int speaker = -1;
+    std::vector<float> pcm;
+    std::vector<float> speaker_embedding;
 };
+
+struct SpeakerServerConfig {
+    bool enabled = false;
+    bool log = false;
+    std::string cluster = "spectral";
+    float threshold = 0.5f;
+    int num_speakers = 0;
+    int max_speakers = 10;
+};
+
+static std::string speaker_name(int speaker) {
+    if (speaker < 0) return "";
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "SPEAKER_%02d", speaker);
+    return buf;
+}
+
+static std::string time_s(float seconds) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.3f", seconds);
+    return buf;
+}
+
+static bool speaker_embed_pcm(const std::vector<float> &pcm,
+                              std::vector<float> &embedding,
+                              std::string &err) {
+    if (!g_have_speaker || !g_speaker) {
+        err = "no speaker model loaded (use --spk-model)";
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(g_speaker_mu);
+    const int dim = rs_speaker_dim(g_speaker);
+    if (dim <= 0) {
+        err = "speaker model has invalid embedding dimension";
+        return false;
+    }
+    embedding.assign((size_t)dim, 0.0f);
+    rs_error_t rc = rs_speaker_embed(g_speaker, pcm.data(), (int)pcm.size(),
+                                     embedding.data(), dim);
+    if (rc != RS_OK) {
+        rs_error_info_t e = rs_get_last_error();
+        err = e.message[0] ? e.message : "speaker embedding failed";
+        return false;
+    }
+    return true;
+}
+
+static std::vector<int> cluster_speaker_embeddings_ahc(
+    const std::vector<std::vector<float>> &embs, int dim, float threshold,
+    int num_speakers) {
+    const int n = (int)embs.size();
+    std::vector<int> labels(n, 0);
+    if (n <= 1) return labels;
+
+    std::vector<float> sim((size_t)n * n, 1.0f);
+    for (int i = 0; i < n; ++i) {
+        for (int j = i + 1; j < n; ++j) {
+            float c = rs_speaker_cosine(embs[i].data(), embs[j].data(), dim);
+            sim[(size_t)i * n + j] = c;
+            sim[(size_t)j * n + i] = c;
+        }
+    }
+
+    std::vector<std::vector<int>> clusters(n);
+    for (int i = 0; i < n; ++i) clusters[i] = {i};
+
+    auto avg_link = [&](const std::vector<int> &a,
+                        const std::vector<int> &b) {
+        double s = 0.0;
+        for (int i : a) {
+            for (int j : b) s += sim[(size_t)i * n + j];
+        }
+        return (float)(s / ((double)a.size() * (double)b.size()));
+    };
+
+    while ((int)clusters.size() > 1) {
+        float best = -2.0f;
+        int bi = -1;
+        int bj = -1;
+        for (size_t i = 0; i < clusters.size(); ++i) {
+            for (size_t j = i + 1; j < clusters.size(); ++j) {
+                float s = avg_link(clusters[i], clusters[j]);
+                if (s > best) {
+                    best = s;
+                    bi = (int)i;
+                    bj = (int)j;
+                }
+            }
+        }
+        bool do_merge = num_speakers > 0
+            ? ((int)clusters.size() > num_speakers)
+            : (best >= threshold);
+        if (!do_merge) break;
+        clusters[bi].insert(clusters[bi].end(), clusters[bj].begin(),
+                            clusters[bj].end());
+        clusters.erase(clusters.begin() + bj);
+    }
+
+    std::sort(clusters.begin(), clusters.end(),
+              [](const std::vector<int> &a, const std::vector<int> &b) {
+                  return *std::min_element(a.begin(), a.end()) <
+                         *std::min_element(b.begin(), b.end());
+              });
+    for (size_t k = 0; k < clusters.size(); ++k) {
+        for (int idx : clusters[k]) labels[idx] = (int)k;
+    }
+    return labels;
+}
+
+static void jacobi_eigh(std::vector<double> &A, int n,
+                        std::vector<double> &w,
+                        std::vector<double> &V) {
+    V.assign((size_t)n * n, 0.0);
+    for (int i = 0; i < n; ++i) V[(size_t)i * n + i] = 1.0;
+
+    double frob2 = 0.0;
+    for (double v : A) frob2 += v * v;
+    const double tol = 1e-12 * std::max(1.0, frob2);
+
+    for (int sweep = 0; sweep < 100; ++sweep) {
+        double off = 0.0;
+        for (int p = 0; p < n; ++p) {
+            for (int q = p + 1; q < n; ++q) {
+                off += A[(size_t)p * n + q] * A[(size_t)p * n + q];
+            }
+        }
+        if (off < tol) break;
+
+        for (int p = 0; p < n; ++p) {
+            for (int q = p + 1; q < n; ++q) {
+                const double apq = A[(size_t)p * n + q];
+                if (std::fabs(apq) < 1e-300) continue;
+                const double app = A[(size_t)p * n + p];
+                const double aqq = A[(size_t)q * n + q];
+                const double theta = (aqq - app) / (2.0 * apq);
+                const double t = (theta >= 0.0 ? 1.0 : -1.0) /
+                    (std::fabs(theta) + std::sqrt(theta * theta + 1.0));
+                const double c = 1.0 / std::sqrt(t * t + 1.0);
+                const double s = t * c;
+
+                for (int k = 0; k < n; ++k) {
+                    const double akp = A[(size_t)k * n + p];
+                    const double akq = A[(size_t)k * n + q];
+                    A[(size_t)k * n + p] = c * akp - s * akq;
+                    A[(size_t)k * n + q] = s * akp + c * akq;
+                }
+                for (int k = 0; k < n; ++k) {
+                    const double apk = A[(size_t)p * n + k];
+                    const double aqk = A[(size_t)q * n + k];
+                    A[(size_t)p * n + k] = c * apk - s * aqk;
+                    A[(size_t)q * n + k] = s * apk + c * aqk;
+                }
+                for (int k = 0; k < n; ++k) {
+                    const double vkp = V[(size_t)k * n + p];
+                    const double vkq = V[(size_t)k * n + q];
+                    V[(size_t)k * n + p] = c * vkp - s * vkq;
+                    V[(size_t)k * n + q] = s * vkp + c * vkq;
+                }
+            }
+        }
+    }
+
+    w.resize(n);
+    for (int i = 0; i < n; ++i) w[i] = A[(size_t)i * n + i];
+
+    std::vector<int> order(n);
+    for (int i = 0; i < n; ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        return w[a] < w[b];
+    });
+
+    std::vector<double> w_sorted(n);
+    std::vector<double> V_sorted((size_t)n * n);
+    for (int k = 0; k < n; ++k) {
+        w_sorted[k] = w[order[k]];
+        for (int i = 0; i < n; ++i) {
+            V_sorted[(size_t)i * n + k] = V[(size_t)i * n + order[k]];
+        }
+    }
+    w = std::move(w_sorted);
+    V = std::move(V_sorted);
+}
+
+static std::vector<int> kmeans_cluster(const std::vector<double> &X, int n,
+                                       int d, int k) {
+    std::vector<int> best_labels(n, 0);
+    if (k <= 1 || n <= 1) return best_labels;
+    k = std::min(k, n);
+
+    std::mt19937 rng(42);
+    const int n_init = 10;
+    const int max_iter = 100;
+    double best_inertia = std::numeric_limits<double>::max();
+
+    auto dist2 = [&](const double *a, const double *b) {
+        double s = 0.0;
+        for (int j = 0; j < d; ++j) {
+            const double diff = a[j] - b[j];
+            s += diff * diff;
+        }
+        return s;
+    };
+
+    std::vector<double> centers((size_t)k * d);
+    std::vector<double> min_d2(n);
+    std::vector<int> labels(n);
+    std::vector<int> counts(k);
+
+    for (int init = 0; init < n_init; ++init) {
+        std::uniform_int_distribution<int> uni(0, n - 1);
+        int first = uni(rng);
+        std::copy(X.begin() + (size_t)first * d,
+                  X.begin() + (size_t)(first + 1) * d,
+                  centers.begin());
+        for (int i = 0; i < n; ++i) {
+            min_d2[i] = dist2(&X[(size_t)i * d], &centers[0]);
+        }
+
+        for (int c = 1; c < k; ++c) {
+            double total = 0.0;
+            for (int i = 0; i < n; ++i) total += min_d2[i];
+            int chosen = 0;
+            if (total <= 0.0) {
+                chosen = uni(rng);
+            } else {
+                std::uniform_real_distribution<double> ur(0.0, total);
+                double r = ur(rng);
+                double acc = 0.0;
+                chosen = n - 1;
+                for (int i = 0; i < n; ++i) {
+                    acc += min_d2[i];
+                    if (acc >= r) {
+                        chosen = i;
+                        break;
+                    }
+                }
+            }
+            std::copy(X.begin() + (size_t)chosen * d,
+                      X.begin() + (size_t)(chosen + 1) * d,
+                      centers.begin() + (size_t)c * d);
+            for (int i = 0; i < n; ++i) {
+                min_d2[i] = std::min(
+                    min_d2[i],
+                    dist2(&X[(size_t)i * d], &centers[(size_t)c * d]));
+            }
+        }
+
+        std::fill(labels.begin(), labels.end(), -1);
+        for (int iter = 0; iter < max_iter; ++iter) {
+            bool changed = false;
+            for (int i = 0; i < n; ++i) {
+                int best_c = 0;
+                double best_d = std::numeric_limits<double>::max();
+                for (int c = 0; c < k; ++c) {
+                    const double dd =
+                        dist2(&X[(size_t)i * d], &centers[(size_t)c * d]);
+                    if (dd < best_d) {
+                        best_d = dd;
+                        best_c = c;
+                    }
+                }
+                if (labels[i] != best_c) {
+                    labels[i] = best_c;
+                    changed = true;
+                }
+            }
+            if (!changed) break;
+
+            std::fill(centers.begin(), centers.end(), 0.0);
+            std::fill(counts.begin(), counts.end(), 0);
+            for (int i = 0; i < n; ++i) {
+                counts[labels[i]]++;
+                for (int j = 0; j < d; ++j) {
+                    centers[(size_t)labels[i] * d + j] += X[(size_t)i * d + j];
+                }
+            }
+            for (int c = 0; c < k; ++c) {
+                if (counts[c] > 0) {
+                    for (int j = 0; j < d; ++j) {
+                        centers[(size_t)c * d + j] /= (double)counts[c];
+                    }
+                } else {
+                    int far_i = 0;
+                    double far_d = -1.0;
+                    for (int i = 0; i < n; ++i) {
+                        const double dd = dist2(
+                            &X[(size_t)i * d],
+                            &centers[(size_t)labels[i] * d]);
+                        if (dd > far_d) {
+                            far_d = dd;
+                            far_i = i;
+                        }
+                    }
+                    std::copy(X.begin() + (size_t)far_i * d,
+                              X.begin() + (size_t)(far_i + 1) * d,
+                              centers.begin() + (size_t)c * d);
+                }
+            }
+        }
+
+        double inertia = 0.0;
+        for (int i = 0; i < n; ++i) {
+            inertia += dist2(&X[(size_t)i * d],
+                             &centers[(size_t)labels[i] * d]);
+        }
+        if (inertia < best_inertia) {
+            best_inertia = inertia;
+            best_labels = labels;
+        }
+    }
+    return best_labels;
+}
+
+static void renumber_labels(std::vector<int> &labels) {
+    std::vector<int> remap;
+    for (int &label : labels) {
+        int found = -1;
+        for (size_t i = 0; i < remap.size(); ++i) {
+            if (remap[i] == label) {
+                found = (int)i;
+                break;
+            }
+        }
+        if (found < 0) {
+            remap.push_back(label);
+            found = (int)remap.size() - 1;
+        }
+        label = found;
+    }
+}
+
+static std::vector<int> spectral_cluster_embeddings(
+    const std::vector<std::vector<float>> &embs, int dim, int max_speakers,
+    int oracle_num) {
+    const int n = (int)embs.size();
+    std::vector<int> labels(n, 0);
+    if (n <= 1) return labels;
+
+    std::vector<double> M((size_t)n * n, 1.0);
+    for (int i = 0; i < n; ++i) {
+        for (int j = i + 1; j < n; ++j) {
+            const double c =
+                (double)rs_speaker_cosine(embs[i].data(), embs[j].data(), dim);
+            M[(size_t)i * n + j] = c;
+            M[(size_t)j * n + i] = c;
+        }
+    }
+
+    const float pval = 0.02f;
+    const int min_pnum = 6;
+    int n_elems = (int)((1.0f - pval) * (float)n);
+    n_elems = std::min(n_elems, n - min_pnum);
+    if (n_elems > 0) {
+        std::vector<int> idx(n);
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j) idx[j] = j;
+            double *row = &M[(size_t)i * n];
+            std::sort(idx.begin(), idx.end(), [row](int a, int b) {
+                return row[a] < row[b];
+            });
+            for (int e = 0; e < n_elems; ++e) row[idx[e]] = 0.0;
+        }
+    }
+
+    for (int i = 0; i < n; ++i) {
+        for (int j = i + 1; j < n; ++j) {
+            const double v = 0.5 * (M[(size_t)i * n + j] +
+                                    M[(size_t)j * n + i]);
+            M[(size_t)i * n + j] = v;
+            M[(size_t)j * n + i] = v;
+        }
+    }
+
+    for (int i = 0; i < n; ++i) M[(size_t)i * n + i] = 0.0;
+    std::vector<double> L((size_t)n * n);
+    for (int i = 0; i < n; ++i) {
+        double deg = 0.0;
+        for (int j = 0; j < n; ++j) deg += std::fabs(M[(size_t)i * n + j]);
+        for (int j = 0; j < n; ++j) L[(size_t)i * n + j] = -M[(size_t)i * n + j];
+        L[(size_t)i * n + i] = deg;
+    }
+
+    std::vector<double> w;
+    std::vector<double> V;
+    jacobi_eigh(L, n, w, V);
+
+    int num_spk = 1;
+    if (oracle_num > 0) {
+        num_spk = std::min(oracle_num, n);
+    } else {
+        const int hi = std::min(std::max(1, max_speakers) + 1, n);
+        double best_gap = -std::numeric_limits<double>::max();
+        for (int i = 0; i + 1 < hi; ++i) {
+            const double gap = w[i + 1] - w[i];
+            if (gap > best_gap) {
+                best_gap = gap;
+                num_spk = i + 1;
+            }
+        }
+        num_spk = std::max(1, std::min(num_spk, n));
+    }
+
+    std::vector<double> spec_emb((size_t)n * num_spk);
+    for (int i = 0; i < n; ++i) {
+        for (int c = 0; c < num_spk; ++c) {
+            spec_emb[(size_t)i * num_spk + c] = V[(size_t)i * n + c];
+        }
+    }
+
+    labels = kmeans_cluster(spec_emb, n, num_spk, num_spk);
+    renumber_labels(labels);
+    return labels;
+}
+
+static bool apply_speaker_clustering(std::vector<AsrSegment> &segments,
+                                     const SpeakerServerConfig &cfg,
+                                     std::string &err) {
+    if (!cfg.enabled) return true;
+    if (!g_have_speaker || !g_speaker) {
+        err = "speaker=true requires --spk-model";
+        return false;
+    }
+    std::vector<std::vector<float>> embeddings;
+    std::vector<int> segment_index;
+    embeddings.reserve(segments.size());
+    segment_index.reserve(segments.size());
+    for (size_t i = 0; i < segments.size(); ++i) {
+        if (segments[i].pcm.empty()) continue;
+        std::vector<float> emb;
+        if (!speaker_embed_pcm(segments[i].pcm, emb, err)) return false;
+        segments[i].speaker_embedding = emb;
+        embeddings.push_back(std::move(emb));
+        segment_index.push_back((int)i);
+    }
+    if (embeddings.empty()) return true;
+    const int dim = rs_speaker_dim(g_speaker);
+    std::vector<int> labels = cfg.cluster == "ahc"
+        ? cluster_speaker_embeddings_ahc(
+              embeddings, dim, cfg.threshold, cfg.num_speakers)
+        : spectral_cluster_embeddings(
+              embeddings, dim, cfg.max_speakers, cfg.num_speakers);
+    for (size_t i = 0; i < labels.size(); ++i) {
+        segments[(size_t)segment_index[i]].speaker = labels[i];
+    }
+    return true;
+}
+
+static void write_speaker_log(const std::vector<AsrSegment> &segments,
+                              const SpeakerServerConfig &cfg) {
+    if (!cfg.log) return;
+    std::ostream *out = &std::cerr;
+    std::ofstream file;
+    if (!g_speaker_log_path.empty() && g_speaker_log_path != "-") {
+        file.open(g_speaker_log_path, std::ios::app);
+        if (file) out = &file;
+    }
+    for (const auto &segment : segments) {
+        if (segment.speaker < 0) continue;
+        *out << "[speaker] segment=" << segment.index
+             << " start=" << time_s(segment.start_s)
+             << " end=" << time_s(segment.end_s)
+             << " speaker=" << speaker_name(segment.speaker)
+             << " text=" << segment.text << "\n";
+    }
+}
 
 static bool parse_bool_value(const std::string &v, bool current);
 
@@ -1061,6 +1581,228 @@ private:
 
 static std::unique_ptr<AsrBatchScheduler> g_asr_batch;
 
+static void set_process_env(const std::string &key, const std::string &value) {
+#ifdef _WIN32
+    _putenv_s(key.c_str(), value.c_str());
+#else
+    setenv(key.c_str(), value.c_str(), 1);
+#endif
+}
+
+struct RegistryDependency {
+    std::string name;
+    std::string env;
+    std::string filename;
+    std::string path;
+    int64_t size_bytes = 0;
+};
+
+static void maybe_start_asr_batch_scheduler() {
+    if (g_asr_slots > 1 &&
+        (g_asr.arch == "SenseVoiceSmall" || g_asr.arch == "FunASRNano")) {
+        const int asr_max_batch_wait_ms =
+            g_asr_max_batch_wait_ms < 0
+                ? std::max(g_asr_batch_wait_ms, g_asr_batch_wait_ms * 4)
+                : g_asr_max_batch_wait_ms;
+        const int asr_frontend_workers =
+            g_asr_frontend_workers > 0 ? g_asr_frontend_workers : g_asr_slots;
+        const int asr_min_batch =
+            g_asr_min_batch <= 0 ? g_asr_slots
+                                 : std::min(g_asr_min_batch, g_asr_slots);
+        g_asr_batch = std::make_unique<AsrBatchScheduler>(
+            g_asr_slots, g_asr_max_queued, g_asr_batch_wait_ms,
+            asr_min_batch, asr_max_batch_wait_ms, asr_frontend_workers);
+        g_asr_batch->Start();
+        fprintf(stderr,
+                "[server] ASR scheduler: slots=%d max_queued=%d "
+                "batch_wait=%dms min_batch=%d max_wait=%dms "
+                "frontend_workers=%d frontend_threads=%d\n",
+                g_asr_slots, g_asr_max_queued, g_asr_batch_wait_ms,
+                asr_min_batch, asr_max_batch_wait_ms, asr_frontend_workers,
+                g_asr_frontend_threads);
+    } else if (g_asr_slots > 1 && !g_asr.arch.empty()) {
+        fprintf(stderr,
+                "[server] ASR batching unavailable for arch=%s; using serialized path\n",
+                g_asr.arch.c_str());
+    }
+}
+
+static bool load_asr_runtime_model(const std::string &path,
+                                   const std::string &spec,
+                                   std::string &err) {
+    std::lock_guard<std::mutex> switch_lk(g_model_switch_mu);
+    g_asr_batch.reset();
+    {
+        std::lock_guard<std::mutex> lk(g_asr.mu);
+        g_have_asr = false;
+        g_asr_model_path = path;
+        g_asr_final_segments_since_reload = 0;
+        g_asr.unload();
+        if (!g_asr.load(path, g_model_threads, g_model_gpu)) {
+            err = "failed to load ASR model: " + path;
+            return false;
+        }
+        if (g_asr.ctx && g_asr.ctx->ctx_gguf) {
+            load_cmvn_params(g_asr.ctx->ctx_gguf, g_asr_cmvn_means,
+                             g_asr_cmvn_vars);
+            g_asr_cmvn_version++;
+        }
+        g_have_asr = true;
+        g_current_asr_model_spec = spec;
+        fprintf(stderr, "[server] ASR ready: %s @ %d Hz (%s)\n",
+                g_asr.arch.c_str(), g_asr.sample_rate, spec.c_str());
+        fprintf(stderr, "[server] ASR decode: two-pass=%s ctc-precheck=%s\n",
+                g_asr_cfg.two_pass ? "on" : "off",
+                g_asr_cfg.ctc_precheck ? "on" : "off");
+        if (g_mem_log) log_asr_memory_locked("after-load");
+    }
+    if (g_asr_reload_every > 0) {
+        fprintf(stderr,
+                "[server] ASR auto-reload enabled: every %d final segment(s)\n",
+                g_asr_reload_every);
+    }
+    maybe_start_asr_batch_scheduler();
+    return true;
+}
+
+static void stop_tts_runtime_schedulers() {
+    g_tts_batch.reset();
+    g_voxcpm2_batch.reset();
+}
+
+static void maybe_start_tts_schedulers() {
+    if (g_tts_slots > 1 && g_tts.arch == "cosyvoice3") {
+        auto *cv3 = dynamic_cast<CosyVoice3LMModel *>(g_tts.ctx->model.get());
+        if (cv3) {
+            auto scheds_voc =
+                g_tts.ctx->create_extra_gpu_scheds(g_tts_voc_workers);
+            g_tts_batch = std::make_unique<TtsBatchScheduler>(
+                cv3, g_tts.ctx->sched, std::move(scheds_voc), g_tts_slots);
+            g_tts_batch->Start();
+            fprintf(stderr, "[server] TTS continuous batching: %d slots\n",
+                    g_tts_slots);
+        } else {
+            fprintf(stderr,
+                    "[server] TTS batching unavailable (model cast failed); "
+                    "using serialized path\n");
+        }
+    }
+    if (g_tts_slots > 1 && g_tts.arch == "voxcpm2") {
+        auto *voxcpm2 = dynamic_cast<VoxCPM2Model *>(g_tts.ctx->model.get());
+        if (voxcpm2) {
+            auto extra = g_tts.ctx->create_extra_gpu_scheds(g_tts_slots - 1);
+            std::vector<ggml_backend_sched_t> scheds;
+            scheds.push_back(g_tts.ctx->sched);
+            scheds.insert(scheds.end(), extra.begin(), extra.end());
+            g_voxcpm2_batch =
+                std::make_unique<VoxCPM2ServerScheduler>(
+                    voxcpm2, std::move(scheds), g_tts_slots);
+            g_voxcpm2_batch->Start();
+            fprintf(stderr,
+                    "[server] VoxCPM2 TTS scheduler: %d slots, %d worker(s)\n",
+                    g_tts_slots, g_voxcpm2_batch->n_workers());
+        } else {
+            fprintf(stderr,
+                    "[server] VoxCPM2 batching unavailable (model cast failed)\n");
+        }
+    }
+}
+
+static bool load_tts_runtime_model(const std::string &path,
+                                   const std::string &spec,
+                                   const std::string &voice_path,
+                                   const std::vector<RegistryDependency> &dependencies,
+                                   std::string &err) {
+    std::lock_guard<std::mutex> switch_lk(g_model_switch_mu);
+    if (!voice_path.empty()) set_process_env("RS_KOKORO_VOICE_PATH", voice_path);
+    for (const auto &dep : dependencies) {
+        if (!dep.env.empty()) set_process_env(dep.env, dep.path);
+    }
+    stop_tts_runtime_schedulers();
+    {
+        std::lock_guard<std::mutex> lk(g_tts.mu);
+        g_have_tts = false;
+        g_tts.unload();
+        if (!g_tts.load(path, g_model_threads, g_model_gpu, RS_TASK_TTS_ONLINE)) {
+            err = "failed to load TTS model: " + path;
+            return false;
+        }
+        g_have_tts = true;
+        g_current_tts_model_spec = spec;
+        fprintf(stderr, "[server] TTS ready: %s @ %d Hz (%s)\n",
+                g_tts.arch.c_str(), g_tts.sample_rate, spec.c_str());
+    }
+    maybe_start_tts_schedulers();
+    return true;
+}
+
+static bool load_vad_runtime_model(const std::string &path,
+                                   const std::string &spec,
+                                   std::string &err) {
+    std::lock_guard<std::mutex> switch_lk(g_model_switch_mu);
+    std::lock_guard<std::mutex> lk(g_vad_mu);
+    if (g_vad) {
+        rs_vad_free(g_vad);
+        g_vad = nullptr;
+    }
+    for (auto *worker : g_vad_ws_pool) {
+        if (worker) rs_vad_free(worker);
+    }
+    g_vad_ws_pool.clear();
+    g_vad_ws_busy.clear();
+    g_have_vad = false;
+
+    g_vad = rs_vad_init_from_file(path.c_str(), g_model_threads, g_model_gpu);
+    if (!g_vad) {
+        err = "failed to load VAD model: " + path;
+        return false;
+    }
+    rs_vad_set_threshold(g_vad, g_vad_cfg.threshold);
+    for (int i = 0; i < g_vad_workers; ++i) {
+        rs_vad_t *worker =
+            rs_vad_init_from_file(path.c_str(), g_model_threads, g_model_gpu);
+        if (!worker) {
+            err = "failed to load VAD worker";
+            return false;
+        }
+        rs_vad_set_threshold(worker, g_vad_cfg.threshold);
+        g_vad_ws_pool.push_back(worker);
+        g_vad_ws_busy.push_back(false);
+    }
+    g_have_vad = true;
+    g_current_vad_model_spec = spec;
+    fprintf(stderr,
+            "[server] VAD ready: %s threshold=%.2f ws-workers=%d (%s)\n",
+            rs_vad_get_arch(g_vad), g_vad_cfg.threshold, g_vad_workers,
+            spec.c_str());
+    return true;
+}
+
+static bool load_speaker_runtime_model(const std::string &path,
+                                       const std::string &spec,
+                                       std::string &err) {
+    std::lock_guard<std::mutex> switch_lk(g_model_switch_mu);
+    std::lock_guard<std::mutex> lk(g_speaker_mu);
+    if (g_speaker) {
+        rs_speaker_free(g_speaker);
+        g_speaker = nullptr;
+    }
+    g_have_speaker = false;
+    g_speaker = rs_speaker_init_from_file(path.c_str(), g_model_threads,
+                                          g_model_gpu);
+    if (!g_speaker) {
+        rs_error_info_t e = rs_get_last_error();
+        err = e.message[0] ? e.message : "failed to load speaker model";
+        return false;
+    }
+    g_have_speaker = true;
+    g_speaker_model_path = path;
+    g_current_speaker_model_spec = spec;
+    fprintf(stderr, "[server] Speaker ready: CAMPPlus dim=%d (%s)\n",
+            rs_speaker_dim(g_speaker), spec.c_str());
+    return true;
+}
+
 static bool transcribe_pcm_server(const float *pcm, int n,
                                   const AsrServerConfig &cfg,
                                   std::string &text, std::string &err) {
@@ -1211,6 +1953,160 @@ static bool transcribe_pcm_vad_locked(const std::vector<float> &pcm,
     return true;
 }
 
+static bool detect_pcm_vad_segments_locked(const std::vector<float> &pcm,
+                                           const VadServerConfig &cfg,
+                                           std::vector<AsrSegment> &segments,
+                                           std::string &err) {
+    if (rs_vad_reset(g_vad) != RS_OK) {
+        err = "rs_vad_reset failed";
+        return false;
+    }
+    if (rs_vad_set_threshold(g_vad, cfg.threshold) != RS_OK) {
+        err = "rs_vad_set_threshold failed";
+        return false;
+    }
+
+    const int sr = g_asr.sample_rate > 0 ? g_asr.sample_rate : 16000;
+    const int chunk_samples = std::max(1, sr / 10);
+    std::vector<float> seg;
+    bool in_speech = false;
+    bool pending_end = false;
+    int pending_silence_samples = 0;
+    int seg_index = 0;
+    int64_t seg_start_sample = 0;
+    int64_t total_samples = 0;
+
+    auto push_segment = [&](int64_t end_sample) {
+        if (seg.empty()) return true;
+        int min_samples = (sr * cfg.min_segment_ms) / 1000;
+        if ((int)seg.size() < min_samples) return true;
+        AsrSegment out;
+        out.index = seg_index;
+        out.start_s = (float)((double)seg_start_sample / sr);
+        out.end_s = (float)((double)end_sample / sr);
+        out.pcm = seg;
+        segments.push_back(std::move(out));
+        return true;
+    };
+
+    auto finalize_seg = [&](int64_t end_sample) {
+        if (!push_segment(end_sample)) return false;
+        in_speech = false;
+        pending_end = false;
+        pending_silence_samples = 0;
+        seg_index++;
+        seg.clear();
+        return true;
+    };
+
+    auto force_split_seg = [&](int64_t end_sample) {
+        if (!finalize_seg(end_sample)) return false;
+        in_speech = true;
+        seg_start_sample = end_sample;
+        return true;
+    };
+
+    auto handle_frames = [&]() {
+        rs_vad_frame_t frames[64];
+        int nf;
+        while ((nf = rs_vad_drain_frames(g_vad, frames, 64)) > 0) {
+            for (int i = 0; i < nf; i++) {
+                if (frames[i].is_speech_start) {
+                    if (pending_end) {
+                        pending_end = false;
+                        pending_silence_samples = 0;
+                    } else if (!in_speech) {
+                        in_speech = true;
+                        seg.clear();
+                        seg_start_sample = total_samples;
+                    }
+                }
+                if (frames[i].is_speech_end && in_speech) {
+                    pending_end = true;
+                    pending_silence_samples = 0;
+                }
+            }
+            if (nf < 64) break;
+        }
+    };
+
+    for (size_t offset = 0; offset < pcm.size();) {
+        int n = (int)std::min<size_t>((size_t)chunk_samples, pcm.size() - offset);
+        const float *chunk = pcm.data() + offset;
+        if (rs_vad_push_audio(g_vad, chunk, n) != RS_OK) {
+            err = "rs_vad_push_audio failed";
+            return false;
+        }
+        handle_frames();
+        if (in_speech) {
+            seg.insert(seg.end(), chunk, chunk + n);
+            if (pending_end) pending_silence_samples += n;
+        }
+
+        total_samples += n;
+        if (pending_end &&
+            pending_silence_samples >= (sr * cfg.end_silence_ms) / 1000) {
+            if (!finalize_seg(total_samples)) return false;
+        }
+        if (in_speech && cfg.max_segment_ms > 0 &&
+            seg.size() >= (size_t)((sr * cfg.max_segment_ms) / 1000)) {
+            if (pending_end) {
+                if (!finalize_seg(total_samples)) return false;
+            } else if (!force_split_seg(total_samples)) {
+                return false;
+            }
+        }
+        offset += n;
+    }
+    if (in_speech) {
+        if (!finalize_seg(total_samples)) return false;
+    }
+    return true;
+}
+
+static bool transcribe_detected_segments(std::vector<AsrSegment> &segments,
+                                         const AsrServerConfig &cfg,
+                                         std::string &text,
+                                         std::string &err) {
+    text.clear();
+    if (segments.empty()) return true;
+
+    if (g_asr_batch) {
+        std::vector<std::future<std::pair<std::string, std::string>>> futures;
+        futures.reserve(segments.size());
+        for (const auto &segment : segments) {
+            futures.push_back(g_asr_batch->Submit(segment.pcm, cfg));
+        }
+        for (size_t i = 0; i < futures.size(); ++i) {
+            auto result = futures[i].get();
+            if (!result.second.empty()) {
+                err = result.second;
+                return false;
+            }
+            segments[i].text = std::move(result.first);
+        }
+    } else {
+        for (auto &segment : segments) {
+            if (!transcribe_pcm_server(segment.pcm.data(), (int)segment.pcm.size(),
+                                       cfg, segment.text, err)) {
+                return false;
+            }
+        }
+    }
+
+    std::vector<AsrSegment> non_empty;
+    non_empty.reserve(segments.size());
+    for (auto &segment : segments) {
+        if (segment.text.empty()) continue;
+        if (!text.empty()) text += "\n";
+        text += segment.text;
+        segment.index = (int)non_empty.size();
+        non_empty.push_back(std::move(segment));
+    }
+    segments = std::move(non_empty);
+    return true;
+}
+
 static bool do_transcribe_with_config(const std::string &audio_bytes,
                                       const AsrServerConfig &cfg,
                                       std::string &text, std::string &err) {
@@ -1232,17 +2128,34 @@ static bool do_transcribe(const std::string &audio_bytes, std::string &text,
 static bool do_transcribe_vad(const std::string &audio_bytes,
                               const AsrServerConfig &asr_cfg,
                               const VadServerConfig &vad_cfg,
+                              const SpeakerServerConfig &spk_cfg,
                               std::vector<AsrSegment> &segments,
                               std::string &text, std::string &err) {
     if (!g_have_asr) { err = "no ASR model loaded"; return false; }
     if (!g_have_vad) { err = "no VAD model loaded (use --vad-model)"; return false; }
+    if (spk_cfg.enabled && !g_have_speaker) {
+        err = "speaker=true requires --spk-model";
+        return false;
+    }
     std::vector<float> pcm;
     if (!decode_audio(audio_bytes, g_asr.sample_rate, pcm)) {
         err = "could not decode audio (expected WAV)";
         return false;
     }
-    std::unique_lock<std::mutex> vlk(g_vad_mu);
-    return transcribe_pcm_vad_locked(pcm, asr_cfg, vad_cfg, segments, text, err);
+    {
+        std::unique_lock<std::mutex> vlk(g_vad_mu);
+        if (!detect_pcm_vad_segments_locked(pcm, vad_cfg, segments, err)) {
+            return false;
+        }
+    }
+    if (!transcribe_detected_segments(segments, asr_cfg, text, err)) {
+        return false;
+    }
+    if (!apply_speaker_clustering(segments, spk_cfg, err)) {
+        return false;
+    }
+    write_speaker_log(segments, spk_cfg);
+    return true;
 }
 
 // Synthesize text → mono float PCM at g_tts.sample_rate.
@@ -1301,6 +2214,507 @@ static void send_error(httplib::Response &res, int status, const std::string &ms
     e["error"]["message"] = msg;
     e["error"]["type"] = type;
     send_json(res, status, e);
+}
+
+static std::string read_text_file(const fs::path &path, std::string &err) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        err = "could not open " + path.string();
+        return "";
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+static const rsjson::Value *object_get(const rsjson::Value &obj,
+                                       const std::string &key) {
+    if (!obj.is_object()) return nullptr;
+    for (const auto &kv : obj.members()) {
+        if (kv.first == key) return &kv.second;
+    }
+    return nullptr;
+}
+
+static bool ends_with(const std::string &s, const std::string &suffix) {
+    return s.size() >= suffix.size() &&
+           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+static bool looks_like_path(const std::string &s) {
+    return s.find('/') != std::string::npos ||
+           s.find('\\') != std::string::npos ||
+           ends_with(s, ".gguf");
+}
+
+static fs::path expand_user_path(const std::string &s) {
+    if (s == "~" || s.rfind("~/", 0) == 0) {
+        const char *home = std::getenv(
+#ifdef _WIN32
+            "USERPROFILE"
+#else
+            "HOME"
+#endif
+        );
+        if (home) {
+            return s == "~" ? fs::path(home) : fs::path(home) / s.substr(2);
+        }
+    }
+    return fs::path(s);
+}
+
+static fs::path rapidspeech_cache_home() {
+    if (const char *p = std::getenv("RAPIDSPEECH_HOME")) {
+        return expand_user_path(p);
+    }
+    const char *home = std::getenv(
+#ifdef _WIN32
+        "USERPROFILE"
+#else
+        "HOME"
+#endif
+    );
+    if (!home || !home[0]) return fs::path(".rapidspeech-cache");
+    return fs::path(home) / ".cache" / "rapidspeech";
+}
+
+static fs::path rapidspeech_models_dir() {
+    return rapidspeech_cache_home() / "models";
+}
+
+static std::string basename_from_url_path(const std::string &path) {
+    size_t pos = path.find_last_of("/\\");
+    return pos == std::string::npos ? path : path.substr(pos + 1);
+}
+
+static bool cached_file_ok(const std::string &filename, int64_t size_bytes) {
+    std::error_code ec;
+    fs::path path = rapidspeech_models_dir() / filename;
+    if (!fs::is_regular_file(path, ec)) return false;
+    if (size_bytes <= 0) return true;
+    return (int64_t)fs::file_size(path, ec) == size_bytes && !ec;
+}
+
+static bool load_registry_root(rsjson::Value &root, std::string &err) {
+    if (g_registry_path.empty()) {
+        err = "model registry path is not configured";
+        return false;
+    }
+    std::string text = read_text_file(g_registry_path, err);
+    if (!err.empty()) return false;
+    try {
+        root = rsjson::parse(text);
+    } catch (const std::exception &e) {
+        err = std::string("could not parse model registry: ") + e.what();
+        return false;
+    }
+    if (!root.is_object() || !root.contains("models")) {
+        err = "model registry is missing the models object";
+        return false;
+    }
+    return true;
+}
+
+struct ResolvedRegistryModel {
+    std::string task;
+    std::string name;
+    std::string variant;
+    std::string canonical_spec;
+    std::string filename;
+    std::string path;
+    int64_t size_bytes = 0;
+    std::string known_issues;
+    std::string default_voice;
+    std::string voice_filename;
+    std::string voice_path;
+    int64_t voice_size_bytes = 0;
+    std::vector<RegistryDependency> dependencies;
+};
+
+static bool file_entry_info(const rsjson::Value &entry, std::string &filename,
+                            int64_t &size_bytes, std::string &err) {
+    const rsjson::Value *files = object_get(entry, "files");
+    if (!files || !files->is_object() || files->members().empty()) {
+        err = "registry entry has no files";
+        return false;
+    }
+    const std::string rel = files->members().front().second.as_string();
+    if (rel.empty()) {
+        err = "registry entry has an empty file path";
+        return false;
+    }
+    filename = basename_from_url_path(rel);
+    size_bytes = (int64_t)entry["size_bytes"].as_number(0);
+    return true;
+}
+
+static bool split_model_spec(const std::string &spec, std::string &name,
+                             std::string &variant) {
+    size_t pos = spec.find(':');
+    if (pos == std::string::npos) {
+        name = spec;
+        variant.clear();
+    } else {
+        name = spec.substr(0, pos);
+        variant = spec.substr(pos + 1);
+    }
+    while (!name.empty() && std::isspace((unsigned char)name.front()))
+        name.erase(name.begin());
+    while (!name.empty() && std::isspace((unsigned char)name.back()))
+        name.pop_back();
+    while (!variant.empty() && std::isspace((unsigned char)variant.front()))
+        variant.erase(variant.begin());
+    while (!variant.empty() && std::isspace((unsigned char)variant.back()))
+        variant.pop_back();
+    return !name.empty();
+}
+
+static bool resolve_registry_model(const std::string &spec,
+                                   const std::string &requested_task,
+                                   const std::string &voice,
+                                   ResolvedRegistryModel &out,
+                                   std::string &err) {
+    out = ResolvedRegistryModel{};
+    rsjson::Value root;
+    if (!load_registry_root(root, err)) return false;
+
+    std::string name, variant;
+    if (spec.empty()) {
+        const rsjson::Value &defaults = root["defaults"];
+        name = defaults[requested_task].as_string();
+        if (name.empty()) {
+            err = "registry has no default model for task '" + requested_task + "'";
+            return false;
+        }
+    } else if (!split_model_spec(spec, name, variant)) {
+        err = "empty model spec";
+        return false;
+    }
+
+    const rsjson::Value *model = object_get(root["models"], name);
+    if (!model) {
+        err = "unknown model '" + name + "'";
+        return false;
+    }
+    out.task = (*model)["task"].as_string();
+    if (!requested_task.empty() && out.task != requested_task) {
+        err = "model '" + name + "' is task '" + out.task +
+              "', not '" + requested_task + "'";
+        return false;
+    }
+    if (variant.empty()) variant = (*model)["default_variant"].as_string();
+    const rsjson::Value *variants = object_get(*model, "variants");
+    const rsjson::Value *var = variants ? object_get(*variants, variant) : nullptr;
+    if (!var) {
+        err = "model '" + name + "' has no variant '" + variant + "'";
+        return false;
+    }
+
+    out.name = name;
+    out.variant = variant;
+    out.canonical_spec = name + ":" + variant;
+    out.known_issues = (*var)["known_issues"].as_string();
+    if (!file_entry_info(*var, out.filename, out.size_bytes, err)) return false;
+    out.path = (rapidspeech_models_dir() / out.filename).string();
+
+    if (out.task == "tts" && model->contains("voices")) {
+        out.default_voice = voice.empty() ? (*model)["default_voice"].as_string()
+                                          : voice;
+        const rsjson::Value *voices = object_get(*model, "voices");
+        const rsjson::Value *voice_entry =
+            (voices && !out.default_voice.empty())
+                ? object_get(*voices, out.default_voice)
+                : nullptr;
+        if (voice_entry) {
+            if (!file_entry_info(*voice_entry, out.voice_filename,
+                                 out.voice_size_bytes, err)) {
+                return false;
+            }
+            out.voice_path =
+                (rapidspeech_models_dir() / out.voice_filename).string();
+        }
+    }
+
+    const rsjson::Value *deps = object_get(*model, "dependencies");
+    if (deps && deps->is_object()) {
+        for (const auto &kv : deps->members()) {
+            RegistryDependency dep;
+            dep.name = kv.first;
+            dep.env = kv.second["env"].as_string();
+            if (!file_entry_info(kv.second, dep.filename, dep.size_bytes, err)) {
+                err = "dependency '" + dep.name + "': " + err;
+                return false;
+            }
+            dep.path = (rapidspeech_models_dir() / dep.filename).string();
+            out.dependencies.push_back(dep);
+        }
+    }
+    return true;
+}
+
+static std::string shell_quote(const std::string &s) {
+#ifdef _WIN32
+    std::string out = "\"";
+    for (char c : s) {
+        if (c == '"' || c == '\\') out.push_back('\\');
+        out.push_back(c);
+    }
+    out.push_back('"');
+    return out;
+#else
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') out += "'\\''";
+        else out.push_back(c);
+    }
+    out.push_back('\'');
+    return out;
+#endif
+}
+
+static bool run_command_capture(const std::string &cmd, std::string &output,
+                                int &status) {
+    output.clear();
+    std::string full = cmd + " 2>&1";
+    FILE *pipe = RS_POPEN(full.c_str(), "r");
+    if (!pipe) {
+        status = -1;
+        output = "failed to start command";
+        return false;
+    }
+    std::array<char, 4096> buf{};
+    while (fgets(buf.data(), (int)buf.size(), pipe)) {
+        output += buf.data();
+    }
+    status = RS_PCLOSE(pipe);
+    return status == 0;
+}
+
+static bool ensure_registry_model_downloaded(ResolvedRegistryModel &model,
+                                             bool &downloaded,
+                                             std::string &err) {
+    downloaded = false;
+    bool model_ok = cached_file_ok(model.filename, model.size_bytes);
+    bool voice_ok = model.voice_filename.empty() ||
+                    cached_file_ok(model.voice_filename,
+                                   model.voice_size_bytes);
+    bool deps_ok = true;
+    for (const auto &dep : model.dependencies) {
+        deps_ok = deps_ok && cached_file_ok(dep.filename, dep.size_bytes);
+    }
+    if (model_ok && voice_ok && deps_ok) return true;
+    if (g_python_executable.empty()) {
+        err = "model is not cached and RAPIDSPEECH_PYTHON_EXECUTABLE is not set";
+        return false;
+    }
+    std::string cmd = shell_quote(g_python_executable) +
+        " -m rapidspeech.python.cli pull " + shell_quote(model.canonical_spec);
+    std::string output;
+    int status = 0;
+    fprintf(stderr, "[server] downloading model via: %s\n", cmd.c_str());
+    if (!run_command_capture(cmd, output, status)) {
+        err = "download failed for " + model.canonical_spec +
+              " (exit status " + std::to_string(status) + "):\n" + output;
+        return false;
+    }
+    model_ok = cached_file_ok(model.filename, model.size_bytes);
+    voice_ok = model.voice_filename.empty() ||
+               cached_file_ok(model.voice_filename, model.voice_size_bytes);
+    deps_ok = true;
+    for (const auto &dep : model.dependencies) {
+        deps_ok = deps_ok && cached_file_ok(dep.filename, dep.size_bytes);
+    }
+    if (!model_ok || !voice_ok || !deps_ok) {
+        err = "download finished but expected files are still missing";
+        return false;
+    }
+    downloaded = true;
+    return true;
+}
+
+static void add_registry_file_status(rsjson::Value &dst,
+                                     const rsjson::Value &entry,
+                                     const std::string &spec) {
+    std::string filename;
+    int64_t size_bytes = 0;
+    std::string err;
+    if (file_entry_info(entry, filename, size_bytes, err)) {
+        dst["filename"] = filename;
+        dst["size_bytes"] = size_bytes;
+        dst["cached"] = cached_file_ok(filename, size_bytes);
+    } else {
+        dst["cached"] = false;
+    }
+    if (!spec.empty()) dst["spec"] = spec;
+    std::string issue = entry["known_issues"].as_string();
+    if (!issue.empty()) dst["known_issues"] = issue;
+}
+
+static void handle_model_registry(const httplib::Request &,
+                                  httplib::Response &res) {
+    rsjson::Value root;
+    std::string err;
+    if (!load_registry_root(root, err)) {
+        send_error(res, 503, err, "server_error");
+        return;
+    }
+    rsjson::Value out = rsjson::Value::object();
+    out["registry_path"] = g_registry_path;
+    out["cache_dir"] = rapidspeech_models_dir().string();
+    out["download_enabled"] = !g_python_executable.empty();
+    out["defaults"] = root["defaults"];
+    out["loaded"]["asr"] = g_have_asr ? g_current_asr_model_spec : "";
+    out["loaded"]["tts"] = g_have_tts ? g_current_tts_model_spec : "";
+    out["loaded"]["vad"] = g_have_vad ? g_current_vad_model_spec : "";
+    out["loaded"]["speaker"] =
+        g_have_speaker ? g_current_speaker_model_spec : "";
+
+    rsjson::Value models = rsjson::Value::array();
+    for (const auto &kv : root["models"].members()) {
+        const std::string &name = kv.first;
+        const rsjson::Value &entry = kv.second;
+        rsjson::Value item = rsjson::Value::object();
+        item["id"] = name;
+        item["task"] = entry["task"].as_string();
+        item["description"] = entry["description"].as_string();
+        item["default_variant"] = entry["default_variant"].as_string();
+        item["default_voice"] = entry["default_voice"].as_string();
+        item["loaded"] =
+            ((item["task"].as_string() == "asr" &&
+              g_current_asr_model_spec.rfind(name + ":", 0) == 0) ||
+             (item["task"].as_string() == "tts" &&
+              g_current_tts_model_spec.rfind(name + ":", 0) == 0) ||
+             (item["task"].as_string() == "vad" &&
+              g_current_vad_model_spec.rfind(name + ":", 0) == 0) ||
+             (item["task"].as_string() == "speaker" &&
+              g_current_speaker_model_spec.rfind(name + ":", 0) == 0));
+
+        rsjson::Value vars = rsjson::Value::array();
+        const rsjson::Value *variants = object_get(entry, "variants");
+        if (variants) {
+            for (const auto &vv : variants->members()) {
+                rsjson::Value v = rsjson::Value::object();
+                v["id"] = vv.first;
+                v["default"] = vv.first == item["default_variant"].as_string();
+                add_registry_file_status(v, vv.second, name + ":" + vv.first);
+                vars.push_back(v);
+            }
+        }
+        item["variants"] = vars;
+
+        rsjson::Value deps = rsjson::Value::array();
+        const rsjson::Value *dep_entries = object_get(entry, "dependencies");
+        if (dep_entries) {
+            for (const auto &vv : dep_entries->members()) {
+                rsjson::Value d = rsjson::Value::object();
+                d["id"] = vv.first;
+                d["env"] = vv.second["env"].as_string();
+                add_registry_file_status(d, vv.second, "");
+                deps.push_back(d);
+            }
+        }
+        item["dependencies"] = deps;
+
+        rsjson::Value voices = rsjson::Value::array();
+        const rsjson::Value *voice_entries = object_get(entry, "voices");
+        if (voice_entries) {
+            for (const auto &vv : voice_entries->members()) {
+                rsjson::Value v = rsjson::Value::object();
+                v["id"] = vv.first;
+                v["default"] = vv.first == item["default_voice"].as_string();
+                add_registry_file_status(v, vv.second, "");
+                voices.push_back(v);
+            }
+        }
+        item["voices"] = voices;
+        models.push_back(item);
+    }
+    out["models"] = models;
+    send_json(res, 200, out);
+}
+
+static void handle_model_load(const httplib::Request &req,
+                              httplib::Response &res) {
+    rsjson::Value body;
+    try {
+        body = req.body.empty() ? rsjson::Value::object()
+                                : rsjson::parse(req.body);
+    } catch (const std::exception &e) {
+        send_error(res, 400, e.what());
+        return;
+    }
+    std::string task = body["task"].as_string();
+    std::string model_spec = body["model"].as_string();
+    std::string voice = body["voice"].as_string();
+    std::string err;
+    std::string model_path;
+    std::string voice_path;
+    std::string canonical_spec = model_spec;
+    std::vector<RegistryDependency> dependencies;
+    bool downloaded = false;
+
+    if (looks_like_path(model_spec)) {
+        if (task.empty()) {
+            send_error(res, 400, "task is required when loading a direct .gguf path");
+            return;
+        }
+        fs::path p = expand_user_path(model_spec);
+        std::error_code ec;
+        if (!fs::is_regular_file(p, ec)) {
+            send_error(res, 404, "model file not found: " + p.string());
+            return;
+        }
+        model_path = p.string();
+    } else {
+        if (task.empty() && model_spec.empty()) {
+            send_error(res, 400, "task or model is required");
+            return;
+        }
+        ResolvedRegistryModel resolved;
+        if (!resolve_registry_model(model_spec, task, voice, resolved, err)) {
+            send_error(res, 400, err);
+            return;
+        }
+        if (!ensure_registry_model_downloaded(resolved, downloaded, err)) {
+            send_error(res, 500, err, "server_error");
+            return;
+        }
+        task = resolved.task;
+        model_path = resolved.path;
+        voice_path = resolved.voice_path;
+        canonical_spec = resolved.canonical_spec;
+        dependencies = resolved.dependencies;
+    }
+
+    bool ok = false;
+    if (task == "asr") {
+        ok = load_asr_runtime_model(model_path, canonical_spec, err);
+    } else if (task == "tts") {
+        ok = load_tts_runtime_model(model_path, canonical_spec, voice_path,
+                                    dependencies, err);
+    } else if (task == "vad") {
+        ok = load_vad_runtime_model(model_path, canonical_spec, err);
+    } else if (task == "speaker") {
+        ok = load_speaker_runtime_model(model_path, canonical_spec, err);
+    } else {
+        send_error(res, 400, "unsupported model task: " + task);
+        return;
+    }
+    if (!ok) {
+        send_error(res, 500, err, "server_error");
+        return;
+    }
+
+    rsjson::Value out = rsjson::Value::object();
+    out["ok"] = true;
+    out["task"] = task;
+    out["model"] = canonical_spec;
+    out["path"] = model_path;
+    out["downloaded"] = downloaded;
+    if (!voice_path.empty()) out["voice_path"] = voice_path;
+    if (task == "asr") out["arch"] = g_asr.arch;
+    if (task == "tts") out["arch"] = g_tts.arch;
+    send_json(res, 200, out);
 }
 
 static bool request_has_value(const httplib::Request &req, const char *key) {
@@ -1365,6 +2779,33 @@ static VadServerConfig request_vad_config(const httplib::Request &req) {
     return cfg;
 }
 
+static SpeakerServerConfig request_speaker_config(const httplib::Request &req) {
+    SpeakerServerConfig cfg;
+    cfg.enabled = request_bool(req, "speaker", false);
+    cfg.enabled = request_bool(req, "diarization", cfg.enabled);
+    cfg.enabled = request_bool(req, "speaker_diarization", cfg.enabled);
+    cfg.enabled = request_bool(req, "spk", cfg.enabled);
+    bool explicit_log = request_has_value(req, "speaker_log");
+    cfg.log = request_bool(req, "speaker_log", !g_speaker_log_path.empty());
+    if (explicit_log && cfg.log) {
+        cfg.enabled = true;
+    }
+    cfg.cluster = request_value(req, "spk_cluster", g_speaker_cluster);
+    cfg.cluster = request_value(req, "speaker_cluster", cfg.cluster);
+    if (cfg.cluster != "ahc" && cfg.cluster != "spectral") {
+        cfg.cluster = "spectral";
+    }
+    cfg.threshold = request_float(req, "spk_threshold", g_speaker_threshold,
+                                  -1.0f, 1.0f);
+    cfg.threshold = request_float(req, "speaker_threshold", cfg.threshold,
+                                  -1.0f, 1.0f);
+    cfg.num_speakers = request_int(req, "num_speakers",
+                                   g_speaker_num_speakers, 0, 256);
+    cfg.max_speakers = request_int(req, "max_speakers",
+                                   g_speaker_max_speakers, 1, 256);
+    return cfg;
+}
+
 static bool request_wants_vad(const httplib::Request &req) {
     if (request_has_value(req, "vad")) return request_bool(req, "vad", false);
     if (request_has_value(req, "use_vad")) return request_bool(req, "use_vad", false);
@@ -1387,10 +2828,11 @@ static void handle_transcriptions(const httplib::Request &req, httplib::Response
     std::vector<AsrSegment> segments;
     AsrServerConfig asr_cfg = request_asr_config(req);
     VadServerConfig vad_cfg = request_vad_config(req);
-    bool use_vad = request_wants_vad(req);
+    SpeakerServerConfig spk_cfg = request_speaker_config(req);
+    bool use_vad = request_wants_vad(req) || spk_cfg.enabled;
     bool ok = use_vad
                   ? do_transcribe_vad(file.content, asr_cfg, vad_cfg,
-                                      segments, text, err)
+                                      spk_cfg, segments, text, err)
                   : do_transcribe_with_config(file.content, asr_cfg, text, err);
     if (!ok) {
         send_error(res, 400, err, "server_error");
@@ -1412,9 +2854,22 @@ static void handle_transcriptions(const httplib::Request &req, httplib::Response
                 item["start"] = s.start_s;
                 item["end"] = s.end_s;
                 item["text"] = s.text;
+                if (s.speaker >= 0) {
+                    item["speaker"] = speaker_name(s.speaker);
+                    item["speaker_id"] = s.speaker;
+                }
                 arr.push_back(item);
             }
             o["segments"] = arr;
+            if (spk_cfg.enabled) {
+                o["speaker"] = true;
+                o["speaker_cluster"] = spk_cfg.cluster;
+                int n_speakers = 0;
+                for (const auto &s : segments) {
+                    if (s.speaker >= 0) n_speakers = std::max(n_speakers, s.speaker + 1);
+                }
+                o["num_speakers"] = n_speakers;
+            }
         }
         send_json(res, 200, o);
     }
@@ -1459,6 +2914,7 @@ static void handle_models(const httplib::Request &, httplib::Response &res) {
     };
     if (g_have_asr) add("rapidspeech-asr", g_asr.arch);
     if (g_have_tts) add("rapidspeech-tts", g_tts.arch);
+    if (g_have_speaker) add("rapidspeech-speaker", "campplus");
     o["data"] = data;
     send_json(res, 200, o);
 }
@@ -2491,50 +3947,64 @@ static void usage(const char *argv0) {
     fprintf(stderr,
         "RapidSpeech server — OpenAI-compatible HTTP API + MCP\n"
         "Usage: %s [--asr-model asr.gguf] [--tts-model tts.gguf] [options]\n"
-        "  --asr-model PATH   ASR GGUF (enables /v1/audio/transcriptions + transcribe tool)"
-        "  --tts-model PATH   TTS GGUF (enables /v1/audio/speech + synthesize tool)"
-        "  --vad-model PATH   VAD GGUF (enables the /asr/vad WebSocket)"
-        "  --vad-workers N    Independent /asr/vad WebSocket VAD workers (default 1)"
-        "  --vad-threshold F  VAD speech threshold (default 0.5)"
-        "  --vad-end-silence-ms N  Silence before finalizing segment (default 600)"
-        "  --vad-partial-ms N Partial ASR interval for /asr/vad (default 1500, 0=off)"
-        "  --vad-min-segment-ms N  Minimum segment to transcribe (default 500)"
-        "  --vad-max-segment-ms N  Force-finalize long speech (default 0=off)"
-        "  --two-pass        FunASR-Nano: CTC first pass + LLM final re-decode"
-        "  --ctc-precheck    FunASR-Nano: skip LLM on CTC-empty silence/noise"
-        "  --asr-slots N     ASR shape-bucketed batch slots (default 4, 1=off)"
-        "  --asr-max-queued N  Maximum queued ASR requests (default 256)"
-        "  --asr-batch-wait-ms N  ASR microbatch wait window (default 3)"
-        "  --asr-min-batch N Prefer waiting for at least N ASR requests (default=asr-slots)"
-        "  --asr-max-batch-wait-ms N  Hard ASR microbatch wait cap (default=4x batch-wait)"
-        "  --asr-frontend-threads N  CPU fbank threads per ASR request (default 1)"
-        "  --asr-frontend-workers N  Concurrent ASR frontend jobs (default=asr-slots)"
-        "  --tts-slots N     TTS concurrent requests via scheduler/batching"
-        "  --tts-voc-workers N  Flow/HiFT worker threads (CUDA streams, default 1)"
-        "                    (CosyVoice3/VoxCPM2; default 2, 1=serialized)"
-        "  --tts-stream-mode MODE  /tts/stream mode: true, hybrid, auto"
-        "  --tts-segment-max-chars N  Max chars per hybrid TTS segment (default 80)"
-        "  --mem-log         Log ASR scheduler compute-buffer high-water marks"
-        "  --asr-reload-every N  Reload ASR after N final segments to release GPU buffers (0=off)"
-        "  --ws-log          Log WebSocket connection lifecycle events"
-        "  --host HOST        HTTP bind host (default 127.0.0.1)"
-        "  --port PORT        HTTP port (default 8080)"
-        "  --ws-port PORT     WebSocket port (default HTTP port + 1)"
-        "  --web-dir DIR      Serve a static web UI dir at / (e.g. examples/server)"
-        "  --mcp-stdio        Run as an MCP server over stdio (no HTTP)"
-        "  -t, --threads N    CPU threads per model (default 4)"
-        "  --cpu              Disable GPU"
+        "  --asr-model PATH   ASR GGUF (enables /v1/audio/transcriptions + transcribe tool)\n"
+        "  --tts-model PATH   TTS GGUF (enables /v1/audio/speech + synthesize tool)\n"
+        "  --vad-model PATH   VAD GGUF (enables VAD segmented ASR and /asr/vad)\n"
+        "  --vad-workers N    Independent /asr/vad WebSocket VAD workers (default 1)\n"
+        "  --vad-threshold F  VAD speech threshold (default 0.5)\n"
+        "  --vad-end-silence-ms N  Silence before finalizing segment (default 600)\n"
+        "  --vad-partial-ms N Partial ASR interval for /asr/vad (default 1500, 0=off)\n"
+        "  --vad-min-segment-ms N  Minimum segment to transcribe (default 500)\n"
+        "  --vad-max-segment-ms N  Force-finalize long speech (default 0=off)\n"
+        "  --spk-model PATH   CAMPPlus speaker GGUF (enables speaker=true requests)\n"
+        "  --speaker PATH     Alias for --spk-model\n"
+        "  --spk-cluster MODE Speaker clustering: spectral or ahc (default spectral)\n"
+        "  --spk-threshold F  AHC cosine merge threshold (default 0.5)\n"
+        "  --num-speakers N   Fixed speaker count, 0 = auto (default 0)\n"
+        "  --max-speakers N   Spectral auto-estimation cap (default 10)\n"
+        "  --speaker-log PATH Append speaker transcript log TSV, '-' = stderr\n"
+        "  --two-pass         FunASR-Nano: CTC first pass + LLM final re-decode\n"
+        "  --ctc-precheck     FunASR-Nano: skip LLM on CTC-empty silence/noise\n"
+        "  --asr-slots N      ASR shape-bucketed batch slots (default 4, 1=off)\n"
+        "  --asr-max-queued N Maximum queued ASR requests (default 256)\n"
+        "  --asr-batch-wait-ms N  ASR microbatch wait window (default 3)\n"
+        "  --asr-min-batch N  Prefer waiting for at least N ASR requests (default=asr-slots)\n"
+        "  --asr-max-batch-wait-ms N  Hard ASR microbatch wait cap (default=4x batch-wait)\n"
+        "  --asr-frontend-threads N  CPU fbank threads per ASR request (default 1)\n"
+        "  --asr-frontend-workers N  Concurrent ASR frontend jobs (default=asr-slots)\n"
+        "  --tts-slots N      TTS concurrent requests via scheduler/batching\n"
+        "  --tts-voc-workers N  Flow/HiFT worker threads (CUDA streams, default 1)\n"
+        "                     (CosyVoice3/VoxCPM2; default 2, 1=serialized)\n"
+        "  --tts-stream-mode MODE  /tts/stream mode: true, hybrid, auto\n"
+        "  --tts-segment-max-chars N  Max chars per hybrid TTS segment (default 80)\n"
+        "  --mem-log          Log ASR scheduler compute-buffer high-water marks\n"
+        "  --asr-reload-every N  Reload ASR after N final segments to release GPU buffers (0=off)\n"
+        "  --ws-log           Log WebSocket connection lifecycle events\n"
+        "  --host HOST        HTTP bind host (default 127.0.0.1)\n"
+        "  --port PORT        HTTP port (default 8080)\n"
+        "  --ws-port PORT     WebSocket port (default HTTP port + 1)\n"
+        "  --web-dir DIR      Serve a static web UI dir at / (e.g. examples/server)\n"
+        "                     WebUI can call /v1/models/registry and /v1/models/load\n"
+        "                     to download and hot-load registry models.\n"
+        "  --mcp-stdio        Run as an MCP server over stdio (no HTTP)\n"
+        "  -t, --threads N    CPU threads per model (default 4)\n"
+        "  --cpu              Disable GPU\n"
         "  -h, --help\n"
-        "WebSocket endpoints (binary = int16 mono PCM, text = JSON):"
-        "  /asr/stream      pure streaming ASR (X-ASR)     partial+final"
-        "  /asr/vad         VAD-segmented offline ASR      partial+final per segment"
-        "                   query overrides: vad_threshold, vad_end_silence_ms,"
-        "                   vad_partial_ms,"
-        "                   vad_min_segment_ms, vad_max_segment_ms,"
-        "                   two_pass, ctc_precheck, ctc_only"
-        "  /tts/segmented   sentence-by-sentence TTS       audio per segment"
+        "HTTP transcription params:\n"
+        "  vad=true           VAD-segmented offline ASR; segments are batch-decoded when ASR scheduler is on\n"
+        "  speaker=true       CAMPPlus embedding + clustering per VAD segment (requires --spk-model)\n"
+        "  speaker_log=true   Write timestamped speaker log to --speaker-log path or stderr\n"
+        "  spk_cluster=MODE   spectral or ahc; also accepts num_speakers/max_speakers/spk_threshold\n"
+        "WebSocket endpoints (binary = int16 mono PCM, text = JSON):\n"
+        "  /asr/stream      pure streaming ASR (X-ASR)     partial+final\n"
+        "  /asr/vad         VAD-segmented offline ASR      partial+final per segment\n"
+        "                   query overrides: vad_threshold, vad_end_silence_ms,\n"
+        "                   vad_partial_ms,\n"
+        "                   vad_min_segment_ms, vad_max_segment_ms,\n"
+        "                   two_pass, ctc_precheck, ctc_only\n"
+        "  /tts/segmented   sentence-by-sentence TTS       audio per segment\n"
         "  /tts/stream      pure streaming TTS             audio chunks as generated\n"
-        "At least one of --asr-model / --tts-model is required.\n",
+        "If no model is provided, start the WebUI and load one from the registry.\n",
         argv0);
 }
 
@@ -2553,6 +4023,23 @@ int main(int argc_raw, char **argv_raw) {
 #else
     setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 0);
 #endif
+
+    if (const char *p = std::getenv("RAPIDSPEECH_REGISTRY_PATH")) {
+        g_registry_path = p;
+    }
+    if (g_registry_path.empty()) {
+        g_registry_path = find_registry_path_from_argv0(argv[0]);
+    }
+    if (const char *p = std::getenv("RAPIDSPEECH_PYTHON_EXECUTABLE")) {
+        g_python_executable = p;
+    }
+    if (g_python_executable.empty()) {
+#ifdef _WIN32
+        g_python_executable = "python";
+#else
+        g_python_executable = "python3";
+#endif
+    }
 
     std::string asr_model, tts_model, vad_model, host = "127.0.0.1", web_dir;
     int port = 8080, ws_port = -1, threads = 4;
@@ -2590,6 +4077,34 @@ int main(int argc_raw, char **argv_raw) {
         }
         else if (a == "--vad-max-segment-ms") {
             g_vad_cfg.max_segment_ms = std::max(0, atoi(next("--vad-max-segment-ms")));
+        }
+        else if (a == "--spk-model" || a == "--speaker-model" ||
+                 a == "--speaker") {
+            g_speaker_model_path = next(a.c_str());
+        }
+        else if (a == "--spk-cluster" || a == "--speaker-cluster") {
+            g_speaker_cluster = next(a.c_str());
+            if (g_speaker_cluster != "ahc" &&
+                g_speaker_cluster != "spectral") {
+                fprintf(stderr,
+                        "[server] warning: unsupported speaker cluster '%s'; "
+                        "using spectral\n",
+                        g_speaker_cluster.c_str());
+                g_speaker_cluster = "spectral";
+            }
+        }
+        else if (a == "--spk-threshold" || a == "--speaker-threshold") {
+            g_speaker_threshold =
+                std::max(-1.0f, std::min(1.0f, (float)atof(next(a.c_str()))));
+        }
+        else if (a == "--num-speakers") {
+            g_speaker_num_speakers = std::max(0, atoi(next("--num-speakers")));
+        }
+        else if (a == "--max-speakers") {
+            g_speaker_max_speakers = std::max(1, atoi(next("--max-speakers")));
+        }
+        else if (a == "--speaker-log" || a == "--spk-log") {
+            g_speaker_log_path = next(a.c_str());
         }
         else if (a == "--two-pass") g_asr_cfg.two_pass = true;
         else if (a == "--ctc-precheck") g_asr_cfg.ctc_precheck = true;
@@ -2674,6 +4189,7 @@ int main(int argc_raw, char **argv_raw) {
             return 1;
         }
         g_have_asr = true;
+        g_current_asr_model_spec = asr_model;
         if (g_asr.ctx && g_asr.ctx->ctx_gguf) {
             load_cmvn_params(g_asr.ctx->ctx_gguf, g_asr_cmvn_means,
                              g_asr_cmvn_vars);
@@ -2724,6 +4240,27 @@ int main(int argc_raw, char **argv_raw) {
                     g_asr.arch.c_str());
         }
     }
+    if (!g_speaker_model_path.empty()) {
+        fprintf(stderr, "[server] loading speaker model: %s\n",
+                g_speaker_model_path.c_str());
+        g_speaker = rs_speaker_init_from_file(g_speaker_model_path.c_str(),
+                                              threads, gpu);
+        if (!g_speaker) {
+            rs_error_info_t e = rs_get_last_error();
+            fprintf(stderr, "[server] failed to load speaker model: %s\n",
+                    e.message[0] ? e.message : "unknown error");
+            return 1;
+        }
+        g_have_speaker = true;
+        g_current_speaker_model_spec = g_speaker_model_path;
+        fprintf(stderr,
+                "[server] Speaker ready: CAMPPlus dim=%d sr=%d cluster=%s "
+                "threshold=%.2f num_speakers=%d max_speakers=%d log=%s\n",
+                rs_speaker_dim(g_speaker), rs_speaker_sample_rate(g_speaker),
+                g_speaker_cluster.c_str(), g_speaker_threshold,
+                g_speaker_num_speakers, g_speaker_max_speakers,
+                g_speaker_log_path.empty() ? "off" : g_speaker_log_path.c_str());
+    }
     if (!tts_model.empty()) {
         fprintf(stderr, "[server] loading TTS: %s\n", tts_model.c_str());
         // Load as TTS_ONLINE so rs_process streams per-chunk where the model
@@ -2734,6 +4271,7 @@ int main(int argc_raw, char **argv_raw) {
             return 1;
         }
         g_have_tts = true;
+        g_current_tts_model_spec = tts_model;
         fprintf(stderr, "[server] TTS ready: %s @ %d Hz\n", g_tts.arch.c_str(), g_tts.sample_rate);
 
         // CosyVoice3 uses continuous LM batching. VoxCPM2 is initialized below
@@ -2806,6 +4344,7 @@ int main(int argc_raw, char **argv_raw) {
             g_vad_ws_busy.push_back(false);
         }
         g_have_vad = true;
+        g_current_vad_model_spec = vad_model;
         fprintf(stderr,
                 "[server] VAD ready: %s  threshold=%.2f silence=%dms partial=%dms "
                 "min-seg=%dms max-seg=%dms ws-workers=%d\n",
@@ -2907,9 +4446,25 @@ int main(int argc_raw, char **argv_raw) {
             o["vad_workers"]["slots"] = (int)g_vad_ws_pool.size();
             o["vad_workers"]["busy"] = busy;
         }
+        if (g_have_speaker && g_speaker) {
+            std::lock_guard<std::mutex> lk(g_speaker_mu);
+            rsjson::Value spk = rsjson::Value::object();
+            spk["model"] = "campplus";
+            spk["loaded"] = true;
+            spk["dim"] = rs_speaker_dim(g_speaker);
+            spk["sample_rate"] = rs_speaker_sample_rate(g_speaker);
+            spk["cluster"] = g_speaker_cluster;
+            spk["threshold"] = g_speaker_threshold;
+            spk["num_speakers"] = g_speaker_num_speakers;
+            spk["max_speakers"] = g_speaker_max_speakers;
+            spk["log"] = !g_speaker_log_path.empty();
+            o["speaker"] = spk;
+        }
         send_json(res, 200, o);
     });
     srv.Get("/v1/models", handle_models);
+    srv.Get("/v1/models/registry", handle_model_registry);
+    srv.Post("/v1/models/load", handle_model_load);
     srv.Post("/v1/audio/transcriptions", handle_transcriptions);
     srv.Post("/v1/audio/speech", handle_speech);
 
@@ -2951,7 +4506,13 @@ int main(int argc_raw, char **argv_raw) {
     fprintf(stderr, "[server]   MCP:     POST /mcp\n");
     fprintf(stderr, "[server]   WS:      ws://%s:%d/{asr/stream,asr/vad,tts/segmented,tts/stream}\n",
             host.c_str(), ws_port);
-    if (!srv.listen(host, port)) {
+    bool listened = srv.listen(host, port);
+    if (g_speaker) {
+        rs_speaker_free(g_speaker);
+        g_speaker = nullptr;
+        g_have_speaker = false;
+    }
+    if (!listened) {
         fprintf(stderr, "[server] failed to bind %s:%d\n", host.c_str(), port);
         return 1;
     }

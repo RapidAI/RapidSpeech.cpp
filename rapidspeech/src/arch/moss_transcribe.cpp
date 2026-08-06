@@ -603,7 +603,20 @@ bool MossTranscribeModel::DecodeWithLLM(RSState &state,
   }
 
   // Adaptive decode budget: transcripts run ~<=2x the audio token count.
-  max_decode_tokens_ = std::min(8192, std::max(1024, audio_T * 2 + 512));
+  // Long-audio callers should normally chunk the input; this environment
+  // override provides a guardrail against spending thousands of decode steps
+  // on a malformed or unexpectedly verbose segment.
+  int decode_cap = 8192;
+  if (const char *env = std::getenv("RS_MOSS_MAX_DECODE_TOKENS")) {
+    const int requested = std::atoi(env);
+    if (requested > 0) {
+      decode_cap = std::clamp(requested, 512, 8192);
+    }
+  }
+  max_decode_tokens_ =
+      std::min(decode_cap, std::max(1024, audio_T * 2 + 512));
+  RS_LOG_INFO("MossTranscribe decode budget: max_tokens=%d cap=%d",
+              max_decode_tokens_, decode_cap);
 
   llm_cparams cparams;
   cparams.n_ctx           = total_T + max_decode_tokens_;
@@ -807,6 +820,7 @@ bool MossTranscribeModel::DecodeWithLLM(RSState &state,
     warmup_opts.is_decode_step  = true;
     warmup_opts.n_kv_cache      = n_kv_max - 1;
     warmup_opts.n_kv_max        = n_kv_max;
+    warmup_opts.fixed_kv_cache_shape = true;
     warmup_opts.causal_mask     = true;
     warmup_opts.gpu_kv_k        = gpu_kv_k_vec.data();
     warmup_opts.gpu_kv_v        = gpu_kv_v_vec.data();
@@ -819,7 +833,6 @@ bool MossTranscribeModel::DecodeWithLLM(RSState &state,
 
   // -------- (d) autoregressive greedy decode --------
   const int32_t eos_token_id = llm_model_->vocab().token_eos();
-  std::vector<float> kv_stage_k(kv_dim), kv_stage_v(kv_dim);
   int consecutive_same_token = 0;
   constexpr int MAX_CONSECUTIVE_REPEAT = 30;
 
@@ -832,6 +845,7 @@ bool MossTranscribeModel::DecodeWithLLM(RSState &state,
     dec_opts.is_decode_step  = true;
     dec_opts.n_kv_cache      = n_cached_tokens_;
     dec_opts.n_kv_max        = n_kv_max;
+    dec_opts.fixed_kv_cache_shape = true;
     dec_opts.causal_mask     = true;
     dec_opts.gpu_kv_k        = gpu_kv_k_vec.data();
     dec_opts.gpu_kv_v        = gpu_kv_v_vec.data();
@@ -857,6 +871,7 @@ bool MossTranscribeModel::DecodeWithLLM(RSState &state,
     if (auto t = dec->get_input_tensor("causal_mask")) {
       dec->set_causal_mask(t, 1, n_cached_tokens_);
     }
+    dec->set_kv_write_indices(n_cached_tokens_, n_layer);
     if (ggml_backend_sched_graph_compute(sched, dec->get_graph()) !=
         GGML_STATUS_SUCCESS) {
       RS_LOG_ERR("MossTranscribe: decode compute failed at step %d", step);
@@ -885,20 +900,6 @@ bool MossTranscribeModel::DecodeWithLLM(RSState &state,
     if (next_token == best_token) consecutive_same_token++;
     else                          consecutive_same_token = 0;
 
-    // Stage new KV column into the persistent GPU buffers.
-    for (int il = 0; il < n_layer; ++il) {
-      ggml_tensor *k_out = dec->get_kv_output_k(il);
-      ggml_tensor *v_out = dec->get_kv_output_v(il);
-      if (!k_out || !v_out) continue;
-      const size_t new_bytes = (size_t)kv_dim * sizeof(float);
-      const size_t off = (size_t)n_cached_tokens_ * kv_dim * sizeof(float);
-      ggml_backend_tensor_get(k_out, kv_stage_k.data(), off, new_bytes);
-      ggml_backend_tensor_get(v_out, kv_stage_v.data(), off, new_bytes);
-      ggml_backend_tensor_set(gpu_kv_k_vec[il], kv_stage_k.data(), off,
-                              new_bytes);
-      ggml_backend_tensor_set(gpu_kv_v_vec[il], kv_stage_v.data(), off,
-                              new_bytes);
-    }
     n_cached_tokens_++;
 
     if (next_token == eos_token_id) {

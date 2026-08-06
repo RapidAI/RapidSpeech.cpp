@@ -65,14 +65,11 @@ cache, and prints the exact fix for every problem it finds.
 See [docs/cli.md](docs/cli.md) for all commands (`models`, `pull`, offline
 mode, mirrors).
 
-Want to see the whole loop at once? `rapidspeech demo` opens a local browser
-page with hold-to-talk recognition, synthesis, and an echo mode that speaks
-your words back — models, backend and per-request latency shown on screen,
-nothing leaving localhost.
-
-Building a local speech app? `rapidspeech serve` starts the native server,
-opens `http://127.0.0.1:8080/webui.html`, and exposes OpenAI-compatible HTTP
-plus WebSocket streaming ASR/TTS endpoints from the same process.
+Want to see the whole loop at once? `rapidspeech serve` starts the native
+server, opens `http://127.0.0.1:8080/webui.html`, and exposes the browser
+console, OpenAI-compatible HTTP, and WebSocket streaming ASR/TTS endpoints
+from the same process. Models, backend, and per-request latency are shown on
+screen; nothing leaves localhost.
 
 > The default TTS model is Mandarin Kokoro v1.1-zh. Curated voice packs are
 > available through the model registry, and English words embedded in Chinese

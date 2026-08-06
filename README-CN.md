@@ -62,13 +62,10 @@ model: FunASRNano  backend: MTL0
 明确的修复命令。全部命令（`models`、`pull`、离线模式、镜像切换）见
 [docs/cli.md](docs/cli.md)。
 
-想一次看到完整闭环？`rapidspeech demo` 会在本地打开一个浏览器页面：按住说话
-识别、文本合成、以及把你说的话用 TTS 朗读回来的「回声模式」——页面上直接显示
-加载的模型、后端和每次请求的延迟，所有数据不出 localhost。
-
-要做本地语音应用？`rapidspeech serve` 会启动 native server，打开
-`http://127.0.0.1:8080/webui.html`，并在同一个进程里提供 OpenAI 兼容
-HTTP 和 WebSocket 流式 ASR/TTS 接口。
+想一次看到完整闭环？`rapidspeech serve` 会启动 native server，打开
+`http://127.0.0.1:8080/webui.html`，并在同一个进程里提供浏览器控制台、
+OpenAI 兼容 HTTP 和 WebSocket 流式 ASR/TTS 接口。页面会显示加载的模型、
+后端和每次请求的延迟，所有数据不出 localhost。
 
 > 默认 TTS 是中文 Kokoro v1.1-zh。模型注册表提供了一组精选音色包，中文中夹带
 > 英文单词也可以直接处理。英文和声音克隆 TTS 见[模型文档](#文档)。

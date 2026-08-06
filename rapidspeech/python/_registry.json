@@ -1,5 +1,5 @@
 {
-  "registry_version": 2,
+  "registry_version": 3,
   "repo": "RapidAI/RapidSpeech",
   "sources": {
     "modelscope": "https://www.modelscope.cn/models/RapidAI/RapidSpeech/resolve/master/",
@@ -35,6 +35,13 @@
             "modelscope": "ASR/FunASRNano/funasr-nano-fp16.gguf"
           }
         },
+        "q2_k": {
+          "size_bytes": 399296704,
+          "sha256": "7321ac57de9cda7f859ea546195d049696a2d9f4fbb6af643f050cf099e06448",
+          "files": {
+            "modelscope": "ASR/FunASRNano/funasr-nano-q2_k.gguf"
+          }
+        },
         "q3_k": {
           "size_bytes": 499063360,
           "sha256": "2e060dc62ace358ee358e9d14dc32410f69678e395ac4e13a9cc5485a2b9cbc4",
@@ -43,12 +50,54 @@
             "huggingface": "ASR/FunasrNano/funasr-nano-q3_k.gguf"
           }
         },
+        "q3_k_m": {
+          "size_bytes": 542713568,
+          "sha256": "db20fe3fd9b4ebef17a4eb4b53b2fdcdd2c54a7ce8b8cc23eb9132335dae9273",
+          "files": {
+            "modelscope": "ASR/FunASRNano/funasr-nano-q3_k_m.gguf"
+          }
+        },
+        "q4_0": {
+          "size_bytes": 631145664,
+          "sha256": "85846300c183123d2780e194301fd7f74d729b53a71e329bbfa4c6dd06567385",
+          "files": {
+            "modelscope": "ASR/FunASRNano/funasr-nano-q4_0.gguf"
+          }
+        },
+        "q4_1": {
+          "size_bytes": 692212800,
+          "sha256": "d9e8aeccb8d6f34783fb1e28345e9cf0ad54c665ec93a2c58c02bd0b85c7239c",
+          "files": {
+            "modelscope": "ASR/FunASRNano/funasr-nano-q4_1.gguf"
+          }
+        },
+        "q4_k": {
+          "size_bytes": 630711360,
+          "sha256": "bded7231b0a6500a000e07c82c54fb2237d260ec8305a728561445bd249ab0c6",
+          "files": {
+            "modelscope": "ASR/FunASRNano/funasr-nano-q4_k.gguf"
+          }
+        },
         "q4_k_m": {
           "size_bytes": 692140864,
           "sha256": "82c5bc2aea12a852ce55bf78183d0c23624454df181da59b1b9e1fef8292e6ab",
           "files": {
             "modelscope": "ASR/FunASRNano/funasr-nano-q4_k_m.gguf",
             "huggingface": "ASR/FunasrNano/funasr-nano-q4_k_m.gguf"
+          }
+        },
+        "q5_k": {
+          "size_bytes": 754615360,
+          "sha256": "7e755b5ca41fb5c7ff1b68bbf68b382f6c2453db289abe499e8013aac1d21867",
+          "files": {
+            "modelscope": "ASR/FunASRNano/funasr-nano-q5_k.gguf"
+          }
+        },
+        "q5_k_m": {
+          "size_bytes": 780614464,
+          "sha256": "53eea1c931f89a44032a94f8f276459db829047b202379ddfb75041c05ca43c7",
+          "files": {
+            "modelscope": "ASR/FunASRNano/funasr-nano-q5_k_m.gguf"
           }
         },
         "q6_k": {
@@ -95,11 +144,67 @@
             "huggingface": "ASR/SenseVoice/sense-voice-small-fp16.gguf"
           }
         },
+        "fp32": {
+          "size_bytes": 936542464,
+          "sha256": "f1f8cb1ebc9f4f7dd26307f5bf4eddb558a09195c6974b45987cd0d0a81b3778",
+          "files": {
+            "modelscope": "ASR/SenseVoice/sense-voice-small-fp32.gguf"
+          }
+        },
+        "iq2_xxs": {
+          "size_bytes": 104671040,
+          "sha256": "74598651cb99f47ba0f591f97587559bd29dc5d631a54333f157b9f48a5622b1",
+          "files": {
+            "modelscope": "ASR/SenseVoice/sense-voice-small-iq2_xxs.gguf"
+          }
+        },
+        "iq3_xxs": {
+          "size_bytes": 125245248,
+          "sha256": "6ba408f60c0dc9f10e67940c38debb043337ab9b6ff0b2fba301bf030fd15788",
+          "files": {
+            "modelscope": "ASR/SenseVoice/sense-voice-small-iq3_xxs.gguf"
+          }
+        },
+        "q2_k": {
+          "size_bytes": 103485248,
+          "sha256": "c61aecd172427d7f55ada9acdd884bf980abd12be57172dc591b485309d98841",
+          "files": {
+            "modelscope": "ASR/SenseVoice/sense-voice-small-q2_k.gguf"
+          }
+        },
+        "q3_k": {
+          "size_bytes": 153164096,
+          "sha256": "094fbf0995a94ffd0b02efc926b48aff89d1335ed803fdaec61fb3ea69bfb1a6",
+          "files": {
+            "modelscope": "ASR/SenseVoice/sense-voice-small-q3_k.gguf"
+          }
+        },
+        "q3_k_m": {
+          "size_bytes": 119043552,
+          "sha256": "2ce28248899405eb70bbace3060935631f25d88241f8eb21deef621096baae10",
+          "files": {
+            "modelscope": "ASR/SenseVoice/sense-voice-small-q3_k_m.gguf"
+          }
+        },
+        "q4_k": {
+          "size_bytes": 182305088,
+          "sha256": "0a2457c53b6c3f3e504df16585dcd0ede9ef5ae023325c70ed547801a9453c0a",
+          "files": {
+            "modelscope": "ASR/SenseVoice/sense-voice-small-q4_k.gguf"
+          }
+        },
         "q4_k_m": {
           "size_bytes": 145181984,
           "sha256": "565aea29121600eac68e6234aa4819458f3ca43c9cf88b2628a5d194c4b4ebd7",
           "files": {
             "modelscope": "ASR/SenseVoice/sense-voice-small-q4_k_m.gguf"
+          }
+        },
+        "q5_k": {
+          "size_bytes": 209731904,
+          "sha256": "d1ad80e4a0d0ce593975d9b1aea26326fe6ce6aea2cf9e61ec99a88f0ec759b5",
+          "files": {
+            "modelscope": "ASR/SenseVoice/sense-voice-small-q5_k.gguf"
           }
         },
         "q6_k": {
@@ -143,6 +248,13 @@
             "modelscope": "ASR/X-ASR/xasr-f16.gguf"
           }
         },
+        "f32": {
+          "size_bytes": 613123744,
+          "sha256": "8dbb35491aa502bdba6f1dea158e411237b0dff8a0dd8825a877a1ce1a7669cc",
+          "files": {
+            "modelscope": "ASR/X-ASR/xasr-f32.gguf"
+          }
+        },
         "q4_k_m": {
           "size_bytes": 104300800,
           "sha256": "f18450bcd94153aebcb5df4894903de1adfa160e095fea4b22486b12bfd3f5b5",
@@ -155,6 +267,59 @@
           "sha256": "d3308e7f283f9e3403f5f787d48dbff57b335b6fbb05899074ce48d009d9de57",
           "files": {
             "modelscope": "ASR/X-ASR/xasr-q8_0.gguf"
+          }
+        }
+      }
+    },
+    "moss-transcribe-diarize": {
+      "task": "asr",
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "license": "see model card (RapidAI/RapidSpeech)",
+      "description": "MOSS-Transcribe-Diarize ASR: Qwen3-based speech transcription with diarization-oriented prompts",
+      "default_variant": "q4_k_m",
+      "recommended_backends": [
+        "cpu",
+        "metal",
+        "cuda"
+      ],
+      "example": "rapidspeech transcribe audio.wav --model moss-transcribe-diarize",
+      "variants": {
+        "f16": {
+          "size_bytes": 1826195776,
+          "sha256": "fa25f13d45e0380deb2f830cba53f8177a49d26ccb7c9d789fb02037ada3b118",
+          "files": {
+            "modelscope": "ASR/MOSS-Transcribe-Diarize/moss-transcribe-diarize-f16.gguf"
+          }
+        },
+        "q4_k_m": {
+          "size_bytes": 591820192,
+          "sha256": "9057240dabcb3a3f9f4213ac6567c74a50f8480f8c1685ff9f188d8769ddb959",
+          "files": {
+            "modelscope": "ASR/MOSS-Transcribe-Diarize/moss-transcribe-diarize-q4_k_m.gguf"
+          }
+        },
+        "q5_k_m": {
+          "size_bytes": 688043424,
+          "sha256": "e7f0bd1be597ff5a4dbe46354c9b9d985f7a2a387bb45a93a2addf766b7d3335",
+          "files": {
+            "modelscope": "moss-transcribe-diarize-q5_k_m.gguf"
+          }
+        },
+        "q6_k": {
+          "size_bytes": 950405536,
+          "sha256": "70ad431f3729944d8c5cc5bb48a06fd0a5162252711552c94e99c7591b0e550a",
+          "files": {
+            "modelscope": "ASR/MOSS-Transcribe-Diarize/moss-transcribe-diarize-q6_k.gguf"
+          }
+        },
+        "q8_0": {
+          "size_bytes": 1130203552,
+          "sha256": "558512ddda8bf86b2d02683dd05c4ff28c118759a2404623c8ab5a1ed95c8e7c",
+          "files": {
+            "modelscope": "ASR/MOSS-Transcribe-Diarize/moss-transcribe-diarize-q8_0.gguf"
           }
         }
       }
@@ -180,6 +345,13 @@
           "sha256": "0de363d93377879f35d96a8157552618ec1a3e1866f293cfc9013d2e5441699e",
           "files": {
             "modelscope": "TTS/kokoro/kokoro-v1_1-zh-f16.gguf"
+          }
+        },
+        "q2_k_m": {
+          "size_bytes": 66463552,
+          "sha256": "246016c68a34bbc275ef147dcf5641aca13879f8b8d7cb1b7dead9e3766ba1c6",
+          "files": {
+            "modelscope": "TTS/kokoro/kokoro-v1_1-zh-q2_k_m.gguf"
           }
         },
         "q3_k_m": {
@@ -962,6 +1134,13 @@
             "huggingface": "TTS/omnivoice-f16.gguf"
           }
         },
+        "f32": {
+          "size_bytes": 3259164224,
+          "sha256": "1a7921e63c8a0bbb311bbaf1be084dcd30bb474411a51206797c0d217cb6c2d9",
+          "files": {
+            "modelscope": "TTS/omnivoice/omnivoice-f32.gguf"
+          }
+        },
         "iq3_xxs": {
           "size_bytes": 687359008,
           "sha256": "fe970d1365afd8f1c1ce83134aeb9b73340754b8188bcc0294d7237724aaff3a",
@@ -1000,6 +1179,120 @@
           "files": {
             "modelscope": "TTS/omnivoice/omnivoice-q8_0.gguf",
             "huggingface": "TTS/omnivoice-q8_0.gguf"
+          }
+        }
+      }
+    },
+    "cosyvoice3": {
+      "task": "tts",
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "license": "see model card (RapidAI/RapidSpeech)",
+      "description": "CosyVoice3 0.5B 2512 TTS: unified LLM + Flow + HiFT, 24 kHz",
+      "default_variant": "q4_k_m",
+      "recommended_backends": [
+        "cpu",
+        "metal",
+        "cuda"
+      ],
+      "example": "rapidspeech speak \"你好，世界\" --model cosyvoice3 -o hello.wav",
+      "variants": {
+        "f16": {
+          "size_bytes": 2273227360,
+          "sha256": "d97397358115befef75bf6619a17c37b609f961f2abe7a4a94b2e53c66a4fa6b",
+          "files": {
+            "modelscope": "TTS/cosyvoice3/cosyvoice3-0.5b-2512-f16.gguf"
+          }
+        },
+        "q2_k_m": {
+          "size_bytes": 517935104,
+          "sha256": "4c6e850198242b53b4198c8e3a62ff7798db7f043527a2b8d00abcbf8907f116",
+          "files": {
+            "modelscope": "TTS/cosyvoice3/cosyvoice3-0.5b-2512-q2_k_m.gguf"
+          }
+        },
+        "q4_k_m": {
+          "size_bytes": 618453504,
+          "sha256": "332709cfd5a25c72ff4da16ba162a5d56f15b72fd4231effb57691e4ffa2d7af",
+          "files": {
+            "modelscope": "TTS/cosyvoice3/cosyvoice3-0.5b-2512-q4_k_m.gguf"
+          }
+        },
+        "q5_k_m": {
+          "size_bytes": 743838720,
+          "sha256": "9a43d91836a8d65471900a2d46037a389bffca42d72432d0c3628092a8c73c71",
+          "files": {
+            "modelscope": "TTS/cosyvoice3/cosyvoice3-0.5b-2512-q5_k_m.gguf"
+          }
+        },
+        "q8_0": {
+          "size_bytes": 1097232896,
+          "sha256": "bf1440fbf4f25c2c1f0a26d81c99ba56eb2fb1d68d21ac82e8d361686f372c23",
+          "files": {
+            "modelscope": "TTS/cosyvoice3/cosyvoice3-0.5b-2512-q8_0.gguf"
+          }
+        }
+      },
+      "dependencies": {
+        "campplus": {
+          "env": "RS_CV3_CAMPPLUS_PATH",
+          "size_bytes": 27779360,
+          "sha256": "c2debc36561fffa7f956f8650582a2c86df04644c744a1c1adddcde248191859",
+          "files": {
+            "modelscope": "SV/campplus.gguf"
+          }
+        },
+        "speech-tokenizer": {
+          "env": "RS_CV3_SPEECH_TOKENIZER_PATH",
+          "size_bytes": 484405472,
+          "sha256": "d32b837f039e597d3e8c9f0a780be54712847ec46dde887d6e9045bec4224313",
+          "files": {
+            "modelscope": "TTS/cosyvoice3/cv3-speech-tokenizer.gguf"
+          }
+        }
+      }
+    },
+    "indextts2": {
+      "task": "tts",
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "license": "see model card (RapidAI/RapidSpeech)",
+      "description": "IndexTTS2 TTS: semantic codec + S2Mel + BigVGAN with optional emotion control",
+      "default_variant": "q4_k_m",
+      "recommended_backends": [
+        "cpu",
+        "metal",
+        "cuda"
+      ],
+      "example": "rapidspeech speak \"你好，世界\" --model indextts2 -o hello.wav",
+      "variants": {
+        "q4_k_m": {
+          "size_bytes": 1663301248,
+          "sha256": "276425675d373e232f76f432f93e8bc391463194ff332b442995af82c2badfa9",
+          "files": {
+            "modelscope": "TTS/Index2TTS/indextts2-q4_k_m.gguf"
+          }
+        }
+      },
+      "dependencies": {
+        "bigvgan": {
+          "env": "RS_INDEXTTS2_BIGVGAN_GGUF",
+          "size_bytes": 224638560,
+          "sha256": "af3b687195bdc60a5102c69397a3478621b35bd89ea1144a87e968d75c72bd3e",
+          "files": {
+            "modelscope": "TTS/Index2TTS/indextts2-bigvgan.gguf"
+          }
+        },
+        "qwen-emo": {
+          "env": "RS_INDEXTTS2_QWEN_EMO_GGUF",
+          "size_bytes": 517017440,
+          "sha256": "0553c82156ed8bec53045ff9e89f7bc952ec000cd295565690b21192d2a6bbb8",
+          "files": {
+            "modelscope": "TTS/Index2TTS/indextts2-qwen-emo-q4_k_m.gguf"
           }
         }
       }
@@ -1046,6 +1339,28 @@
           "files": {
             "modelscope": "VAD/firered-stream-vad.gguf",
             "huggingface": "VAD/firered-stream-vad.gguf"
+          }
+        }
+      }
+    },
+    "ten-vad": {
+      "task": "vad",
+      "languages": [
+        "*"
+      ],
+      "license": "Apache-2.0 (TEN VAD), see model card",
+      "description": "TEN-VAD: tiny streaming voice activity detector with mel + pitch frontend",
+      "default_variant": "v1",
+      "recommended_backends": [
+        "cpu"
+      ],
+      "example": "used automatically by VAD-segmented ASR when selected",
+      "variants": {
+        "v1": {
+          "size_bytes": 303520,
+          "sha256": "098fe49dc26d108cf81b01bc690bcf311d28cbc9fdb0323ed8e3c795e221c4e2",
+          "files": {
+            "modelscope": "VAD/ten-vad.gguf"
           }
         }
       }

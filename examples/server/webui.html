@@ -123,6 +123,28 @@
     </div>
   </section>
 
+  <section class="card full">
+    <h2>Model selection <span class="tag">registry · download · hot load</span></h2>
+    <div class="grid3">
+      <div>
+        <label>ASR model</label>
+        <select id="modelAsr"></select>
+        <button id="modelAsrLoad" onclick="loadSelectedModel('asr','modelAsr')">Load ASR</button>
+      </div>
+      <div>
+        <label>TTS model</label>
+        <select id="modelTts"></select>
+        <button id="modelTtsLoad" onclick="loadSelectedModel('tts','modelTts')">Load TTS</button>
+      </div>
+      <div>
+        <label>VAD model</label>
+        <select id="modelVad"></select>
+        <button id="modelVadLoad" class="sec" onclick="loadSelectedModel('vad','modelVad')">Load VAD</button>
+      </div>
+    </div>
+    <div id="modelStatus" class="out muted">Connect to load the model registry.</div>
+  </section>
+
   <!-- HTTP: transcription -->
   <section class="card">
     <h2>HTTP transcription <span class="tag">POST /v1/audio/transcriptions</span></h2>
@@ -318,6 +340,15 @@ const UI_I18N = {
   "True chunk streaming, sentence segmentation, latency and RTF.": { zh: "支持真实分块流、按句分段、延迟和 RTF 指标。", en: "True chunk streaming, sentence segmentation, latency and RTF." },
   "Observer bridge": { zh: "Observer 桥接", en: "Observer bridge" },
   "Optional ffmpeg source, video, RSS/CPU and soak-test alerts.": { zh: "可选 ffmpeg 源、视频预览、RSS/CPU 和长跑告警。", en: "Optional ffmpeg source, video, RSS/CPU and soak-test alerts." },
+  "Model selection": { zh: "模型选择", en: "Model selection" },
+  "registry · download · hot load": { zh: "模型表 · 下载 · 热加载", en: "registry · download · hot load" },
+  "ASR model": { zh: "ASR 模型", en: "ASR model" },
+  "TTS model": { zh: "TTS 模型", en: "TTS model" },
+  "VAD model": { zh: "VAD 模型", en: "VAD model" },
+  "Load ASR": { zh: "加载 ASR", en: "Load ASR" },
+  "Load TTS": { zh: "加载 TTS", en: "Load TTS" },
+  "Load VAD": { zh: "加载 VAD", en: "Load VAD" },
+  "Connect to load the model registry.": { zh: "连接后加载模型列表。", en: "Connect to load the model registry." },
   "HTTP transcription": { zh: "HTTP 转写", en: "HTTP transcription" },
   "Audio file (WAV)": { zh: "音频文件（WAV）", en: "Audio file (WAV)" },
   "Transcribe": { zh: "开始转写", en: "Transcribe" },
@@ -376,6 +407,7 @@ const UI_I18N = {
   "events connecting": { zh: "事件连接中", en: "events connecting" },
   "events connected": { zh: "事件已连接", en: "events connected" },
   "events reconnecting": { zh: "事件重连中", en: "events reconnecting" },
+  "observer unavailable": { zh: "Observer 不可用", en: "observer unavailable" },
   "observer HTTP base": { zh: "observer API 地址", en: "observer HTTP base" },
   "source URL or file path": { zh: "媒体源 URL 或文件路径", en: "source URL or file path" },
   "rs-server WS": { zh: "rs-server WS 地址", en: "rs-server WS" },
@@ -469,6 +501,101 @@ function log(m) { const t = new Date().toLocaleTimeString();
   document.getElementById("log").textContent += `[${t}] ${m}\n`;
   document.getElementById("log").scrollTop = 1e9; }
 
+let modelRegistry = null;
+function fmtModelSize(bytes) {
+  const n = Number(bytes || 0);
+  if (!n) return "";
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + " GB";
+  return Math.round(n / 1e6) + " MB";
+}
+function modelLabel(model, variant) {
+  const cached = variant.cached ? "cached" : "download";
+  const marker = variant.default ? " · default" : "";
+  const deps = model.dependencies || [];
+  const depStatus = deps.length
+    ? ` · deps ${deps.every((dep) => dep.cached) ? "cached" : "download"}`
+    : "";
+  return `${model.id}:${variant.id} · ${fmtModelSize(variant.size_bytes)} · ${cached}${depStatus}${marker}`;
+}
+function setModelStatus(message) {
+  const box = document.getElementById("modelStatus");
+  if (box) box.textContent = message;
+}
+function fillModelSelect(task, id) {
+  const select = document.getElementById(id);
+  if (!select || !modelRegistry) return;
+  select.innerHTML = "";
+  const loaded = modelRegistry.loaded?.[task] || "";
+  const models = (modelRegistry.models || []).filter((model) => model.task === task);
+  for (const model of models) {
+    for (const variant of model.variants || []) {
+      const option = document.createElement("option");
+      option.value = variant.spec;
+      option.textContent = modelLabel(model, variant);
+      option.title = model.description || "";
+      if (loaded === variant.spec || (!loaded && variant.default)) option.selected = true;
+      select.appendChild(option);
+    }
+  }
+  if (!select.children.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "no " + task + " models";
+    select.appendChild(option);
+  }
+}
+function renderModelRegistry() {
+  if (!modelRegistry) return;
+  fillModelSelect("asr", "modelAsr");
+  fillModelSelect("tts", "modelTts");
+  fillModelSelect("vad", "modelVad");
+  const loaded = modelRegistry.loaded || {};
+  const cacheDir = modelRegistry.cache_dir || "";
+  setModelStatus(
+    `loaded ASR=${loaded.asr || "none"} · TTS=${loaded.tts || "none"} · VAD=${loaded.vad || "none"}\n` +
+    `cache: ${cacheDir}`
+  );
+}
+async function refreshModelRegistry() {
+  try {
+    modelRegistry = await fetch(HTTP() + "/v1/models/registry").then((r) => {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    });
+    renderModelRegistry();
+  } catch (error) {
+    setModelStatus("model registry unavailable: " + error);
+  }
+}
+window.loadSelectedModel = async (task, selectId) => {
+  const select = document.getElementById(selectId);
+  const spec = select?.value || "";
+  if (!spec) return;
+  const button = document.getElementById("model" + task[0].toUpperCase() + task.slice(1) + "Load");
+  if (button) button.disabled = true;
+  setModelStatus(`loading ${task} model ${spec} ...\nIf it is not cached, the server will download and verify it first.`);
+  log("POST /v1/models/load " + task + " " + spec);
+  try {
+    const response = await fetch(HTTP() + "/v1/models/load", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ task, model: spec })
+    });
+    const data = await response.json().catch(async () => ({ error: { message: await response.text() } }));
+    if (!response.ok || data.ok === false) {
+      throw new Error(data.error?.message || JSON.stringify(data));
+    }
+    setModelStatus(`loaded ${data.task} ${data.model} · arch=${data.arch || "n/a"} · downloaded=${data.downloaded ? "yes" : "no"}`);
+    await refreshModelRegistry();
+    await ping();
+  } catch (error) {
+    setModelStatus("load failed: " + error.message);
+    log("model load failed: " + error.message);
+  } finally {
+    if (button) button.disabled = false;
+  }
+};
+
 async function ping() {
   const dotEl = document.getElementById("dot");
   const statusEl = document.getElementById("status");
@@ -481,6 +608,7 @@ async function ping() {
       ? `${h.status === "ok" ? "正常" : h.status} · 模型：${ids}`
       : `${h.status} · models: ${ids}`;
     log("connected · models: " + ids);
+    refreshModelRegistry();
   } catch (e) { dotEl.classList.remove("up"); statusEl.textContent = uiText("unreachable");
     log("health failed: " + e); }
 }
@@ -711,7 +839,8 @@ ping();
     running: false, timer: null, finished: false
   };
   const observer = {
-    events: null, audio_ctx: null, play_at: 0, metrics: [], last_pcm: new Int16Array(0)
+    events: null, audio_ctx: null, play_at: 0, metrics: [],
+    last_pcm: new Int16Array(0), event_error_reported: false
   };
 
   function http_root() {
@@ -1163,6 +1292,33 @@ ping();
   // ── Optional asr-observer SSE bridge ──────────────────────────────────
   function observer_base() { return el("obBase").value.trim().replace(/\/+$/, ""); }
   function observer_url(path) { return observer_base() + path; }
+  async function observer_health() {
+    const base = observer_base();
+    if (!base) {
+      observer_alert("error", "observer HTTP base is required");
+      el("obEventState").textContent = uiText("observer unavailable");
+      return false;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    try {
+      const response = await fetch(observer_url("/api/health"), {
+        cache: "no-store", signal: controller.signal
+      });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      return true;
+    } catch (error) {
+      el("obEventState").textContent = uiText("observer unavailable");
+      observer_alert(
+        "error",
+        "observer.py is not reachable at " + base + " (" + error.message +
+        "). Start it with: python3 examples/server/asr-observer/observer.py"
+      );
+      return false;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
   function observer_alert(level, message) {
     const box = el("obAlerts");
     const empty = box.querySelector(".muted");
@@ -1218,13 +1374,24 @@ ping();
       data.alerts.forEach((item) => observer_alert(item.level, item.message));
     }
   }
-  function connect_observer_events() {
+  async function connect_observer_events(skip_health) {
+    if (!skip_health && !(await observer_health())) return false;
     if (observer.events) observer.events.close();
     const events = new EventSource(observer_url("/api/events"));
     observer.events = events;
+    observer.event_error_reported = false;
     el("obEventState").textContent = uiText("events connecting");
-    events.onopen = () => { el("obEventState").textContent = uiText("events connected"); };
-    events.onerror = () => { el("obEventState").textContent = uiText("events reconnecting"); };
+    events.onopen = () => {
+      observer.event_error_reported = false;
+      el("obEventState").textContent = uiText("events connected");
+    };
+    events.onerror = () => {
+      el("obEventState").textContent = uiText("events reconnecting");
+      if (!observer.event_error_reported) {
+        observer.event_error_reported = true;
+        observer_alert("error", "observer event stream disconnected; checking " + observer_base());
+      }
+    };
     events.addEventListener("state", (event) => {
       const data = JSON.parse(event.data);
       observer_snapshot(data);
@@ -1268,10 +1435,20 @@ ping();
     });
     events.addEventListener("transcript", (event) => observer_transcript(JSON.parse(event.data)));
     events.addEventListener("metrics", (event) => observer_metrics(JSON.parse(event.data)));
+    return true;
   }
-  window.connectObserver = connect_observer_events;
+  window.connectObserver = () => {
+    connect_observer_events().catch((error) => {
+      el("obEventState").textContent = uiText("observer unavailable");
+      observer_alert("error", "observer connect failed: " + error.message);
+    });
+  };
   window.startObserver = async () => {
-    if (!observer.events) connect_observer_events();
+    if (!(await observer_health())) return;
+    if (!observer.events || observer.events.readyState === EventSource.CLOSED) {
+      const connected = await connect_observer_events(true);
+      if (!connected) return;
+    }
     const cfg = {
       source: el("obSource").value.trim(), mode: el("obMode").value,
       rs_ws: el("obRsWs").value.trim() || ws_root(), rs_pid: "auto",

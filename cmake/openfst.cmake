@@ -40,7 +40,13 @@ FetchContent_Declare(openfst
 # DT_NEEDED — and downstream test executables fail to link because libfst.so
 # isn't on their search path. fst is a purely internal dep of wetext_processor,
 # so static is the right default everywhere.
-set(_RS_PREV_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+if(DEFINED BUILD_SHARED_LIBS)
+    set(_RS_PREV_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+    set(_RS_HAD_BUILD_SHARED_LIBS ON)
+else()
+    set(_RS_HAD_BUILD_SHARED_LIBS OFF)
+endif()
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build shared libraries" FORCE)
 set(BUILD_SHARED_LIBS OFF)
 # Position-independent code is still required so the static archive can be
 # linked into the eventual rapidspeech-core shared lib / Python module.
@@ -49,11 +55,21 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 FetchContent_MakeAvailable(openfst)
 
-set(BUILD_SHARED_LIBS ${_RS_PREV_BUILD_SHARED_LIBS})
+if(_RS_HAD_BUILD_SHARED_LIBS)
+    set(BUILD_SHARED_LIBS ${_RS_PREV_BUILD_SHARED_LIBS} CACHE BOOL "Build shared libraries" FORCE)
+    set(BUILD_SHARED_LIBS ${_RS_PREV_BUILD_SHARED_LIBS})
+else()
+    unset(BUILD_SHARED_LIBS CACHE)
+    unset(BUILD_SHARED_LIBS)
+endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE ${_RS_PREV_CMAKE_PIC})
 
 # Public include path so consumers can `#include "fst/fst.h"` etc.
 if(TARGET fst)
+    get_target_property(_RS_FST_TYPE fst TYPE)
+    if(NOT _RS_FST_TYPE STREQUAL "STATIC_LIBRARY")
+        message(FATAL_ERROR "OpenFst target 'fst' must be STATIC_LIBRARY, got ${_RS_FST_TYPE}")
+    endif()
     target_include_directories(fst PUBLIC
         $<BUILD_INTERFACE:${openfst_SOURCE_DIR}/src/include>)
 endif()

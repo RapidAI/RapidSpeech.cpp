@@ -170,6 +170,23 @@ def _model_path(registry, spec, task):
         _fail_from(e)
 
 
+def _ensure_registry_dependencies(registry, model_name, export_env=False):
+    """Download model companion files and optionally export their env vars."""
+    paths = []
+    if not model_name:
+        return paths
+    try:
+        deps = registry.resolve_dependencies(model_name)
+        for dep in deps:
+            path = dl.ensure_file(dep)
+            paths.append((dep, path))
+            if export_env and dep.env:
+                os.environ.setdefault(dep.env, str(path))
+    except (reg.RegistryError, dl.DownloadError) as e:
+        _fail_from(e)
+    return paths
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Kokoro runtime data (G2P dictionaries shipped inside the wheel)
 # ──────────────────────────────────────────────────────────────────────
@@ -354,6 +371,11 @@ def cmd_models(args):
             print("%-24s %-6s %-10s %-9s %s" % (
                 "  voice:%s%s" % (voice, tag), "", "0.5 MB",
                 "yes" if resolved.filename in cached else "-", ""))
+        for dep in registry.resolve_dependencies(name):
+            print("%-24s %-6s %-10s %-9s %s" % (
+                "  dep:%s" % dep.name.split(":", 1)[1], "",
+                "%.0f MB" % (dep.size_bytes / 1e6),
+                "yes" if dep.filename in cached else "-", dep.env or ""))
     print("\n(* = default; `rapidspeech pull <id>` to prefetch)")
     return 0
 
@@ -366,6 +388,8 @@ def cmd_pull(args):
             resolved = registry.resolve(spec)
             path = dl.ensure_file(resolved)
             print(path)
+            for _, dep_path in _ensure_registry_dependencies(registry, name):
+                print(dep_path)
             # TTS models also need their default voice pack.
             voice = registry.default_voice(name)
             if voice:
@@ -439,6 +463,7 @@ def cmd_speak(args):
 
     registry = _load_registry()
     model_path, model_name = _model_path(registry, args.model, "tts")
+    _ensure_registry_dependencies(registry, model_name, export_env=True)
 
     # Voice pack (kokoro): resolve + download + export env BEFORE model load.
     if model_name and registry.models[model_name].get("voices"):
@@ -496,18 +521,6 @@ def cmd_speak(args):
           file=sys.stderr)
     print(args.output)
     return 0
-
-
-# ──────────────────────────────────────────────────────────────────────
-# demo
-# ──────────────────────────────────────────────────────────────────────
-def cmd_demo(args):
-    from rapidspeech.python.demo import run_demo
-    registry = _load_registry()
-    args.asr_model = getattr(args, "asr_model", None)
-    args.tts_model = getattr(args, "tts_model", None)
-    return run_demo(args, _model_path, registry, _export_kokoro_data_env,
-                    _import_native, fail)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -596,15 +609,26 @@ def cmd_serve(args):
                       "cmake -B build && cmake --build build --target rs-server",
         )
 
-    model_note = "ASR + TTS" + ("" if args.no_vad else " + VAD")
-    print("Preparing models (first run downloads %s)..." % model_note,
-          file=sys.stderr)
-    asr_path, _ = _model_path(registry, args.asr_model, "asr")
-    tts_path, tts_name = _model_path(registry, args.tts_model, "tts")
-    asr_path = asr_path.resolve()
-    tts_path = tts_path.resolve()
+    os.environ.setdefault("RAPIDSPEECH_PYTHON_EXECUTABLE", sys.executable)
+    os.environ.setdefault("RAPIDSPEECH_REGISTRY_PATH", str(reg.registry_path()))
+
+    preload = not args.lazy_models
+    asr_path = None
+    tts_path = None
+    tts_name = None
+    if preload:
+        model_note = "ASR + TTS" + ("" if args.no_vad else " + VAD")
+        print("Preparing models (first run downloads %s)..." % model_note,
+              file=sys.stderr)
+        asr_path, _ = _model_path(registry, args.asr_model, "asr")
+        tts_path, tts_name = _model_path(registry, args.tts_model, "tts")
+        asr_path = asr_path.resolve()
+        tts_path = tts_path.resolve()
+    else:
+        print("Starting in lazy model mode; choose/download models in the WebUI.",
+              file=sys.stderr)
     vad_path = None
-    if not args.no_vad:
+    if preload and not args.no_vad:
         vad_path, _ = _model_path(registry, args.vad_model, "vad")
         vad_path = vad_path.resolve()
 
@@ -637,14 +661,16 @@ def cmd_serve(args):
     ws_port = args.ws_port if args.ws_port is not None else args.port + 1
     cmd = [
         str(server),
-        "--asr-model", str(asr_path),
-        "--tts-model", str(tts_path),
         "--web-dir", str(web_dir),
         "--host", args.host,
         "--port", str(args.port),
         "--ws-port", str(ws_port),
         "--threads", str(args.threads),
     ]
+    if asr_path is not None:
+        cmd.extend(["--asr-model", str(asr_path)])
+    if tts_path is not None:
+        cmd.extend(["--tts-model", str(tts_path)])
     if vad_path is not None:
         cmd.extend(["--vad-model", str(vad_path)])
     if args.two_pass:
@@ -736,19 +762,6 @@ def build_parser():
     sp.add_argument("--cpu", action="store_true", help="disable GPU")
     sp.set_defaults(func=cmd_speak)
 
-    sp = sub.add_parser("demo", help="launch the local speech demo in your browser")
-    sp.add_argument("--asr-model", default=None,
-                    help="registry ID or .gguf path (default: funasr-nano)")
-    sp.add_argument("--tts-model", default=None,
-                    help="registry ID or .gguf path (default: kokoro-zh)")
-    sp.add_argument("--host", default="127.0.0.1")
-    sp.add_argument("--port", type=int, default=8090)
-    sp.add_argument("--threads", type=int, default=4)
-    sp.add_argument("--cpu", action="store_true", help="disable GPU")
-    sp.add_argument("--no-browser", action="store_true",
-                    help="don't open the browser automatically")
-    sp.set_defaults(func=cmd_demo)
-
     sp = sub.add_parser(
         "serve",
         help="start the OpenAI-compatible API and browser speech console",
@@ -763,6 +776,9 @@ def build_parser():
                     help="voice pack name for registry TTS models")
     sp.add_argument("--no-vad", action="store_true",
                     help="don't download/load a VAD model")
+    sp.add_argument("--lazy-models", "--no-preload", action="store_true",
+                    help="start the WebUI without preloading default models; "
+                         "models download when selected")
     sp.add_argument("--host", default="127.0.0.1")
     sp.add_argument("--port", type=int, default=8080)
     sp.add_argument("--ws-port", type=int, default=None)

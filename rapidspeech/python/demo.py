@@ -1,4 +1,7 @@
-"""`rapidspeech demo` — the flagship local speech loop in one command.
+"""Legacy local speech demo server.
+
+The public browser-console entry point is `rapidspeech serve`; this module is
+kept only for source compatibility with callers that import `run_demo`.
 
 A pure-stdlib HTTP server (no Flask, no websockets) serving a single-page
 UI: microphone → ASR, text → TTS, with backend/model/latency/offline status
@@ -136,7 +139,7 @@ class Handler(BaseHTTPRequestHandler):
     def _transcribe(self):
         if STATE.asr is None:
             return self._err("ASR model not loaded",
-                             "restart with `rapidspeech demo`")
+                             "restart with `rapidspeech serve`")
         try:
             pcm, sr = _read_wav(self._body())
         except Exception as e:
@@ -166,7 +169,7 @@ class Handler(BaseHTTPRequestHandler):
     def _speak(self):
         if STATE.tts is None:
             return self._err("TTS model not loaded",
-                             "restart with `rapidspeech demo`")
+                             "restart with `rapidspeech serve`")
         try:
             req = json.loads(self._body().decode("utf-8"))
             text = (req.get("text") or "").strip()
@@ -244,7 +247,7 @@ def run_demo(args, model_path_fn, registry, export_g2p, import_native, fail):
     port = _pick_port(args.host, args.port)
     url = "http://%s:%d" % (args.host, port)
     srv = ThreadingHTTPServer((args.host, port), Handler)
-    print("\n  RapidSpeech demo ready:  %s" % url, file=sys.stderr)
+    print("\n  RapidSpeech legacy demo ready:  %s" % url, file=sys.stderr)
     print("  ASR %s (%s) | TTS %s (%s)\n  Ctrl-C to stop.\n" % (
         STATE.asr_name, STATE.asr.get_backend_name(),
         STATE.tts_name, STATE.tts.get_backend_name()), file=sys.stderr)

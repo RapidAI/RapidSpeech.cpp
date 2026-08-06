@@ -26,13 +26,15 @@ class RegistryError(Exception):
 class ResolvedFile:
     """A single downloadable file resolved from the registry."""
 
-    def __init__(self, name, filename, size_bytes, sha256, urls, known_issues=None):
+    def __init__(self, name, filename, size_bytes, sha256, urls,
+                 known_issues=None, env=None):
         self.name = name              # e.g. "funasr-nano:q4_k_m" or "kokoro-zh/voice:zf_001"
         self.filename = filename      # cache filename, e.g. "funasr-nano-q4_k_m.gguf"
         self.size_bytes = size_bytes
         self.sha256 = sha256
         self.urls = urls              # ordered list of (source_name, url)
         self.known_issues = known_issues
+        self.env = env                # optional environment variable for companion files
 
 
 class Registry:
@@ -101,6 +103,25 @@ class Registry:
             )
         return self._resolved("%s/voice:%s" % (model_name, voice), v)
 
+    def resolve_dependencies(self, model_name):
+        """Resolve companion files needed by a registry model.
+
+        Dependencies are downloaded with the main model and, when they carry an
+        env key, exported before native model load.
+        """
+        entry = self.models.get(model_name)
+        if entry is None:
+            known = ", ".join(sorted(self.models))
+            raise RegistryError(
+                "unknown model '%s'" % model_name,
+                hint="known models: %s (see rapidspeech models)" % known,
+            )
+        deps = entry.get("dependencies", {})
+        return [
+            self._resolved("%s/dependency:%s" % (model_name, dep_name), dep)
+            for dep_name, dep in sorted(deps.items())
+        ]
+
     def default_voice(self, model_name):
         entry = self.models.get(model_name, {})
         return entry.get("default_voice")
@@ -123,6 +144,7 @@ class Registry:
             sha256=file_entry["sha256"],
             urls=urls,
             known_issues=file_entry.get("known_issues"),
+            env=file_entry.get("env"),
         )
 
     # -- mirror configuration --------------------------------------------
@@ -148,6 +170,9 @@ class Registry:
 
 
 def registry_path():
+    env = os.environ.get("RAPIDSPEECH_REGISTRY_PATH")
+    if env:
+        return Path(env).expanduser()
     return Path(__file__).resolve().parent / "_registry.json"
 
 

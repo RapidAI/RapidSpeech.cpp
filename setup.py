@@ -89,7 +89,6 @@ def get_package_data():
             "bin/*",
             "server/*",
             "python/_registry.json",
-            "python/_demo.html",
             "data/kokoro_zh/*",
             "data/kokoro_en/*",
             "data/wetext/*",
@@ -122,7 +121,7 @@ class BuildExtension(build_ext):
 
         backend = os.environ.get("RS_BACKEND", "cpu").lower()
         if backend == "cuda":
-            cmake_args += " -DRS_USE_CUDA=ON"
+            cmake_args += " -DRS_CUDA=ON"
 
         make_args = os.environ.get("RAPIDSPEECH_MAKE_ARGS", "")
         system_make_args = os.environ.get("MAKEFLAGS", "")
