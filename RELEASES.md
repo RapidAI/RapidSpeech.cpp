@@ -1,5 +1,12 @@
 # Releases
 
+## v1.4.2
+
+### 🐛 Bug Fixes / Bug 修复
+
+- Linux CUDA wheel: exclude the NVIDIA driver library `libcuda.so.1` from `auditwheel` repair; it is provided by the host driver and must not be bundled.
+- Linux CUDA wheel：在 `auditwheel` 修复阶段排除 NVIDIA 驱动库 `libcuda.so.1`；该库由宿主机驱动提供，不应打包进 wheel。
+
 ## v1.4.1
 
 ### 🐛 Bug Fixes / Bug 修复

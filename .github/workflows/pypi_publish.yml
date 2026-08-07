@@ -91,6 +91,8 @@ jobs:
           # Fix NEEDED entries before auditwheel repair on Linux.
           # cmake embeds build-tree paths like "ggml/src/libggml-base.so"
           # which auditwheel cannot resolve.
+          # libcuda.so.1 is supplied by the NVIDIA driver on the host and
+          # must remain an external dependency of the CUDA wheel.
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
             tmpdir=$(mktemp -d) &&
             unzip -q {wheel} -d $tmpdir &&
@@ -102,7 +104,7 @@ jobs:
             done &&
             (cd $tmpdir && zip -qr {wheel} .) &&
             rm -rf $tmpdir &&
-            auditwheel repair -w {dest_dir} {wheel}
+            auditwheel repair --exclude libcuda.so.1 -w {dest_dir} {wheel}
 
           # Fix install_name entries before delocate-wheel repair on macOS.
           # cmake embeds build-tree paths in dylib install_names and their
