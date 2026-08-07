@@ -45,7 +45,10 @@ jobs:
         if: matrix.os == 'windows-2022' && matrix.backend == 'cuda'
         uses: jimver/cuda-toolkit@v0.2.20
         with:
-          cuda: '11.8.0'
+          # CUDA 11.8's headers reject the MSVC 14.44 STL shipped by the
+          # current GitHub Windows runner. CUDA 12.4 is the minimum version
+          # accepted by that STL and matches the binary release workflow.
+          cuda: '12.4.0'
           method: 'network'
 
       - name: Build wheels

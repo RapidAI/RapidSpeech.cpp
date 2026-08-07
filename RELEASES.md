@@ -1,5 +1,12 @@
 # Releases
 
+## v1.4.3
+
+### 🐛 Bug Fixes / Bug 修复
+
+- Windows CUDA wheel: upgrade the CI toolkit from CUDA 11.8 to CUDA 12.4, which is required by the MSVC 14.44 STL used on the GitHub Actions runner.
+- Windows CUDA wheel：将 CI toolkit 从 CUDA 11.8 升级到 CUDA 12.4，以兼容 GitHub Actions runner 使用的 MSVC 14.44 STL。
+
 ## v1.4.2
 
 ### 🐛 Bug Fixes / Bug 修复
