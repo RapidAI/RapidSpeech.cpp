@@ -1,5 +1,14 @@
 # Releases
 
+## v1.4.1
+
+### 🐛 Bug Fixes / Bug 修复
+
+- Linux: link `rs-asr-online` with `libdl` so miniaudio microphone backends resolve `dlclose` correctly.
+- Linux：为 `rs-asr-online` 链接 `libdl`，正确解析 miniaudio 麦克风后端使用的 `dlclose`。
+- Windows CUDA: allow the CUDA toolkit to build with the newer MSVC toolset used by GitHub Actions runners.
+- Windows CUDA：允许 CUDA toolkit 与 GitHub Actions runner 上较新的 MSVC 工具链一起构建。
+
 ## v1.4.0
 
 ### 本版本解决的问题 / What this release solves

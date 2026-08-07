@@ -61,6 +61,14 @@ endif()
 # Note: Pass options to ggml before adding the directory
 if (RS_CUDA)
     set(GGML_CUDA ON CACHE BOOL "ggml: enable CUDA" FORCE)
+
+    # The Windows GitHub runners can ship a newer MSVC toolset than the
+    # CUDA toolkit bundled by cibuildwheel supports.  CUDA rejects that host
+    # compiler during CMake's compiler-identification step unless this flag
+    # is enabled.  Keep the workaround scoped to Windows CUDA builds.
+    if (WIN32)
+        string(APPEND CMAKE_CUDA_FLAGS " --allow-unsupported-compiler")
+    endif()
 endif()
 
 if (RS_METAL AND APPLE)
@@ -748,6 +756,7 @@ if (RS_BUILD_CLI)
     # miniaudio uses dlopen on Linux for ALSA/PulseAudio/JACK backend discovery
     if(UNIX AND NOT APPLE)
         target_link_libraries(rs-asr-vad-online PRIVATE ${CMAKE_DL_LIBS})
+        target_link_libraries(rs-asr-online PRIVATE ${CMAKE_DL_LIBS})
         target_link_libraries(rs-tts-online PRIVATE ${CMAKE_DL_LIBS})
         target_link_libraries(rs-kws PRIVATE ${CMAKE_DL_LIBS})
     endif()
