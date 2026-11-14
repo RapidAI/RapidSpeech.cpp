@@ -236,7 +236,8 @@ RS_API int32_t rs_process(rs_context_t *ctx) {
     const bool is_tts =
         (arch == "openvoice2" || arch == "OmniVoice" ||
          arch == "cosyvoice3-llm" || arch == "cosyvoice3" ||
-         arch == "kokoro" || arch == "indextts2" || arch == "voxcpm2");
+         arch == "kokoro" || arch == "indextts2" || arch == "voxcpm2" ||
+         arch == "m5-tts");
     if (is_tts) {
       // Models advertise true chunk streaming through the common interface.
       const bool stream_requested =

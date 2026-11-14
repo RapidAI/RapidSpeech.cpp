@@ -233,6 +233,10 @@ set(RS_SOURCES
         rapidspeech/src/arch/indextts2_s2mel.cpp
         rapidspeech/src/arch/indextts2_bigvgan.cpp
         rapidspeech/src/arch/indextts2_tokenizer.cpp
+        rapidspeech/src/arch/m5tts.h
+        rapidspeech/src/arch/m5tts.cpp
+        rapidspeech/src/arch/m5tts_lm.cpp
+        rapidspeech/src/arch/m5tts_codec.cpp
         rapidspeech/src/arch/indextts2_qwen_emo.cpp
         rapidspeech/src/arch/campplus.cpp
         rapidspeech/src/arch/w2v_bert.h
