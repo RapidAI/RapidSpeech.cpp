@@ -362,7 +362,6 @@ bool Model::DecodeChunk(ggml_backend_sched_t sched, const int32_t *codes,
     ggml_tensor *x = ggml_cont(c, tf_out);  // {L, n}
 
     // --- upsample ×2: transconv (k=s=2) + ConvNeXt ---
-    fprintf(stderr, "m5 dec: pre_up len=%lld\n", (long long)x->ne[1]);
     int si = 1;  // conv state index (pre_conv=0, up0.dwconv=1, up1.dwconv=2)
     for (int u = 0; u < (int)hp_.upsampling_ratios.size(); u++) {
         const auto &up = cdw_.upstage[u];
@@ -389,8 +388,6 @@ bool Model::DecodeChunk(ggml_backend_sched_t sched, const int32_t *codes,
     for (int b = 0; b < (int)hp_.upsample_rates.size(); b++) {
         const auto &blk = cdw_.blocks[b];
         const int rate = hp_.upsample_rates[b];
-        fprintf(stderr, "m5 dec: block %d in=%lld rate=%d\n", b,
-                (long long)x->ne[1], rate);
         ggml_tensor *act = graph::snake_beta(c, x, blk.act0, sc_eps9_);
         ggml_tensor *y = graph::conv_transpose_1d(c, blk.transconv, act,
                                                   blk.transconv.stride);
@@ -418,8 +415,6 @@ bool Model::DecodeChunk(ggml_backend_sched_t sched, const int32_t *codes,
             1);
         ggml_build_forward_expand(gf, st_tail);
 
-        fprintf(stderr, "m5 dec: block %d emission=%lld\n", b,
-                (long long)emission->ne[1]);
         // residual units (dilations 1, 3, 9)
         static const int dils[3] = {1, 3, 9};
         for (int ru = 0; ru < 3; ru++) {
@@ -441,8 +436,6 @@ bool Model::DecodeChunk(ggml_backend_sched_t sched, const int32_t *codes,
         x = graph::conv1d_streaming(c, gf, cdw_.decoder_out, x,
                                     conv_states_[si].t, &st_f);
     }
-    fprintf(stderr, "m5 dec: final len=%lld (expect %d)\n",
-            (long long)x->ne[1], n * hp_.hop_length);
     ggml_tensor *audio = ggml_clamp(c, x, -1.0f, 1.0f);  // {1, 1920n}
     ggml_tensor *audio_out = ggml_reshape_1d(c, audio, (int64_t)n * hp_.hop_length);
     ggml_set_output(audio_out);

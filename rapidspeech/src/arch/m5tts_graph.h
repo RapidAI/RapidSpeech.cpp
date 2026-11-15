@@ -146,11 +146,6 @@ inline ggml_tensor *llama_block(ggml_context *c, ggml_cgraph *gf,
     // --- self attention ---
     ggml_tensor *residual = cur;
     ggml_tensor *x = rmsnorm(c, cur, w.ln1_w, cfg.eps);
-    fprintf(stderr, "blk: cur{%lld,%lld} q_w{%lld,%lld} k_w{%lld,%lld} x{%lld,%lld}\n",
-            (long long)cur->ne[0], (long long)cur->ne[1],
-            (long long)w.q_w->ne[0], (long long)w.q_w->ne[1],
-            (long long)w.k_w->ne[0], (long long)w.k_w->ne[1],
-            (long long)x->ne[0], (long long)x->ne[1]);
     ggml_tensor *q = ggml_reshape_3d(c, linear(c, w.q_w, x), hd, H, T);
     ggml_tensor *k = ggml_reshape_3d(c, linear(c, w.k_w, x), hd, Hkv, T);
     ggml_tensor *v = ggml_reshape_3d(c, linear(c, w.v_w, x), hd, Hkv, T);

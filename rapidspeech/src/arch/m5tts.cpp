@@ -1273,7 +1273,6 @@ bool Model::Encode(const std::vector<float> &input_frames, RSState &state_raw,
     if (index > 0) {
       if (!BackboneStep(sched, next_hidden.data(), n_past++, lh, c0_logits))
         return false;
-    if (index < 3) fprintf(stderr, "m5: frame %d bb ok\n", index);
     }
     const bool allow_eos = index > hp_.min_frames;
     std::memset(raw, 0, sizeof(raw));
